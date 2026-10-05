@@ -306,4 +306,4 @@ not supported.
 
 ## License
 
-Kito Files is released under the **MIT License** (see `license = "MIT"` in `Cargo.toml`).
+Kito Files is released under the **MIT License** (see [LICENSE](LICENSE)).
