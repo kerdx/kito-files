@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/kito-core", "crates/kito-gtk"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"

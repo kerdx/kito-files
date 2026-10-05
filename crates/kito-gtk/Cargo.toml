@@ -1,0 +1,16 @@
+[package]
+name = "kito-gtk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kito-files"
+path = "src/main.rs"
+
+[dependencies]
+kito-core = { path = "../kito-core" }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
+gtk = { package = "gtk4", version = "0.11", features = ["gnome_50"] }
+gio = "0.22"
+glib = "0.22"

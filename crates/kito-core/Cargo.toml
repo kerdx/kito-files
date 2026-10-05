@@ -1,0 +1,12 @@
+[package]
+name = "kito-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gio = { version = "0.22", features = ["v2_88"] }
+glib = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

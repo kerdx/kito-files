@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Kito Files
+Comment=Lightweight Wayland file manager
+Exec=/home/kerd/Dev/kito-files/target/debug/kito-files %U
+Icon=it.kito.KitoFiles
+Terminal=false
+Type=Application
+Categories=System;FileTools;FileManager;
+StartupWMClass=it.kito.KitoFiles
