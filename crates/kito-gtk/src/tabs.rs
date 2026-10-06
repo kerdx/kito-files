@@ -26,6 +26,9 @@ pub struct FileTab {
     selection: RefCell<gtk::SingleSelection>,
     mode: Cell<ViewMode>,
     history: NavHistory,
+    /// Hidden-view sync: the view is fresh only for the global value it
+    /// was last successfully filled with.
+    hidden_sync: HiddenSync,
     show_hidden: Rc<Cell<bool>>,
     window: adw::ApplicationWindow,
     on_navigate: OnNavigate,
@@ -223,12 +226,14 @@ impl FileTab {
     /// chrome on success. Returns whether it worked; shows a dialog on
     /// failure without touching any state.
     fn load_raw(&self, uri: &str) -> bool {
-        match file_list::reload(&self.store, uri, self.show_hidden.get()) {
+        match self.fill_store(uri) {
             Ok(n) => {
                 self.page.set_title(&Self::title_for(uri));
                 self.stack
                     .set_visible_child_name(if n == 0 { "empty" } else { "list" });
                 (self.on_navigate)(uri, n, self.mode.get());
+                let selected = usize::from(self.selection.borrow().selected_item().is_some());
+                (self.on_status)(n, selected);
                 true
             }
             Err(e) => {
@@ -240,6 +245,34 @@ impl FileTab {
                 dialog.present(Some(&self.window));
                 false
             }
+        }
+    }
+
+    /// Refills the store for `uri` with the current global setting,
+    /// restoring the selection when its entry is still listed. Shared by
+    /// navigation and quiet refresh: no chrome, no dialog.
+    fn fill_store(&self, uri: &str) -> Result<usize, glib::Error> {
+        let keep = self.selected_objects().first().map(|obj| obj.uri());
+        let n = file_list::reload(&self.store, uri, self.show_hidden.get())?;
+        if let Some(uri) = keep {
+            self.select_uri(&uri);
+        }
+        self.hidden_sync.mark_refreshed(self.show_hidden.get());
+        Ok(n)
+    }
+
+    /// Selects the entry with `uri`, if listed. No-op otherwise.
+    fn select_uri(&self, uri: &str) {
+        let listed: Vec<String> = (0..self.store.n_items())
+            .filter_map(|i| {
+                self.store
+                    .item(i)
+                    .and_downcast::<FileObject>()
+                    .map(|obj| obj.uri())
+            })
+            .collect();
+        if let Some(pos) = find_uri_index(&listed, uri) {
+            self.selection.borrow().select_item(pos, true);
         }
     }
 
@@ -272,6 +305,30 @@ impl FileTab {
         let uri = self.history.current_uri();
         if !uri.is_empty() {
             self.load(&uri);
+        }
+    }
+
+    /// Applies a pending show_hidden change on selection, quietly: no
+    /// title, crumbs, buttons or status updates (the caller re-syncs the
+    /// active tab right after). Stays stale and silent on failure, so a
+    /// later selection retries.
+    fn sync_hidden_if_stale(&self) {
+        if self.hidden_sync.needs_refresh(self.show_hidden.get()) {
+            self.refresh_hidden();
+        }
+    }
+
+    /// Reloads content for the current global setting. Marks the view
+    /// fresh only on success; leaves everything else (directory,
+    /// history, mode) alone.
+    fn refresh_hidden(&self) {
+        let uri = self.history.current_uri();
+        if uri.is_empty() {
+            return;
+        }
+        if let Ok(n) = self.fill_store(&uri) {
+            self.stack
+                .set_visible_child_name(if n == 0 { "empty" } else { "list" });
         }
     }
 
@@ -350,6 +407,10 @@ impl TabManager {
             let tab_view = manager.tab_view.clone();
             tab_view.connect_selected_page_notify(move |_| {
                 if let Some(tab) = manager.selected() {
+                    // Inactive tabs apply a pending show_hidden change
+                    // first, then the active chrome is re-synced over any
+                    // stray updates.
+                    tab.sync_hidden_if_stale();
                     tab.sync_chrome();
                 }
             });
@@ -384,8 +445,12 @@ impl TabManager {
         }
     }
 
-    /// Toggles hidden files and reloads the tab.
+    /// Toggles hidden files: the active tab reloads now, background tabs
+    /// apply it lazily when selected.
     pub fn set_show_hidden(&self, show: bool) {
+        if self.show_hidden.get() == show {
+            return;
+        }
         self.show_hidden.set(show);
         self.reload_selected();
     }
@@ -440,6 +505,7 @@ impl TabManager {
             >()))),
             mode: Cell::new(ViewMode::default()),
             history: NavHistory::default(),
+            hidden_sync: HiddenSync::new(self.show_hidden.get()),
             show_hidden: self.show_hidden.clone(),
             window: self.window.clone(),
             on_navigate: self.on_navigate.clone(),
@@ -616,5 +682,155 @@ mod tests {
         assert_eq!(snapshot(&second), (c.clone(), vec![], vec![]));
         assert!(!run_navigation(&second, NavKind::Back, "", |_| true));
         assert_eq!(snapshot(&first), (b.clone(), vec![a.clone()], vec![]));
+    }
+}
+
+/// Per-tab hidden-view sync: the view is fresh only for the global
+/// value it was last successfully filled with. Drives lazy refresh on
+/// tab selection; failures keep it stale for a retry. Pure state, no
+/// widgets: headless-testable.
+#[derive(Default)]
+struct HiddenSync {
+    shown: Cell<bool>,
+}
+
+impl HiddenSync {
+    fn new(shown: bool) -> Self {
+        Self {
+            shown: Cell::new(shown),
+        }
+    }
+
+    /// True when the view still reflects an older setting.
+    fn needs_refresh(&self, global: bool) -> bool {
+        self.shown.get() != global
+    }
+
+    /// Marks the view fresh for `global`. Call only after a successful
+    /// fill done with that same value.
+    fn mark_refreshed(&self, global: bool) {
+        self.shown.set(global);
+    }
+}
+
+/// Index of `uri` in a listing, for restoring the selection after a
+/// refresh. Pure over URIs so selection matching stays headless-testable.
+fn find_uri_index(listed: &[String], uri: &str) -> Option<u32> {
+    listed.iter().position(|u| u == uri).map(|i| i as u32)
+}
+
+#[cfg(test)]
+mod hidden_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("visible.txt"), b"v").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), b"h").unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        (tmp, uri)
+    }
+
+    /// Listed URIs collected exactly like `FileTab::select_uri` does.
+    fn listed_uris(store: &gio::ListStore) -> Vec<String> {
+        (0..store.n_items())
+            .filter_map(|i| {
+                store
+                    .item(i)
+                    .and_downcast::<FileObject>()
+                    .map(|obj| obj.uri())
+            })
+            .collect()
+    }
+
+    fn reload_hidden(uri: &str, show_hidden: bool) -> Vec<String> {
+        let store = gio::ListStore::new::<FileObject>();
+        file_list::reload(&store, uri, show_hidden).unwrap();
+        listed_uris(&store)
+    }
+
+    #[test]
+    fn hidden_shows_on_select() {
+        let (_tmp, uri) = fixture();
+        // Tab born before the toggle: stale until selected.
+        let sync = HiddenSync::new(false);
+        assert!(sync.needs_refresh(true));
+        assert_eq!(reload_hidden(&uri, false).len(), 1);
+        // On selection it refreshes with the current value...
+        sync.mark_refreshed(true);
+        assert!(!sync.needs_refresh(true));
+        // ...and the hidden entry is listed.
+        assert_eq!(reload_hidden(&uri, true).len(), 2);
+    }
+
+    #[test]
+    fn hidden_hides_on_select() {
+        let (_tmp, uri) = fixture();
+        let sync = HiddenSync::new(true);
+        assert!(sync.needs_refresh(false));
+        sync.mark_refreshed(false);
+        assert!(!sync.needs_refresh(false));
+        assert_eq!(reload_hidden(&uri, false).len(), 1);
+        assert!(reload_hidden(&uri, true).len() == 2);
+    }
+
+    #[test]
+    fn new_tab_uses_current_value() {
+        assert!(!HiddenSync::new(true).needs_refresh(true));
+        assert!(!HiddenSync::new(false).needs_refresh(false));
+    }
+
+    #[test]
+    fn last_toggle_wins_before_select() {
+        let sync = HiddenSync::new(false);
+        // Toggled on: stale while off-view is shown...
+        assert!(sync.needs_refresh(true));
+        // ...selected while on: applied...
+        sync.mark_refreshed(true);
+        // ...toggled off again: stale again, last value wins...
+        assert!(sync.needs_refresh(false));
+        // ...selected while off: applied, nothing pending.
+        sync.mark_refreshed(false);
+        assert!(!sync.needs_refresh(false));
+    }
+
+    #[test]
+    fn hidden_only_dir_transitions_empty_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".only-hidden"), b"h").unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        // No visible entries -> the "empty" page; with hidden -> the list.
+        assert!(reload_hidden(&uri, false).is_empty());
+        assert_eq!(reload_hidden(&uri, true).len(), 1);
+    }
+
+    #[test]
+    fn failed_refresh_stays_stale_and_retries() {
+        let sync = HiddenSync::new(false);
+        assert!(sync.needs_refresh(true));
+        // Load failed: no mark, still stale...
+        assert!(sync.needs_refresh(true));
+        // ...a later selection retries and succeeds.
+        sync.mark_refreshed(true);
+        assert!(!sync.needs_refresh(true));
+    }
+
+    #[test]
+    fn selection_matching_on_real_listing() {
+        let (_tmp, uri) = fixture();
+        let listed = reload_hidden(&uri, true);
+        assert_eq!(listed.len(), 2);
+        let visible = listed.iter().find(|u| u.ends_with("visible.txt")).unwrap();
+        // Still listed after refresh: restorable at its index.
+        let pos = find_uri_index(&listed, visible).expect("visible entry matches");
+        assert_eq!(listed[pos as usize], *visible);
+        // Gone entry: no match, selection simply clears.
+        assert_eq!(find_uri_index(&listed, "file:///no/such/file.txt"), None);
+        // Hidden entry is matchable when shown...
+        let hidden = listed.iter().find(|u| u.ends_with(".hidden")).unwrap();
+        assert!(find_uri_index(&listed, hidden).is_some());
+        // ...and absent when hidden.
+        let plain = reload_hidden(&uri, false);
+        assert_eq!(find_uri_index(&plain, hidden), None);
     }
 }
