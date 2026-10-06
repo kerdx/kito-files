@@ -6,6 +6,7 @@ mod context_menu;
 mod file_list;
 mod l10n;
 mod ops;
+mod path_completion;
 mod preferences;
 mod preferences_dialog;
 mod sidebar;
@@ -490,19 +491,25 @@ fn build_window(
         .build();
 
     // Path: clickable breadcrumbs <-> writable entry (Ctrl+L).
-    // It is the header bar title: centered in the single bar and
-    // stretching to the side buttons.
+    // The expandable path bar must share one row with New Tab so it can end
+    // immediately before it. Window controls are placed in that row too, so
+    // the title slot can fill the width without centering the app controls.
     let path_stack = gtk::Stack::builder()
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .build();
+    let path_bar_name = tr("path-bar-name");
+    let path_bar_description = tr("path-bar-description");
+    path_stack.update_property(&[
+        gtk::accessible::Property::Label(&path_bar_name),
+        gtk::accessible::Property::Description(&path_bar_description),
+    ]);
 
     let crumbs_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Never)
         .hexpand(true)
-        .margin_start(6)
-        .margin_end(6)
+        .min_content_width(1)
         .css_classes(["path-pill"])
         .build();
     let crumbs = gtk::Box::builder()
@@ -519,23 +526,39 @@ fn build_window(
     let path_entry = gtk::Entry::builder()
         .placeholder_text(tr("path-placeholder"))
         .hexpand(true)
+        .width_chars(1)
         .css_classes(["path-pill"])
         .build();
     path_stack.add_named(&path_entry, Some("edit"));
     path_stack.set_visible_child_name("crumbs");
 
     // Single Nautilus-style bar: left (name + menu + navigation),
-    // path in the center, view and tabs on the right. No second row.
+    // expanding path, view and tabs on the right. No second row.
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&path_stack));
+    let header_contents = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .build();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    header.set_title_widget(Some(&header_contents));
     content.append(&header);
+
+    let start_window_controls = gtk::WindowControls::new(gtk::PackType::Start);
+    start_window_controls.set_visible(!start_window_controls.is_empty());
+    start_window_controls.connect_empty_notify(|controls| {
+        controls.set_visible(!controls.is_empty());
+    });
+    header_contents.append(&start_window_controls);
 
     let app_label = gtk::Label::builder()
         .label("Kito Files")
         .margin_start(4)
         .css_classes(["app-title"])
         .build();
-    header.pack_start(&app_label);
+    header_contents.append(&app_label);
 
     let app_menu_model = app_menu_model();
     let app_menu_popover = gtk::PopoverMenu::from_model(Some(&app_menu_model));
@@ -548,7 +571,7 @@ fn build_window(
     app_menu_button.set_child(Some(&app_menu_icon));
     let app_menu_name = tr("menu-application");
     app_menu_button.update_property(&[gtk::accessible::Property::Label(&app_menu_name)]);
-    header.pack_start(&app_menu_button);
+    header_contents.append(&app_menu_button);
 
     // Navigation: separate flat round arrows, like Nautilus (no linked).
     let nav = gtk::Box::builder()
@@ -564,7 +587,8 @@ fn build_window(
     nav.append(&back_button);
     nav.append(&forward_button);
     nav.append(&up_button);
-    header.pack_start(&nav);
+    header_contents.append(&nav);
+    header_contents.append(&path_stack);
 
     // The view popover contains only view modes and the hidden-file switch.
     let initial_view = preferences.snapshot().default_view;
@@ -645,13 +669,16 @@ fn build_window(
         gtk::accessible::Property::Label(&view_selector_name),
         gtk::accessible::Property::Description(&current_view),
     ]);
-    // The first pack_end widget sits closest to the window controls.
-    header.pack_end(&view_button);
-
     let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], &tr("nav-new-tab"));
-    header.pack_end(&new_tab_button);
+    header_contents.append(&new_tab_button);
+    header_contents.append(&view_button);
+    let end_window_controls = gtk::WindowControls::new(gtk::PackType::End);
+    end_window_controls.set_visible(!end_window_controls.is_empty());
+    end_window_controls.connect_empty_notify(|controls| {
+        controls.set_visible(!controls.is_empty());
+    });
+    header_contents.append(&end_window_controls);
 
-    // TEMP-VERIFY: opens the menu for the screenshot.
     // Body: sidebar on the left, tabs + status on the right.
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -690,6 +717,8 @@ fn build_window(
 
     // Manager slot: needed by breadcrumbs (created before the manager).
     let manager_slot: Rc<RefCell<Option<Rc<tabs::TabManager>>>> = Rc::new(RefCell::new(None));
+    let path_completion_invalidator: Rc<RefCell<Option<Rc<dyn Fn()>>>> =
+        Rc::new(RefCell::new(None));
     let slot_load: Rc<dyn Fn(&str)> = Rc::new({
         let manager_slot = manager_slot.clone();
         move |uri: &str| {
@@ -713,13 +742,31 @@ fn build_window(
         move || {
             if let Some(manager) = manager_slot.borrow().as_ref() {
                 if let Some(uri) = manager.selected_uri() {
-                    let text = kito_core::uri_to_display(&uri);
+                    let mut text = kito_core::uri_to_display(&uri);
+                    // The path bar edits a directory prefix. Keep a trailing
+                    // separator so typing starts the next segment instead of
+                    // appending to the current directory's name.
+                    if kito_core::uri_to_path(&uri).is_some() && !text.ends_with('/') {
+                        text.push('/');
+                    }
                     *shown_text_uri.borrow_mut() = (text.clone(), uri);
                     path_entry.set_text(&text);
                 }
             }
             path_stack.set_visible_child_name("edit");
             path_entry.grab_focus();
+            // Keep the existing path as context when editing by clicking the
+            // breadcrumb bar, so typing appends to the current location.
+            path_entry.set_position(-1);
+        }
+    });
+    // Ctrl+L retains the familiar full-selection behavior for quickly
+    // replacing the entire path.
+    let select_path_entry: Rc<dyn Fn()> = Rc::new({
+        let show_path_entry = show_path_entry.clone();
+        let path_entry = path_entry.clone();
+        move || {
+            show_path_entry();
             path_entry.select_region(0, -1);
         }
     });
@@ -757,10 +804,19 @@ fn build_window(
         let view_button = view_button.clone();
         let window = window.clone();
         let sidebar_slot = sidebar_slot.clone();
+        let path_completion_invalidator = path_completion_invalidator.clone();
+        let crumbs_scroll = crumbs_scroll.clone();
         let set_status = set_status.clone();
         move |uri: &str, n: usize, mode: ViewMode| {
+            if let Some(invalidate) = path_completion_invalidator.borrow().as_ref() {
+                invalidate();
+            }
             rebuild_crumbs(&crumbs, uri, &slot_load, &show_path_entry);
             path_stack.set_visible_child_name("crumbs");
+            let adjustment = crumbs_scroll.hadjustment();
+            glib::idle_add_local_once(move || {
+                adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+            });
             // Window title: folder name, not the raw URI.
             let name = gio::File::for_uri(uri)
                 .basename()
@@ -802,6 +858,21 @@ fn build_window(
         preferences.shared(),
     );
     *manager_slot.borrow_mut() = Some(manager.clone());
+    let autocomplete = path_completion::PathAutocomplete::new(
+        &path_entry,
+        &path_stack,
+        window.upcast_ref(),
+        {
+            let manager = Rc::downgrade(&manager);
+            Rc::new(move || manager.upgrade().and_then(|manager| manager.selected_uri()))
+        },
+        {
+            let show_hidden = show_hidden.clone();
+            Rc::new(move || show_hidden.get())
+        },
+    );
+    *path_completion_invalidator.borrow_mut() = Some(autocomplete.weak_invalidator());
+    let path_completion_retranslator = autocomplete.weak_retranslator();
     preferences.subscribe_open_items({
         let manager = Rc::downgrade(&manager);
         Rc::new(move |behavior| {
@@ -844,29 +915,62 @@ fn build_window(
     path_entry.connect_activate({
         let manager = manager.clone();
         let shown_text_uri = shown_text_uri.clone();
+        let autocomplete = autocomplete.clone();
+        let window = window.clone();
         move |entry| {
             let text = entry.text().to_string();
             let (shown_text, shown_uri) = shown_text_uri.borrow().clone();
-            let Some(uri) = kito_core::resolve_path_text(&text, &shown_text, &shown_uri) else {
+            autocomplete.invalidate_and_close();
+            let Some(current_uri) = manager.selected_uri() else {
                 return;
             };
-            manager.load_selected(&uri);
-        }
-    });
-    // Esc in the entry: back to breadcrumbs.
-    let esc_key = gtk::EventControllerKey::new();
-    esc_key.connect_key_pressed({
-        let path_stack = path_stack.clone();
-        move |_, keyval, _, _| {
-            if keyval == gdk::Key::Escape {
-                path_stack.set_visible_child_name("crumbs");
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
+            match path_completion::resolve_path_input(
+                &text,
+                &shown_text,
+                &shown_uri,
+                &current_uri,
+                &glib::home_dir(),
+            ) {
+                Some(uri) => manager.load_selected(&uri),
+                None if !text.is_empty() => {
+                    let dialog = adw::AlertDialog::builder()
+                        .heading(tr("error-open-folder"))
+                        .body(tr("error-invalid-path"))
+                        .build();
+                    dialog.add_response("ok", &tr("dialog-ok"));
+                    dialog.present(Some(&window));
+                }
+                None => {}
             }
         }
     });
-    path_entry.add_controller(esc_key);
+
+    // Empty space in the breadcrumb viewport enters path editing. Inspect
+    // the picked child so breadcrumb and separator clicks keep their action.
+    let blank_path_click = gtk::GestureClick::builder().button(1).build();
+    blank_path_click.connect_pressed({
+        let crumbs_scroll = crumbs_scroll.downgrade();
+        let edit = show_path_entry.clone();
+        move |_, _, x, y| {
+            let Some(scroll) = crumbs_scroll.upgrade() else {
+                return;
+            };
+            let mut picked = scroll.pick(x, y, gtk::PickFlags::DEFAULT);
+            while let Some(widget) = picked {
+                if widget.downcast_ref::<gtk::Button>().is_some()
+                    || widget.downcast_ref::<gtk::Label>().is_some()
+                {
+                    return;
+                }
+                if widget == scroll {
+                    break;
+                }
+                picked = widget.parent();
+            }
+            edit();
+        }
+    });
+    crumbs_scroll.add_controller(blank_path_click);
 
     let toast_overlay = adw::ToastOverlay::new();
     let ctx = Rc::new(ops::Ctx {
@@ -875,7 +979,7 @@ fn build_window(
         toast: toast_overlay.clone(),
         clipboard: Rc::new(RefCell::new(ops::ClipTracker::default())),
         preferences: preferences.clone(),
-        focus_path: show_path_entry.clone(),
+        focus_path: select_path_entry,
     });
     register_actions(
         app,
@@ -919,6 +1023,8 @@ fn build_window(
         let forward_button = forward_button.downgrade();
         let up_button = up_button.downgrade();
         let path_entry = path_entry.downgrade();
+        let path_stack = path_stack.downgrade();
+        let path_completion_retranslator = path_completion_retranslator.clone();
         let app_menu_button = app_menu_button.downgrade();
         let app_menu_model = app_menu_model.downgrade();
         let view_button = view_button.downgrade();
@@ -941,6 +1047,15 @@ fn build_window(
             if let Some(entry) = path_entry.upgrade() {
                 entry.set_placeholder_text(Some(&tr("path-placeholder")));
             }
+            if let Some(stack) = path_stack.upgrade() {
+                let label = tr("path-bar-name");
+                let description = tr("path-bar-description");
+                stack.update_property(&[
+                    gtk::accessible::Property::Label(&label),
+                    gtk::accessible::Property::Description(&description),
+                ]);
+            }
+            path_completion_retranslator();
             if let Some(button) = app_menu_button.upgrade() {
                 let label = tr("menu-application");
                 button.set_tooltip_text(Some(&label));

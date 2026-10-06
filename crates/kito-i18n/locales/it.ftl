@@ -36,7 +36,10 @@ menu-about = Informazioni su Kito Files
 menu-preferences = Preferenze…
 
 ## Barra del percorso
+path-bar-name = Percorso
+path-bar-description = Fai clic nell’area vuota o premi Ctrl+L per modificare il percorso
 path-placeholder = Digita un percorso, Invio per andare
+path-suggestions = Suggerimenti di percorso
 crumb-edit-current = Fai clic per modificare il percorso
 crumb-edit-path = Modifica percorso
 crumb-root = Radice del filesystem
@@ -79,6 +82,7 @@ status-selected =
 
 ## Schede
 error-open-folder = Impossibile aprire la cartella
+error-invalid-path = Inserisci un percorso locale o un URI da aprire.
 empty-folder = Questa cartella è vuota
 error-open-file = Impossibile aprire il file
 error-open-file-detail = Kito Files non è riuscito ad avviare l’applicazione predefinita: { $error }

@@ -45,9 +45,13 @@ for Wayland or X11. Development testing is done on Wayland.
 - Tabs (`AdwTabView`), each tab keeps its own folder, view mode and back/forward history
 - Back / forward / up navigation, plus mouse side buttons (back = button 8, forward = button 9)
 - Failed navigation leaves the current folder and back/forward history unchanged
-- Editable path bar: `Ctrl+L` (or click the current breadcrumb) to type any path or URI
-- Readable local paths and breadcrumb labels, with spaces and special characters
-  handled without double-encoding when confirming the current path
+- The path bar fills the available header space; `Ctrl+L`, the current breadcrumb,
+  or an empty area of the bar opens its editor
+- Asynchronous local-directory suggestions support absolute paths, `~/` and paths
+  relative to the active tab. Use Up/Down to choose, Tab to complete, and Enter to
+  accept a suggestion or navigate; typed URIs remain available for remote locations
+- Readable local paths and breadcrumb labels preserve spaces, Unicode and special
+  characters without double-encoding; failed navigation leaves location and history unchanged
 - Show / hide hidden files (dotfiles) through the view popover; the active tab
   updates immediately and other tabs apply the setting when selected
 - Empty-folder page when there are no visible items
@@ -268,6 +272,9 @@ The header bar separates navigation, view controls and app settings:
 
 - **App menu**, next to the name at the top left: Preferences and About Kito Files.
 - **Navigation and path**: back, forward, up, clickable breadcrumbs and a path editor.
+  Click its empty area or press `Ctrl+L` to edit; local directory suggestions appear
+  as you type, with relative paths based on the active tab. Tab completes the selected
+  suggestion (or the common prefix), and Enter accepts a suggestion or opens the path.
 - **View selector**, at the top right: Icons, Compact, Details and Show Hidden Files.
   The popover stays open while changing view options.
 - **New tab** button: opens the current location in another tab.

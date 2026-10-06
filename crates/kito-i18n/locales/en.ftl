@@ -36,7 +36,10 @@ menu-about = About Kito Files
 menu-preferences = Preferences…
 
 ## Path bar
+path-bar-name = Location
+path-bar-description = Click an empty area or press Ctrl+L to edit the path
 path-placeholder = Type a path, Enter to go
+path-suggestions = Path suggestions
 crumb-edit-current = Click to edit path
 crumb-edit-path = Edit path
 crumb-root = Filesystem root
@@ -80,6 +83,7 @@ status-selected =
 
 ## Tabs
 error-open-folder = Could not open folder
+error-invalid-path = Enter a local path or URI to open.
 empty-folder = This folder is empty
 error-open-file = Could not open file
 error-open-file-detail = Kito Files could not start the default application: { $error }
