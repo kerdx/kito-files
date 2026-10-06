@@ -2,9 +2,10 @@
 //!
 //! Il sottomenu ("Crea") è una seconda popover accanto alla prima, non
 //! una colonna interna: così il menu principale non cambia dimensione e
-//! resta fermo. Finché il sottomenu è aperto il padre ha `autohide`
-//! disattivato, altrimenti GTK lo chiuderebbe appena il puntatore passa
-//! sulla superficie del figlio.
+//! resta fermo. Entrambi i popover restano sempre `autohide`: la
+//! chiusura a cascata è gestita dai nostri handler `closed`, senza
+//! toccare `autohide` su popover visibili (GTK vi unrealizza la
+//! superficie e sbilancia i grab -> finestra sorda ai click).
 
 use adw::prelude::*;
 use gtk::gio;
@@ -154,34 +155,37 @@ const TRASH_BACKGROUND_ROWS: [Row; 1] = [danger_row(
 /// sue righe: dà tempo di arrivarci davvero.
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
 
-/// Sottomenu aperto e timer che lo chiude. I riferimenti sono deboli:
+/// Sottomenu aperto e timer che lo chiude. Il riferimento è debole:
 /// le righe del menu stanno dentro i popover, non li tengono vivi.
 #[derive(Default)]
 struct MenuState {
     submenu: RefCell<Option<glib::WeakRef<gtk::Popover>>>,
-    parent: RefCell<Option<glib::WeakRef<gtk::Popover>>>,
     timer: RefCell<Option<glib::SourceId>>,
 }
 
 impl MenuState {
-    /// Chiude il sottomenu e ridà al padre la chiusura automatica.
+    /// Chiude il sottomenu; la chiusura del figlio chiude anche il
+    /// padre (cascata in `open_submenu`), e la chiusura del padre
+    /// chiude il figlio (handler in `popup`).
     fn close_submenu(&self) {
         self.cancel_close();
-        if let Some(weak) = self.submenu.borrow_mut().take() {
+        // `take()` fuori dall'`if let`: il `RefMut` temporaneo muore a
+        // fine istruzione, prima di `popdown()`. Nello scrutinee di
+        // `if let` (edition 2021) vivrebbe fino a fine blocco, e
+        // `popdown()` emette `closed` in modo sincrono rientrando qui
+        // via `connect_closed` -> "RefCell already borrowed" -> abort.
+        let submenu = self.submenu.borrow_mut().take();
+        if let Some(weak) = submenu {
             if let Some(popover) = weak.upgrade() {
                 popover.popdown();
-            }
-        }
-        if let Some(weak) = self.parent.borrow_mut().take() {
-            if let Some(popover) = weak.upgrade() {
-                popover.set_autohide(true);
             }
         }
     }
 
     /// Il puntatore è ancora dentro il menu: nessuna chiusura in arrivo.
     fn cancel_close(&self) {
-        if let Some(id) = self.timer.borrow_mut().take() {
+        let timer = self.timer.borrow_mut().take();
+        if let Some(id) = timer {
             id.remove();
         }
     }
@@ -320,8 +324,10 @@ fn build(
 }
 
 /// Apre il sottomenu accanto alla riga `anchor`, una volta sola.
-/// Il padre perde `autohide` finché il figlio è aperto: è la causa dei
-/// menu che spariscono appena il puntatore entra nel sottomenu.
+/// La chiusura a cascata è nei due handler `closed`: il figlio chiude
+/// il padre e il padre chiude il figlio. Niente `set_autohide`: su un
+/// popover visibile GTK ne unrealizza la superficie e i grab restano
+/// sbilanciati (finestra sorda ai click).
 fn open_submenu(
     anchor: &gtk::Button,
     parent: &gtk::Popover,
@@ -382,8 +388,6 @@ fn open_submenu(
     child.set_margin_bottom(6);
 
     *state.submenu.borrow_mut() = Some(child.downgrade());
-    *state.parent.borrow_mut() = Some(parent.downgrade());
-    parent.set_autohide(false);
     child.popup();
 }
 
