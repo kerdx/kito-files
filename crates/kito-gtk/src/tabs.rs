@@ -25,14 +25,109 @@ pub struct FileTab {
     stack: gtk::Stack,
     selection: RefCell<gtk::SingleSelection>,
     mode: Cell<ViewMode>,
-    current: Rc<RefCell<String>>,
-    back_stack: RefCell<Vec<String>>,
-    forward_stack: RefCell<Vec<String>>,
+    history: NavHistory,
     show_hidden: Rc<Cell<bool>>,
     window: adw::ApplicationWindow,
     on_navigate: OnNavigate,
     on_history: OnHistory,
     on_status: OnStatus,
+}
+
+/// How the target was chosen: drives the history update on success.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavKind {
+    Visit,
+    Back,
+    Forward,
+}
+
+/// Navigation history: current URI + back/forward stacks. No GTK, no
+/// GIO: fully headless-testable. `current` is shared with the
+/// background gesture, which reads it without retaining the tab.
+#[derive(Default)]
+struct NavHistory {
+    current: Rc<RefCell<String>>,
+    back: RefCell<Vec<String>>,
+    forward: RefCell<Vec<String>>,
+}
+
+impl NavHistory {
+    /// Target URI for the action, or `None` when there is nothing to do
+    /// (empty URI, empty back/forward stacks). A visit always loads,
+    /// even to the current URI (refresh); `uri` is ignored otherwise.
+    fn target(&self, kind: NavKind, uri: &str) -> Option<String> {
+        match kind {
+            NavKind::Visit => {
+                if uri.is_empty() {
+                    None
+                } else {
+                    Some(uri.to_string())
+                }
+            }
+            NavKind::Back => self.back.borrow().last().cloned(),
+            NavKind::Forward => self.forward.borrow().last().cloned(),
+        }
+    }
+
+    /// History changes for a SUCCESSFUL load of `target` (`previous` is
+    /// the current URI from before the load). Never runs on failure, so
+    /// a failed load leaves everything untouched.
+    fn commit(&self, kind: NavKind, previous: &str, target: &str) {
+        match kind {
+            NavKind::Visit => {
+                if !previous.is_empty() && previous != target {
+                    self.back.borrow_mut().push(previous.to_string());
+                    self.forward.borrow_mut().clear();
+                }
+            }
+            NavKind::Back => {
+                self.back.borrow_mut().pop();
+                self.forward.borrow_mut().push(previous.to_string());
+            }
+            NavKind::Forward => {
+                self.forward.borrow_mut().pop();
+                self.back.borrow_mut().push(previous.to_string());
+            }
+        }
+        *self.current.borrow_mut() = target.to_string();
+    }
+
+    fn current_uri(&self) -> String {
+        self.current.borrow().clone()
+    }
+
+    fn shared_current(&self) -> Rc<RefCell<String>> {
+        self.current.clone()
+    }
+
+    fn can_go_back(&self) -> bool {
+        !self.back.borrow().is_empty()
+    }
+
+    fn can_go_forward(&self) -> bool {
+        !self.forward.borrow().is_empty()
+    }
+}
+
+/// Runs one navigation: resolves the target, loads it, and commits the
+/// history change only on success. Returns whether anything was
+/// committed. The loader is injectable so successes and failures are
+/// testable without widgets or GIO.
+fn run_navigation(
+    history: &NavHistory,
+    kind: NavKind,
+    uri: &str,
+    load: impl FnOnce(&str) -> bool,
+) -> bool {
+    let Some(target) = history.target(kind, uri) else {
+        return false;
+    };
+    let previous = history.current_uri();
+    if load(&target) {
+        history.commit(kind, &previous, &target);
+        return true;
+    }
+    false
 }
 
 fn activate_at(tab: &Rc<FileTab>, pos: u32) {
@@ -69,7 +164,7 @@ fn rebuild_view(tab: &Rc<FileTab>) {
                 tab.selection.borrow().select_item(pos, true);
             }
             // In trash the menu changes: restore instead of rename.
-            if is_trash_uri(&tab.current.borrow()) {
+            if is_trash_uri(&tab.history.current_uri()) {
                 crate::context_menu::show_trash(anchor, x, y, &tab.window);
             } else {
                 crate::context_menu::show(anchor, x, y, &tab.window);
@@ -111,25 +206,30 @@ impl FileTab {
     }
 
     pub fn load(&self, uri: &str) {
-        // User navigation: record in history (reload excluded:
-        // same URI, nothing to record).
-        let current = self.current.borrow().clone();
-        if !current.is_empty() && current != uri {
-            self.back_stack.borrow_mut().push(current);
-            self.forward_stack.borrow_mut().clear();
-        }
-        self.load_raw(uri);
+        self.navigate(NavKind::Visit, uri);
     }
 
-    fn load_raw(&self, uri: &str) {
+    /// Single navigation path: resolves the target, loads it, and only
+    /// on success commits the history change and refreshes the buttons.
+    /// A failed load leaves current URI, view content and both stacks
+    /// untouched; the error dialog comes from `load_raw`.
+    fn navigate(&self, kind: NavKind, uri: &str) {
+        if run_navigation(&self.history, kind, uri, |target| self.load_raw(target)) {
+            self.emit_history();
+        }
+    }
+
+    /// Loads `uri` into the view, updating current URI, title, view and
+    /// chrome on success. Returns whether it worked; shows a dialog on
+    /// failure without touching any state.
+    fn load_raw(&self, uri: &str) -> bool {
         match file_list::reload(&self.store, uri, self.show_hidden.get()) {
             Ok(n) => {
-                *self.current.borrow_mut() = uri.to_string();
                 self.page.set_title(&Self::title_for(uri));
                 self.stack
                     .set_visible_child_name(if n == 0 { "empty" } else { "list" });
                 (self.on_navigate)(uri, n, self.mode.get());
-                self.emit_history();
+                true
             }
             Err(e) => {
                 let dialog = adw::AlertDialog::builder()
@@ -138,41 +238,27 @@ impl FileTab {
                     .build();
                 dialog.add_response("ok", "Ok");
                 dialog.present(Some(&self.window));
+                false
             }
         }
     }
 
     fn emit_history(&self) {
-        (self.on_history)(
-            !self.back_stack.borrow().is_empty(),
-            !self.forward_stack.borrow().is_empty(),
-        );
+        (self.on_history)(self.history.can_go_back(), self.history.can_go_forward());
     }
 
     pub fn go_back(&self) {
-        let Some(prev) = self.back_stack.borrow_mut().pop() else {
-            return;
-        };
-        self.forward_stack
-            .borrow_mut()
-            .push(self.current.borrow().clone());
-        self.load_raw(&prev);
+        self.navigate(NavKind::Back, "");
     }
 
     pub fn go_forward(&self) {
-        let Some(next) = self.forward_stack.borrow_mut().pop() else {
-            return;
-        };
-        self.back_stack
-            .borrow_mut()
-            .push(self.current.borrow().clone());
-        self.load_raw(&next);
+        self.navigate(NavKind::Forward, "");
     }
 
     /// Realigns pathbar + status + history + view to the tab (tab switch).
     fn sync_chrome(&self) {
         (self.on_navigate)(
-            &self.current.borrow(),
+            &self.history.current_uri(),
             self.store.n_items() as usize,
             self.mode.get(),
         );
@@ -183,7 +269,7 @@ impl FileTab {
 
     /// Reloads the tab's current folder.
     pub fn reload(&self) {
-        let uri = self.current.borrow().clone();
+        let uri = self.history.current_uri();
         if !uri.is_empty() {
             self.load(&uri);
         }
@@ -281,7 +367,7 @@ impl TabManager {
     }
 
     pub fn selected_uri(&self) -> Option<String> {
-        self.selected().map(|t| t.current.borrow().clone())
+        self.selected().map(|t| t.history.current_uri())
     }
 
     /// Loads `uri` into the selected tab (used by sidebar and up arrow).
@@ -353,9 +439,7 @@ impl TabManager {
                 FileObject,
             >()))),
             mode: Cell::new(ViewMode::default()),
-            current: Rc::new(RefCell::new(String::new())),
-            back_stack: RefCell::new(Vec::new()),
-            forward_stack: RefCell::new(Vec::new()),
+            history: NavHistory::default(),
             show_hidden: self.show_hidden.clone(),
             window: self.window.clone(),
             on_navigate: self.on_navigate.clone(),
@@ -370,7 +454,7 @@ impl TabManager {
         let background = gtk::GestureClick::builder().button(3).build();
         background.connect_pressed({
             let window = self.window.clone();
-            let current = tab.current.clone();
+            let current = tab.history.shared_current();
             move |gesture, _, x, y| {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 let Some(anchor) = gesture.widget() else {
@@ -389,5 +473,148 @@ impl TabManager {
 
         self.tab_view.set_selected_page(&page);
         tab.load(uri);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri(path: &std::path::Path) -> String {
+        format!("file://{}", path.display())
+    }
+
+    fn fixture() -> (tempfile::TempDir, String, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["A", "B", "C"] {
+            std::fs::create_dir(tmp.path().join(name)).unwrap();
+        }
+        let a = uri(&tmp.path().join("A"));
+        let b = uri(&tmp.path().join("B"));
+        let c = uri(&tmp.path().join("C"));
+        (tmp, a, b, c)
+    }
+
+    fn snapshot(history: &NavHistory) -> (String, Vec<String>, Vec<String>) {
+        (
+            history.current_uri(),
+            history.back.borrow().clone(),
+            history.forward.borrow().clone(),
+        )
+    }
+
+    #[test]
+    fn successful_trip_back_and_forward() {
+        let (_tmp, a, b, c) = fixture();
+        let history = NavHistory::default();
+        assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
+        assert!(run_navigation(&history, NavKind::Visit, &b, |_| true));
+        assert!(run_navigation(&history, NavKind::Visit, &c, |_| true));
+        assert_eq!(
+            snapshot(&history),
+            (c.clone(), vec![a.clone(), b.clone()], vec![])
+        );
+        assert!(history.can_go_back() && !history.can_go_forward());
+
+        assert!(run_navigation(&history, NavKind::Back, "", |_| true));
+        assert_eq!(
+            snapshot(&history),
+            (b.clone(), vec![a.clone()], vec![c.clone()])
+        );
+        assert!(run_navigation(&history, NavKind::Back, "", |_| true));
+        assert_eq!(
+            snapshot(&history),
+            (a.clone(), vec![], vec![c.clone(), b.clone()])
+        );
+        assert!(!history.can_go_back() && history.can_go_forward());
+
+        assert!(run_navigation(&history, NavKind::Forward, "", |_| true));
+        assert_eq!(
+            snapshot(&history),
+            (b.clone(), vec![a.clone()], vec![c.clone()])
+        );
+    }
+
+    #[test]
+    fn failed_visit_keeps_history() {
+        let (_tmp, a, b, _c) = fixture();
+        let history = NavHistory::default();
+        assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
+        // Target missing: nothing loads, nothing changes.
+        assert!(!run_navigation(
+            &history,
+            NavKind::Visit,
+            "file:///no/such/dir",
+            |_| false
+        ));
+        assert_eq!(snapshot(&history), (a.clone(), vec![], vec![]));
+    }
+
+    #[test]
+    fn back_to_removed_dir_keeps_state() {
+        let (tmp, a, b, _c) = fixture();
+        let history = NavHistory::default();
+        assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
+        assert!(run_navigation(&history, NavKind::Visit, &b, |_| true));
+        std::fs::remove_dir(tmp.path().join("A")).unwrap();
+        // A is gone: back fails, current/view/stacks unchanged.
+        assert!(!run_navigation(&history, NavKind::Back, "", |_| false));
+        assert_eq!(snapshot(&history), (b.clone(), vec![a.clone()], vec![]));
+    }
+
+    #[test]
+    fn forward_to_removed_dir_keeps_state() {
+        let (tmp, a, b, _c) = fixture();
+        let history = NavHistory::default();
+        assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
+        assert!(run_navigation(&history, NavKind::Visit, &b, |_| true));
+        assert!(run_navigation(&history, NavKind::Back, "", |_| true));
+        std::fs::remove_dir(tmp.path().join("B")).unwrap();
+        assert!(!run_navigation(&history, NavKind::Forward, "", |_| false));
+        assert_eq!(snapshot(&history), (a.clone(), vec![], vec![b.clone()]));
+    }
+
+    #[test]
+    fn refresh_changes_nothing() {
+        let (_tmp, a, b, _c) = fixture();
+        let history = NavHistory::default();
+        assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
+        assert!(run_navigation(&history, NavKind::Visit, &b, |_| true));
+        let before = snapshot(&history);
+        // Refresh succeeds: content reloads, history untouched.
+        assert!(run_navigation(&history, NavKind::Visit, &b, |_| true));
+        assert_eq!(snapshot(&history), before);
+        // Refresh fails: still untouched.
+        assert!(!run_navigation(&history, NavKind::Visit, &b, |_| false));
+        assert_eq!(snapshot(&history), before);
+    }
+
+    #[test]
+    fn forward_cleared_only_on_success() {
+        let (_tmp, a, b, c) = fixture();
+        let history = NavHistory::default();
+        assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
+        assert!(run_navigation(&history, NavKind::Visit, &b, |_| true));
+        assert!(run_navigation(&history, NavKind::Back, "", |_| true));
+        // New visit fails: forward stack survives.
+        assert!(!run_navigation(&history, NavKind::Visit, &c, |_| false));
+        assert_eq!(snapshot(&history), (a.clone(), vec![], vec![b.clone()]));
+        // New visit succeeds: forward cleared, previous recorded.
+        assert!(run_navigation(&history, NavKind::Visit, &c, |_| true));
+        assert_eq!(snapshot(&history), (c.clone(), vec![a.clone()], vec![]));
+    }
+
+    #[test]
+    fn histories_are_independent_per_tab() {
+        let (_tmp, a, b, c) = fixture();
+        let first = NavHistory::default();
+        let second = NavHistory::default();
+        assert!(run_navigation(&first, NavKind::Visit, &a, |_| true));
+        assert!(run_navigation(&first, NavKind::Visit, &b, |_| true));
+        assert!(run_navigation(&second, NavKind::Visit, &c, |_| true));
+        assert_eq!(snapshot(&first), (b.clone(), vec![a.clone()], vec![]));
+        assert_eq!(snapshot(&second), (c.clone(), vec![], vec![]));
+        assert!(!run_navigation(&second, NavKind::Back, "", |_| true));
+        assert_eq!(snapshot(&first), (b.clone(), vec![a.clone()], vec![]));
     }
 }

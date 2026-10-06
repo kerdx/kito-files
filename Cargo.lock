@@ -443,6 +443,7 @@ dependencies = [
  "gtk4",
  "kito-core",
  "libadwaita",
+ "tempfile",
 ]
 
 [[package]]
