@@ -73,20 +73,30 @@ pub fn trash(uri: &str) -> Result<(), glib::Error> {
 }
 
 /// Cancellazione permanente ricorsiva. La UI chiede conferma prima.
+/// I collegamenti simbolici non vengono mai seguiti: eliminare un
+/// symlink rimuove solo il collegamento, anche se punta a una
+/// directory (esterna, interrotta o circolare).
 pub fn delete_recursive(uri: &str) -> Result<(), glib::Error> {
     let file = gio::File::for_uri(uri);
-    if file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
-        == gio::FileType::Directory
+    // NOFOLLOW_SYMLINKS: un symlink (a file o directory, esistente o
+    // interrotto) ha tipo SymbolicLink e salta la ricorsione; la delete
+    // finale rimuove il solo collegamento. Senza questo flag un symlink
+    // a directory verrebbe attraversato, cancellando i file della
+    // destinazione, e uno circolare ricorserebbe all'infinito.
+    if file.query_file_type(
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        gio::Cancellable::NONE,
+    ) == gio::FileType::Directory
     {
         // Enumerazione best-effort: su alcuni backend (cestino) l'elenco
         // dei figli può fallire; in quel caso si prova subito la delete.
         if let Ok(children) = file.enumerate_children(
             "standard::name",
-            gio::FileQueryInfoFlags::NONE,
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         ) {
-            while let Ok(Some(info)) = children.next_file(gio::Cancellable::NONE) {
-                let _ = delete_recursive(&children.child(&info).uri());
+            while let Some(info) = children.next_file(gio::Cancellable::NONE)? {
+                delete_recursive(&children.child(&info).uri())?;
             }
         }
     }
@@ -449,6 +459,91 @@ mod tests {
 
         delete_recursive(&uri(&tmp.path().join("docs"))).unwrap();
         assert!(!tmp.path().join("docs").exists());
+    }
+
+    #[test]
+    fn delete_symlink_to_external_dir_keeps_target() {
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("keep.txt"), b"do not touch").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(external.path(), &link).unwrap();
+
+        delete_recursive(&uri(&link)).unwrap();
+
+        // Sparisce solo il collegamento: destinazione intatta.
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(
+            std::fs::read(external.path().join("keep.txt")).unwrap(),
+            b"do not touch"
+        );
+    }
+
+    #[test]
+    fn delete_dir_with_external_symlink_keeps_target() {
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("data.txt"), b"data").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inner.txt"), b"inner").unwrap();
+        std::os::unix::fs::symlink(external.path(), dir.path().join("ext")).unwrap();
+
+        delete_recursive(&uri(dir.path())).unwrap();
+
+        assert!(!dir.path().exists());
+        assert_eq!(
+            std::fs::read(external.path().join("data.txt")).unwrap(),
+            b"data"
+        );
+    }
+
+    #[test]
+    fn delete_broken_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("no-such-target"), &link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+
+        delete_recursive(&uri(&link)).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).is_err());
+    }
+
+    #[test]
+    fn delete_circular_symlink_does_not_recurse() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("file.txt"), b"x").unwrap();
+        // Collegamento alla directory che lo contiene: seguirlo
+        // ricorserebbe all'infinito.
+        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
+
+        delete_recursive(&uri(tmp.path())).unwrap();
+
+        assert!(!tmp.path().exists());
+    }
+
+    #[test]
+    fn delete_plain_tree_is_recursive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("deep.txt"), b"deep").unwrap();
+        // Symlink a file dentro l'albero: si elimina col resto.
+        std::os::unix::fs::symlink(
+            nested.join("deep.txt"),
+            tmp.path().join("a").join("file-link.txt"),
+        )
+        .unwrap();
+
+        delete_recursive(&uri(&tmp.path().join("a"))).unwrap();
+
+        assert!(!tmp.path().join("a").exists());
+    }
+
+    #[test]
+    fn delete_missing_returns_error() {
+        assert!(
+            delete_recursive(&uri(&tempfile::tempdir().unwrap().path().join("ghost"))).is_err()
+        );
     }
 
     #[test]
