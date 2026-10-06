@@ -301,9 +301,53 @@ fn copy_recursive(src: &gio::File, dest: &gio::File) -> Result<(), glib::Error> 
     }
 }
 
+/// `true` se `dest_dir` è `src` o un suo discendente: copiarci dentro
+/// una directory creerebbe la destinazione prima di enumerarla, e la
+/// ricorsione la ricopierebbe all'infinito (copie annidate).
+fn dest_inside_src(src: &gio::File, dest_dir: &gio::File) -> bool {
+    // Percorsi locali: identità fisica via canonicalizzazione (risolve
+    // `..`, i symlink nella destinazione stessa e nei componenti
+    // intermedi). Niente prefissi testuali: `Path::starts_with` lavora
+    // per componenti (`/tmp/A2` non è dentro `/tmp/A`).
+    if let (Some(src_path), Some(dest_path)) = (src.path(), dest_dir.path()) {
+        if let (Ok(src_canon), Ok(dest_canon)) = (
+            std::fs::canonicalize(&src_path),
+            std::fs::canonicalize(&dest_path),
+        ) {
+            return dest_canon.starts_with(&src_canon);
+        }
+        // Sorgente o destinazione non canonicalizzabile (mancante): si
+        // lascia fallire la copia con il suo errore naturale.
+        return false;
+    }
+    // Backend non locali (trash://, network://, ...): nessuna identità
+    // fisica né symlink da risolvere; confronto sulle URI normalizzate
+    // con guardia sul separatore. Limite: alias dello stesso oggetto con
+    // URI diverse (o maiuscole diverse su backend case-insensitive) non
+    // vengono rilevati.
+    let norm = |uri: glib::GString| {
+        let s = uri.to_string();
+        s.trim_end_matches('/').to_string()
+    };
+    let s = norm(src.uri());
+    let d = norm(dest_dir.uri());
+    d == s || d.starts_with(&format!("{s}/"))
+}
+
 /// Copia file o cartella (ricorsiva) dentro `dest_dir_uri`.
+/// Copiare una directory dentro sé stessa o in un suo discendente è
+/// rifiutato prima di creare alcunché.
 pub fn copy_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
     let src = gio::File::for_uri(src_uri);
+    let dest_dir = gio::File::for_uri(dest_dir_uri);
+    if src.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+        == gio::FileType::Directory
+        && dest_inside_src(&src, &dest_dir)
+    {
+        return Err(io_error(
+            "Cannot copy a folder into itself or one of its subfolders",
+        ));
+    }
     let name = src
         .basename()
         .and_then(|n| n.into_string().ok())
@@ -543,6 +587,112 @@ mod tests {
     fn delete_missing_returns_error() {
         assert!(
             delete_recursive(&uri(&tempfile::tempdir().unwrap().path().join("ghost"))).is_err()
+        );
+    }
+
+    /// Nomi ordinati delle voci di `dir`: istantanea per verificare che
+    /// un'operazione rifiutata non crei nulla.
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn copy_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("A");
+        std::fs::create_dir_all(a.join("sub")).unwrap();
+        std::fs::write(a.join("f.txt"), b"effe").unwrap();
+        std::fs::write(a.join("sub").join("g.txt"), b"gi").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn copy_dir_into_itself_is_rejected() {
+        let tmp = copy_fixture();
+        let a = tmp.path().join("A");
+        let before = names(&a);
+
+        assert!(copy_to(&uri(&a), &uri(&a)).is_err());
+
+        // Nulla creato, sorgente intatta.
+        assert_eq!(names(&a), before);
+        assert_eq!(std::fs::read(a.join("f.txt")).unwrap(), b"effe");
+        assert_eq!(std::fs::read(a.join("sub").join("g.txt")).unwrap(), b"gi");
+    }
+
+    #[test]
+    fn copy_dir_into_subdir_is_rejected() {
+        let tmp = copy_fixture();
+        let a = tmp.path().join("A");
+        let sub = a.join("sub");
+        let before_a = names(&a);
+        let before_sub = names(&sub);
+
+        assert!(copy_to(&uri(&a), &uri(&sub)).is_err());
+
+        assert_eq!(names(&a), before_a);
+        assert_eq!(names(&sub), before_sub);
+        assert_eq!(std::fs::read(a.join("f.txt")).unwrap(), b"effe");
+    }
+
+    #[test]
+    fn copy_dir_through_symlink_dest_is_rejected() {
+        let tmp = copy_fixture();
+        let a = tmp.path().join("A");
+        let before = names(&a);
+        std::os::unix::fs::symlink(&a, tmp.path().join("link_a")).unwrap();
+        std::os::unix::fs::symlink(a.join("sub"), tmp.path().join("link_sub")).unwrap();
+
+        // Destinazione che raggiunge A o un suo discendente via symlink.
+        assert!(copy_to(&uri(&a), &uri(&tmp.path().join("link_a"))).is_err());
+        assert!(copy_to(&uri(&a), &uri(&tmp.path().join("link_sub"))).is_err());
+
+        assert_eq!(names(&a), before);
+        assert_eq!(std::fs::read(a.join("f.txt")).unwrap(), b"effe");
+    }
+
+    #[test]
+    fn copy_between_siblings_with_prefix_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("A");
+        let a2 = tmp.path().join("A2");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&a2).unwrap();
+        std::fs::write(a.join("a.txt"), b"a").unwrap();
+        std::fs::write(a2.join("b.txt"), b"b").unwrap();
+
+        // `A2` non è dentro `A` nonostante il prefisso: copie valide.
+        copy_to(&uri(&a2), &uri(&a)).unwrap();
+        assert_eq!(std::fs::read(a.join("A2").join("b.txt")).unwrap(), b"b");
+        copy_to(&uri(&a), &uri(&a2)).unwrap();
+        assert_eq!(std::fs::read(a2.join("A").join("a.txt")).unwrap(), b"a");
+        // Sorgenti intatte.
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(a2.join("b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn copy_dir_collision_gets_copy_suffix() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("docs")).unwrap();
+        std::fs::write(src.path().join("docs").join("a.txt"), b"aaa").unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dest.path().join("docs")).unwrap();
+        std::fs::write(dest.path().join("docs").join("other.txt"), b"o").unwrap();
+
+        copy_to(&uri(&src.path().join("docs")), &uri(dest.path())).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.path().join("docs (copy)").join("a.txt")).unwrap(),
+            b"aaa"
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("docs").join("other.txt")).unwrap(),
+            b"o"
         );
     }
 

@@ -120,22 +120,28 @@ impl Ctx {
         Self::run_in_thread(
             move || {
                 let mut failed = 0;
+                let mut first_error = None;
                 for uri in &uris {
                     let r = if cut {
                         kito_core::move_to(uri, &dest)
                     } else {
                         kito_core::copy_to(uri, &dest)
                     };
-                    if r.is_err() {
+                    if let Err(e) = r {
                         failed += 1;
+                        if first_error.is_none() {
+                            first_error = Some(e.to_string());
+                        }
                     }
                 }
-                (uris.len(), failed)
+                (uris.len(), failed, first_error)
             },
-            move |(total, failed)| {
+            move |(total, failed, first_error): (usize, i32, Option<String>)| {
                 this.manager.reload_selected();
                 if failed == 0 {
                     this.toast(&format!("Pasted {total} item(s)"));
+                } else if let Some(error) = first_error {
+                    this.error_dialog("Could not paste", error);
                 } else {
                     this.toast(&format!("{failed} of {total} item(s) failed"));
                 }
@@ -168,17 +174,23 @@ impl Ctx {
                     Self::run_in_thread(
                         move || {
                             let mut failed = 0;
+                            let mut first_error = None;
                             for uri in &uris {
-                                if kito_core::copy_to(uri, &dest).is_err() {
+                                if let Err(e) = kito_core::copy_to(uri, &dest) {
                                     failed += 1;
+                                    if first_error.is_none() {
+                                        first_error = Some(e.to_string());
+                                    }
                                 }
                             }
-                            (uris.len(), failed)
+                            (uris.len(), failed, first_error)
                         },
-                        move |(total, failed)| {
+                        move |(total, failed, first_error): (usize, i32, Option<String>)| {
                             this.manager.reload_selected();
                             if failed == 0 {
                                 this.toast(&format!("Pasted {total} item(s)"));
+                            } else if let Some(error) = first_error {
+                                this.error_dialog("Could not paste", error);
                             } else {
                                 this.toast(&format!("{failed} of {total} item(s) failed"));
                             }
