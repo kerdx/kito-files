@@ -11,8 +11,8 @@ use adw::prelude::*;
 use gtk::gio;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
-/// One menu row: icons, label, `win.*` action (empty for a
-/// submenu) and destructive flag.
+/// One menu row: icons, message id for the label, `win.*` action
+/// (empty for a submenu) and destructive flag.
 struct Row {
     icons: &'static [&'static str],
     label: &'static str,
@@ -63,21 +63,21 @@ const fn menu(
 
 /// Menu on a selected entry (row or cell).
 const ROWS: [Row; 9] = [
-    row(&["document-open"], "Open", "open"),
-    row(&["bookmark-new", "list-add"], "Pin to Places", "pin"),
-    row(&["edit-cut"], "Cut", "cut"),
-    row(&["edit-copy"], "Copy", "copy"),
-    row(&["edit-paste"], "Paste", "paste"),
+    row(&["document-open"], "menu-open", "open"),
+    row(&["bookmark-new", "list-add"], "menu-pin", "pin"),
+    row(&["edit-cut"], "menu-cut", "cut"),
+    row(&["edit-copy"], "menu-copy", "copy"),
+    row(&["edit-paste"], "menu-paste", "paste"),
     row(
         &["document-edit", "document-edit-symbolic"],
-        "Rename…",
+        "menu-rename",
         "rename",
     ),
-    row(&["user-trash"], "Move to Trash", "trash"),
-    danger_row(&["edit-delete"], "Delete Permanently…", "delete"),
+    row(&["user-trash"], "menu-trash", "trash"),
+    danger_row(&["edit-delete"], "menu-delete", "delete"),
     row(
         &["dialog-information", "help-about"],
-        "Properties",
+        "menu-properties",
         "properties",
     ),
 ];
@@ -87,13 +87,13 @@ const SEPARATORS_AFTER: [usize; 3] = [1, 4, 7];
 
 /// Menu on an entry inside the trash: restore and delete.
 const TRASH_ROWS: [Row; 5] = [
-    row(&["document-revert", "edit-undo"], "Restore", "restore"),
-    row(&["edit-cut"], "Cut", "cut"),
-    row(&["edit-copy"], "Copy", "copy"),
-    danger_row(&["edit-delete"], "Delete Permanently…", "delete"),
+    row(&["document-revert", "edit-undo"], "menu-restore", "restore"),
+    row(&["edit-cut"], "menu-cut", "cut"),
+    row(&["edit-copy"], "menu-copy", "copy"),
+    danger_row(&["edit-delete"], "menu-delete", "delete"),
     row(
         &["dialog-information", "help-about"],
-        "Properties",
+        "menu-properties",
         "properties",
     ),
 ];
@@ -106,37 +106,46 @@ const TRASH_SEPARATORS_AFTER: [usize; 3] = [0, 2, 3];
 const CREATE_ROWS: [Row; 6] = [
     row(
         &["folder-new", "folder-new-symbolic"],
-        "New Folder",
+        "menu-new-folder",
         "new-folder",
     ),
-    row(&["text-x-generic"], "New Text File", "new-text-file"),
-    row(&["document-new"], "New Empty File", "new-empty-file"),
+    row(&["text-x-generic"], "menu-new-text-file", "new-text-file"),
+    row(&["document-new"], "menu-new-empty-file", "new-empty-file"),
     row(
         &["x-office-document", "application-msword"],
-        "Word Document",
+        "menu-new-word-doc",
         "new-word-doc",
     ),
-    row(&["x-office-spreadsheet"], "Spreadsheet", "new-spreadsheet"),
-    row(&["text-html"], "HTML Page", "new-html-page"),
+    row(
+        &["x-office-spreadsheet"],
+        "menu-new-spreadsheet",
+        "new-spreadsheet",
+    ),
+    row(&["text-html"], "menu-new-html", "new-html-page"),
 ];
 
 /// Menu on the background (empty folder area).
 const BACKGROUND_ROWS: [Row; 5] = [
-    menu(&["list-add", "folder-new"], "Create", &CREATE_ROWS, &[]),
-    row(&["edit-paste"], "Paste", "paste"),
+    menu(
+        &["list-add", "folder-new"],
+        "menu-create",
+        &CREATE_ROWS,
+        &[],
+    ),
+    row(&["edit-paste"], "menu-paste", "paste"),
     row(
         &["utilities-terminal", "terminal"],
-        "Open Terminal",
+        "menu-open-terminal",
         "open-terminal",
     ),
     row(
         &["utilities-terminal", "terminal"],
-        "Open Terminal as Root",
+        "menu-open-terminal-root",
         "open-terminal-root",
     ),
     row(
         &["dialog-information", "help-about"],
-        "Properties",
+        "menu-properties",
         "properties",
     ),
 ];
@@ -147,7 +156,7 @@ const BACKGROUND_SEPARATORS_AFTER: [usize; 3] = [0, 2, 4];
 /// Trash background: the only sensible action is emptying it.
 const TRASH_BACKGROUND_ROWS: [Row; 1] = [danger_row(
     &["user-trash-full", "user-trash"],
-    "Empty Trash…",
+    "menu-empty-trash",
     "empty-trash",
 )];
 
@@ -230,7 +239,7 @@ fn row_button(r: &Row) -> gtk::Button {
     image.set_pixel_size(18);
     content.append(&image);
     let text = gtk::Label::builder()
-        .label(r.label)
+        .label(crate::l10n::tr(r.label))
         .halign(gtk::Align::Start)
         .hexpand(true)
         .build();

@@ -4,7 +4,10 @@
 
 mod context_menu;
 mod file_list;
+mod l10n;
 mod ops;
+mod preferences;
+mod preferences_dialog;
 mod sidebar;
 mod tabs;
 mod terminal;
@@ -12,6 +15,8 @@ mod terminal;
 use adw::prelude::*;
 use file_list::ViewMode;
 use gtk::{gdk, gio, glib};
+use l10n::{tr, tr_num};
+use preferences::PreferenceStore;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -57,16 +62,30 @@ fn view_row(names: &[&str], label: &str) -> gtk::ToggleButton {
 type ActionDef = (&'static str, fn(&ops::Ctx));
 
 /// Registers the `win.*` actions (menu + shortcuts) on the window.
-fn register_actions(app: &adw::Application, window: &adw::ApplicationWindow, ctx: Rc<ops::Ctx>) {
+fn register_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    ctx: Rc<ops::Ctx>,
+    preferences: Rc<PreferenceStore>,
+    preferences_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
+) {
     let group = gio::SimpleActionGroup::new();
     let defs: [ActionDef; 22] = [
         ("open", ops::Ctx::open_selected),
         ("new-folder", ops::Ctx::new_folder),
-        ("new-text-file", |c| c.new_file("New Text File.txt")),
-        ("new-empty-file", |c| c.new_file("New File")),
-        ("new-word-doc", |c| c.new_file("New Word Document.docx")),
-        ("new-spreadsheet", |c| c.new_file("New Spreadsheet.xlsx")),
-        ("new-html-page", |c| c.new_file("New HTML Page.html")),
+        ("new-text-file", |c| {
+            c.new_file(format!("{}.txt", tr("suggest-text-file")))
+        }),
+        ("new-empty-file", |c| c.new_file(tr("suggest-empty-file"))),
+        ("new-word-doc", |c| {
+            c.new_file(format!("{}.docx", tr("suggest-word-doc")))
+        }),
+        ("new-spreadsheet", |c| {
+            c.new_file(format!("{}.xlsx", tr("suggest-spreadsheet")))
+        }),
+        ("new-html-page", |c| {
+            c.new_file(format!("{}.html", tr("suggest-html")))
+        }),
         ("open-terminal", ops::Ctx::open_terminal),
         ("open-terminal-root", ops::Ctx::open_terminal_root),
         ("properties", ops::Ctx::show_properties),
@@ -89,6 +108,12 @@ fn register_actions(app: &adw::Application, window: &adw::ApplicationWindow, ctx
         action.connect_activate(move |_, _| run(&ctx));
         group.add_action(&action);
     }
+    let action = gio::SimpleAction::new("preferences", None);
+    let preferences_window = window.clone();
+    action.connect_activate(move |_, _| {
+        preferences_dialog::present(&preferences_window, &preferences, &preferences_dialog);
+    });
+    group.add_action(&action);
     window.insert_action_group("win", Some(&group));
 
     app.set_accels_for_action("win.copy", &["<Control>c"]);
@@ -100,6 +125,7 @@ fn register_actions(app: &adw::Application, window: &adw::ApplicationWindow, ctx
     app.set_accels_for_action("win.edit-path", &["<Control>l"]);
     app.set_accels_for_action("win.reload", &["F5", "<Control>r"]);
     app.set_accels_for_action("win.new-folder", &["<Control><Shift>n"]);
+    app.set_accels_for_action("win.preferences", &["<Control>comma"]);
 }
 
 /// Button with a system-theme icon: base name first (full theme style,
@@ -254,7 +280,7 @@ fn crumb_button(
     let button = if current {
         gtk::Button::builder()
             .css_classes(["current-crumb"])
-            .tooltip_text("Click to edit path")
+            .tooltip_text(tr("crumb-edit-current"))
             .build()
     } else {
         gtk::Button::builder()
@@ -287,21 +313,31 @@ fn rebuild_crumbs(crumbs: &gtk::Box, uri: &str, load: &Rc<dyn Fn(&str)>, edit: &
         // Non-file schemes (trash, network): readable name, clicking
         // opens path writing like for file:// paths.
         let label: String = if uri.starts_with("trash:") {
-            "Trash".to_string()
+            tr("side-trash")
         } else if uri.starts_with("network:") {
-            "Browse network".to_string()
+            tr("side-browse-network")
         } else {
             kito_core::uri_to_display(uri)
         };
         let edit = edit.clone();
-        crumbs.append(&crumb_button(&label, "Edit path", true, move || edit()));
+        crumbs.append(&crumb_button(
+            &label,
+            &tr("crumb-edit-path"),
+            true,
+            move || edit(),
+        ));
         return;
     };
     // `/` alone: already the current folder, so it edits.
     let items = crumb_items(uri);
     if items.len() == 1 {
         let edit = edit.clone();
-        crumbs.append(&crumb_button("/", "Edit path", true, move || edit()));
+        crumbs.append(&crumb_button(
+            "/",
+            &tr("crumb-edit-path"),
+            true,
+            move || edit(),
+        ));
         return;
     }
     let last = items.len() - 1;
@@ -309,7 +345,7 @@ fn rebuild_crumbs(crumbs: &gtk::Box, uri: &str, load: &Rc<dyn Fn(&str)>, edit: &
         if i == 0 {
             let load = load.clone();
             let target = target.clone();
-            crumbs.append(&crumb_button(label, "Filesystem root", false, move || {
+            crumbs.append(&crumb_button(label, &tr("crumb-root"), false, move || {
                 load(&target)
             }));
             continue;
@@ -317,7 +353,12 @@ fn rebuild_crumbs(crumbs: &gtk::Box, uri: &str, load: &Rc<dyn Fn(&str)>, edit: &
         crumbs.append(&crumb_sep());
         if i == last {
             let edit = edit.clone();
-            crumbs.append(&crumb_button(label, "Edit path", true, move || edit()));
+            crumbs.append(&crumb_button(
+                label,
+                &tr("crumb-edit-path"),
+                true,
+                move || edit(),
+            ));
         } else {
             let target = target.clone();
             let label = label.clone();
@@ -333,44 +374,57 @@ fn show_about(window: &adw::ApplicationWindow) {
         .application_name("Kito Files")
         .application_icon("it.kito.KitoFiles")
         .version("0.1.0")
-        .comments("A lightweight Wayland file manager in Rust + GTK4")
-        .developer_name("Kito Files contributors")
+        .comments(tr("about-comments"))
+        .developer_name(tr("about-developer"))
         .license_type(gtk::License::MitX11)
         .build();
     dialog.present(Some(window));
 }
 
 fn main() -> glib::ExitCode {
+    let preferences = PreferenceStore::load();
+    l10n::init(kito_i18n::I18n::new(
+        preferences.snapshot().language,
+        kito_i18n::detect_system(),
+    ));
     let app = adw::Application::builder()
         .application_id("it.kito.KitoFiles")
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
-    app.connect_activate(|app| {
-        build_window(app, Vec::new());
+    app.connect_activate({
+        let preferences = preferences.clone();
+        move |app| build_window(app, Vec::new(), preferences.clone())
     });
     // `kito-files ~/Downloads`, "open folder with Kito Files": one tab per file.
     // If it is a file (not a folder), opens the folder containing it.
-    app.connect_open(|app, files, _hint| {
-        let mut uris = Vec::new();
-        for file in files {
-            let is_dir = file
-                .query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
-                == gio::FileType::Directory;
-            if is_dir {
-                uris.push(file.uri().to_string());
-            } else if let Some(parent) = file.parent() {
-                uris.push(parent.uri().to_string());
+    app.connect_open({
+        let preferences = preferences.clone();
+        move |app, files, _hint| {
+            let mut uris = Vec::new();
+            for file in files {
+                let is_dir = file
+                    .query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+                    == gio::FileType::Directory;
+                if is_dir {
+                    uris.push(file.uri().to_string());
+                } else if let Some(parent) = file.parent() {
+                    uris.push(parent.uri().to_string());
+                }
             }
+            build_window(app, uris, preferences.clone());
         }
-        build_window(app, uris);
     });
 
     app.run()
 }
 
 /// Builds a window. Empty `initial_uris` = opens home.
-fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
+fn build_window(
+    app: &adw::Application,
+    initial_uris: Vec<String>,
+    preferences: Rc<PreferenceStore>,
+) {
     load_pathbar_css();
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -378,6 +432,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         .default_width(900)
         .default_height(600)
         .build();
+    let preferences_dialog = Rc::new(RefCell::new(None));
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -411,7 +466,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     path_stack.add_named(&crumbs_scroll, Some("crumbs"));
 
     let path_entry = gtk::Entry::builder()
-        .placeholder_text("Type a path, Enter to go")
+        .placeholder_text(tr("path-placeholder"))
         .hexpand(true)
         .css_classes(["path-pill"])
         .build();
@@ -437,11 +492,11 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         .spacing(4)
         .margin_start(4)
         .build();
-    let back_button = nav_button(&["go-previous", "go-previous-symbolic"], "Back");
+    let back_button = nav_button(&["go-previous", "go-previous-symbolic"], &tr("nav-back"));
     back_button.set_sensitive(false);
-    let forward_button = nav_button(&["go-next", "go-next-symbolic"], "Forward");
+    let forward_button = nav_button(&["go-next", "go-next-symbolic"], &tr("nav-forward"));
     forward_button.set_sensitive(false);
-    let up_button = nav_button(&["go-up", "go-up-symbolic"], "Go up");
+    let up_button = nav_button(&["go-up", "go-up-symbolic"], &tr("nav-up"));
     nav.append(&back_button);
     nav.append(&forward_button);
     nav.append(&up_button);
@@ -460,16 +515,22 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         .margin_bottom(6)
         .width_request(216)
         .build();
-    let icons_btn = view_row(&["view-grid", "view-grid-symbolic"], "Icons");
-    let compact_btn = view_row(&["view-list", "view-list-symbolic"], "Compact");
-    let details_btn = view_row(&["view-list-details", "view-list-symbolic"], "Details");
-    compact_btn.set_active(true);
+    let icons_btn = view_row(&["view-grid", "view-grid-symbolic"], &tr("view-icons"));
+    let compact_btn = view_row(&["view-list", "view-list-symbolic"], &tr("view-compact"));
+    let details_btn = view_row(
+        &["view-list-details", "view-list-symbolic"],
+        &tr("view-details"),
+    );
+    let initial_view = preferences.snapshot().default_view;
+    icons_btn.set_active(initial_view == ViewMode::Icons);
+    compact_btn.set_active(initial_view == ViewMode::Compact);
+    details_btn.set_active(initial_view == ViewMode::Details);
     overflow_list.append(&icons_btn);
     overflow_list.append(&compact_btn);
     overflow_list.append(&details_btn);
     overflow_list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let hidden_check = gtk::CheckButton::builder()
-        .label("Show Hidden Files")
+        .label(tr("view-hidden"))
         .active(false)
         .build();
     hidden_check.add_css_class("ctx-row");
@@ -492,16 +553,40 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     about_row.append(&about_icon);
     about_row.append(
         &gtk::Label::builder()
-            .label("About Kito Files")
+            .label(tr("menu-about"))
             .halign(gtk::Align::Start)
             .hexpand(true)
             .build(),
     );
     about_button.set_child(Some(&about_row));
     overflow_list.append(&about_button);
+    let prefs_button = gtk::Button::builder().has_frame(false).build();
+    prefs_button.add_css_class("ctx-row");
+    let prefs_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .margin_start(2)
+        .margin_end(8)
+        .build();
+    let prefs_icon = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(&[
+        "preferences-system",
+        "preferences-other",
+        "emblem-system",
+    ]));
+    prefs_icon.set_pixel_size(18);
+    prefs_row.append(&prefs_icon);
+    prefs_row.append(
+        &gtk::Label::builder()
+            .label(tr("menu-preferences"))
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .build(),
+    );
+    prefs_button.set_child(Some(&prefs_row));
+    overflow_list.append(&prefs_button);
     overflow.set_child(Some(&overflow_list));
     let menu_button = gtk::MenuButton::builder()
-        .tooltip_text("View and settings")
+        .tooltip_text(tr("menu-view-settings"))
         .popover(&overflow)
         .build();
     menu_button.set_child(Some(&gtk::Image::from_gicon(&gio::ThemedIcon::from_names(
@@ -510,7 +595,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     // First pack_end = rightmost: menu next to the window controls.
     header.pack_end(&menu_button);
 
-    let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], "New tab");
+    let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], &tr("nav-new-tab"));
     header.pack_end(&new_tab_button);
 
     // TEMP-VERIFY: opens the menu for the screenshot.
@@ -595,11 +680,13 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         let status = status.clone();
         move |items: usize, selected: usize| {
             let text = if selected > 0 {
-                format!("{items} items · {selected} selected")
-            } else if items == 1 {
-                "1 item".to_string()
+                format!(
+                    "{} · {}",
+                    tr_num("status-items", items as u64),
+                    tr_num("status-selected", selected as u64)
+                )
             } else {
-                format!("{items} items")
+                tr_num("status-items", items as u64)
             };
             status.set_text(&text);
         }
@@ -653,8 +740,17 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         on_history,
         set_status,
         show_hidden.clone(),
+        preferences.shared(),
     );
     *manager_slot.borrow_mut() = Some(manager.clone());
+    preferences.subscribe_open_items({
+        let manager = Rc::downgrade(&manager);
+        Rc::new(move |behavior| {
+            if let Some(manager) = manager.upgrade() {
+                manager.set_open_items(behavior);
+            }
+        })
+    });
 
     // View selector: a single active button, the tab follows.
     let view_buttons = [
@@ -719,9 +815,16 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         manager: manager.clone(),
         toast: toast_overlay.clone(),
         clipboard: Rc::new(RefCell::new(ops::ClipTracker::default())),
+        preferences: preferences.clone(),
         focus_path: show_path_entry.clone(),
     });
-    register_actions(app, &window, ctx.clone());
+    register_actions(
+        app,
+        &window,
+        ctx.clone(),
+        preferences.clone(),
+        preferences_dialog.clone(),
+    );
 
     // System clipboard decides what to paste: track ownership changes.
     // Weak reference: the display outlives the window, no cycle.
@@ -745,6 +848,16 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         move |_| {
             overflow.popdown();
             show_about(&window);
+        }
+    });
+    prefs_button.connect_clicked({
+        let window = window.clone();
+        let overflow = overflow.clone();
+        let preferences = preferences.clone();
+        let preferences_dialog = preferences_dialog.clone();
+        move |_| {
+            overflow.popdown();
+            preferences_dialog::present(&window, &preferences, &preferences_dialog);
         }
     });
 

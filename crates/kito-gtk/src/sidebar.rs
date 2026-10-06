@@ -1,5 +1,5 @@
 //! Places sidebar: Places (XDG + bookmarks) + Devices (volumes) + Network.
-//! All strings are in English (i18n source, see agents.md).
+//! UI labels use the app catalogs; names returned by GIO remain system data.
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -88,7 +88,7 @@ fn bookmark_row(name: &str, uri: &str, load: LoadFn) -> gtk::Button {
         };
         let popover = gtk::Popover::new();
         let remove = gtk::Button::builder()
-            .label("Remove from Places")
+            .label(crate::l10n::tr("side-remove"))
             .has_frame(false)
             .build();
         let uri = uri.clone();
@@ -131,29 +131,37 @@ fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::Appli
     {
         let button = nav_row(
             &place_icon("user-home"),
-            &display_name(&home, "Home"),
+            &display_name(&home, &crate::l10n::tr("side-home")),
             load.clone(),
             format!("file://{}", home.display()),
         );
         add_row(parent, rows, &format!("file://{}", home.display()), &button);
     }
     const PLACES: [(&str, &str, glib::UserDirectory); 6] = [
-        ("folder-desktop", "Desktop", glib::UserDirectory::Desktop),
+        (
+            "folder-desktop",
+            "side-desktop",
+            glib::UserDirectory::Desktop,
+        ),
         (
             "folder-documents",
-            "Documents",
+            "side-documents",
             glib::UserDirectory::Documents,
         ),
         (
             "folder-download",
-            "Downloads",
+            "side-downloads",
             glib::UserDirectory::Downloads,
         ),
-        ("folder-music", "Music", glib::UserDirectory::Music),
-        ("folder-pictures", "Pictures", glib::UserDirectory::Pictures),
-        ("folder-videos", "Videos", glib::UserDirectory::Videos),
+        ("folder-music", "side-music", glib::UserDirectory::Music),
+        (
+            "folder-pictures",
+            "side-pictures",
+            glib::UserDirectory::Pictures,
+        ),
+        ("folder-videos", "side-videos", glib::UserDirectory::Videos),
     ];
-    for (icon_name, label, dir) in PLACES {
+    for (icon_name, label_id, dir) in PLACES {
         let Some(path) = glib::user_special_dir(dir) else {
             continue;
         };
@@ -163,7 +171,7 @@ fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::Appli
         let uri = format!("file://{}", path.display());
         let button = nav_row(
             &place_icon(icon_name),
-            &display_name(&path, label),
+            &display_name(&path, &crate::l10n::tr(label_id)),
             load.clone(),
             uri.clone(),
         );
@@ -279,7 +287,7 @@ fn poll_trash_once(image: &glib::WeakRef<gtk::Image>, state: &Rc<RefCell<TrashIc
 fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
     let button = nav_row(
         &trash_icon(false),
-        "Trash",
+        &crate::l10n::tr("side-trash"),
         load,
         kito_core::TRASH_URI.to_string(),
     );
@@ -353,7 +361,7 @@ fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
         row.append(&image);
         row.append(
             &gtk::Label::builder()
-                .label("Empty Trash…")
+                .label(crate::l10n::tr("menu-empty-trash"))
                 .halign(gtk::Align::Start)
                 .hexpand(true)
                 .css_classes(["error"])
@@ -379,10 +387,10 @@ fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
 
 fn error_dialog(window: &adw::ApplicationWindow, body: String) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Operation failed")
+        .heading(crate::l10n::tr("side-op-failed"))
         .body(body)
         .build();
-    dialog.add_response("ok", "Ok");
+    dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
     dialog.present(Some(window));
 }
 
@@ -501,7 +509,7 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         .margin_top(4)
         .margin_bottom(8)
         .build();
-    outer.append(&section_header("Places"));
+    outer.append(&section_header(&crate::l10n::tr("side-places")));
     let places = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -544,19 +552,19 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         });
     }
 
-    outer.append(&section_header("Devices"));
+    outer.append(&section_header(&crate::l10n::tr("side-devices")));
     let devices = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
         .build();
     outer.append(&devices);
 
-    outer.append(&section_header("Network"));
+    outer.append(&section_header(&crate::l10n::tr("side-network")));
     let network = gio::ThemedIcon::new("network-workgroup");
     {
         let network_row = nav_row(
             &network,
-            "Browse network",
+            &crate::l10n::tr("side-browse-network"),
             load.clone(),
             "network:///".to_string(),
         );
@@ -582,7 +590,7 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
                         "drive-harddisk",
                         "folder",
                     ]),
-                    "File System",
+                    &crate::l10n::tr("side-filesystem"),
                     load.clone(),
                     "file:///".to_string(),
                 ));

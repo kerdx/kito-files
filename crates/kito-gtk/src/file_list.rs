@@ -6,6 +6,9 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::rc::Rc;
 
+use crate::preferences::model::OpenItems;
+pub use crate::preferences::model::ViewMode;
+
 /// Right-click on a row: object + point + anchor widget.
 /// The handler selects the object and opens the menu.
 pub type SecondaryHandler = Rc<dyn Fn(&FileObject, f64, f64, &gtk::Widget)>;
@@ -46,15 +49,6 @@ fn set_secondary(row: &impl IsA<gtk::Widget>, obj: &FileObject, on_secondary: &S
         on_secondary(&obj, x, y, &source);
     });
     row.add_controller(gesture);
-}
-
-/// View mode of the tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ViewMode {
-    #[default]
-    Icons,
-    Compact,
-    Details,
 }
 
 mod imp {
@@ -115,11 +109,11 @@ impl FileObject {
 
     pub fn type_label(&self) -> String {
         if self.is_dir() {
-            return "Folder".to_string();
+            return crate::l10n::tr("props-folder");
         }
         match self.imp().content_type.borrow().as_deref() {
             Some(mime) => gio::content_type_get_description(mime).to_string(),
-            None => "File".to_string(),
+            None => crate::l10n::tr("props-file"),
         }
     }
 
@@ -238,7 +232,10 @@ fn build_compact(
     on_secondary: &SecondaryHandler,
 ) -> gtk::ColumnView {
     let view = gtk::ColumnView::new(Some(selection));
-    let column = gtk::ColumnViewColumn::new(Some("Name"), Some(name_factory(22, on_secondary)));
+    let column = gtk::ColumnViewColumn::new(
+        Some(&crate::l10n::tr("column-name")),
+        Some(name_factory(22, on_secondary)),
+    );
     column.set_expand(true);
     view.append_column(&column);
     view
@@ -249,17 +246,20 @@ fn build_details(
     on_secondary: &SecondaryHandler,
 ) -> gtk::ColumnView {
     let view = gtk::ColumnView::new(Some(selection));
-    let name = gtk::ColumnViewColumn::new(Some("Name"), Some(name_factory(20, on_secondary)));
+    let name = gtk::ColumnViewColumn::new(
+        Some(&crate::l10n::tr("column-name")),
+        Some(name_factory(20, on_secondary)),
+    );
     name.set_expand(true);
     view.append_column(&name);
     let size = gtk::ColumnViewColumn::new(
-        Some("Size"),
+        Some(&crate::l10n::tr("props-size")),
         Some(text_factory(|o| human_size(o.size()), on_secondary)),
     );
     size.set_fixed_width(110);
     view.append_column(&size);
     let kind = gtk::ColumnViewColumn::new(
-        Some("Type"),
+        Some(&crate::l10n::tr("props-type")),
         Some(text_factory(|o| o.type_label(), on_secondary)),
     );
     kind.set_fixed_width(200);
@@ -323,6 +323,7 @@ pub fn build_view(
     mode: ViewMode,
     store: &gio::ListStore,
     on_secondary: &SecondaryHandler,
+    open_items: OpenItems,
 ) -> (gtk::Widget, gtk::SingleSelection) {
     let selection = gtk::SingleSelection::new(Some(store.clone()));
     let widget: gtk::Widget = match mode {
@@ -330,9 +331,38 @@ pub fn build_view(
         ViewMode::Compact => build_compact(selection.clone(), on_secondary).upcast(),
         ViewMode::Details => build_details(selection.clone(), on_secondary).upcast(),
     };
-    // Double-click / Enter handled by the tab (sees the current selection).
+    // Activation (pointer or keyboard) has one shared handler in FileTab.
+    set_open_items(&widget, open_items);
     widget.set_vexpand(true);
     (widget, selection)
+}
+
+/// Configure GTK's built-in pointer activation while leaving Enter and the
+/// view's single `activate` signal handler untouched.
+pub fn set_open_items(widget: &gtk::Widget, behavior: OpenItems) {
+    let single = single_click_activation(behavior);
+    if let Ok(view) = widget.clone().downcast::<gtk::ColumnView>() {
+        view.set_single_click_activate(single);
+    } else if let Ok(view) = widget.clone().downcast::<gtk::GridView>() {
+        view.set_single_click_activate(single);
+    }
+}
+
+fn single_click_activation(behavior: OpenItems) -> bool {
+    behavior == OpenItems::SingleClick
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_setting_only_switches_gtk_pointer_activation() {
+        assert!(!single_click_activation(OpenItems::DoubleClick));
+        assert!(single_click_activation(OpenItems::SingleClick));
+        // wire_activate remains the only activation-signal hookup for both
+        // view types; changing this flag never attaches another handler.
+    }
 }
 
 /// View + empty store; populate with [`reload`].

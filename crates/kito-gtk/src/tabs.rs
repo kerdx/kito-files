@@ -3,6 +3,7 @@
 
 use crate::file_list;
 use crate::file_list::{FileObject, SecondaryHandler, ViewMode};
+use crate::preferences::model::{OpenItems, Preferences};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::{
@@ -25,6 +26,7 @@ pub struct FileTab {
     stack: gtk::Stack,
     selection: RefCell<gtk::SingleSelection>,
     mode: Cell<ViewMode>,
+    open_items: Cell<OpenItems>,
     history: NavHistory,
     /// Hidden-view sync: the view is fresh only for the global value it
     /// was last successfully filled with.
@@ -141,7 +143,11 @@ fn activate_at(tab: &Rc<FileTab>, pos: u32) {
     tab.activate_entry(&obj.uri(), obj.is_dir());
 }
 
-/// Wires double-click / Enter to the freshly created view.
+fn mode_for_new_tab(preferences: &Preferences) -> ViewMode {
+    preferences.default_view
+}
+
+/// Wires GTK activation (pointer or Enter) to the freshly created view.
 fn wire_activate(tab: &Rc<FileTab>, widget: &gtk::Widget) {
     if let Ok(view) = widget.clone().downcast::<gtk::ColumnView>() {
         let tab = tab.clone();
@@ -174,7 +180,12 @@ fn rebuild_view(tab: &Rc<FileTab>) {
             }
         }
     });
-    let (widget, selection) = file_list::build_view(tab.mode.get(), &tab.store, &on_secondary);
+    let (widget, selection) = file_list::build_view(
+        tab.mode.get(),
+        &tab.store,
+        &on_secondary,
+        tab.open_items.get(),
+    );
     wire_activate(tab, &widget);
     // Selection -> status bar (selected items).
     {
@@ -208,6 +219,13 @@ impl FileTab {
         self.sync_chrome();
     }
 
+    fn set_open_items(&self, behavior: OpenItems) {
+        self.open_items.set(behavior);
+        if let Some(widget) = self.scrolled.child() {
+            file_list::set_open_items(&widget, behavior);
+        }
+    }
+
     pub fn load(&self, uri: &str) {
         self.navigate(NavKind::Visit, uri);
     }
@@ -238,10 +256,10 @@ impl FileTab {
             }
             Err(e) => {
                 let dialog = adw::AlertDialog::builder()
-                    .heading("Could not open folder")
+                    .heading(crate::l10n::tr("error-open-folder"))
                     .body(e.to_string())
                     .build();
-                dialog.add_response("ok", "Ok");
+                dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
                 dialog.present(Some(&self.window));
                 false
             }
@@ -350,6 +368,16 @@ impl FileTab {
             // System default app (mimeapps.list), no "open with" window.
             if let Err(e) = gio::AppInfo::launch_default_for_uri(uri, gio::AppLaunchContext::NONE) {
                 eprintln!("open file: {e}");
+                let dialog = adw::AlertDialog::builder()
+                    .heading(crate::l10n::tr("error-open-file"))
+                    .body(crate::l10n::tr_with_one(
+                        "error-open-file-detail",
+                        "error",
+                        &e.to_string(),
+                    ))
+                    .build();
+                dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
+                dialog.present(Some(&self.window));
             }
         }
     }
@@ -362,6 +390,7 @@ pub struct TabManager {
     on_history: OnHistory,
     on_status: OnStatus,
     show_hidden: Rc<Cell<bool>>,
+    preferences: Rc<RefCell<Preferences>>,
     tabs: RefCell<Vec<Rc<FileTab>>>,
 }
 
@@ -374,6 +403,7 @@ impl TabManager {
         on_history: OnHistory,
         on_status: OnStatus,
         show_hidden: Rc<Cell<bool>>,
+        preferences: Rc<RefCell<Preferences>>,
     ) -> Rc<Self> {
         let manager = Rc::new(Self {
             tab_view,
@@ -382,6 +412,7 @@ impl TabManager {
             on_history,
             on_status,
             show_hidden,
+            preferences,
             tabs: RefCell::new(Vec::new()),
         });
         {
@@ -462,6 +493,13 @@ impl TabManager {
         }
     }
 
+    /// Update pointer activation in every tab owned by this window.
+    pub fn set_open_items(&self, behavior: OpenItems) {
+        for tab in self.tabs.borrow().iter() {
+            tab.set_open_items(behavior);
+        }
+    }
+
     pub fn go_back(&self) {
         if let Some(tab) = self.selected() {
             tab.go_back();
@@ -483,11 +521,12 @@ impl TabManager {
 
     /// Opens `uri` in a new tab and selects it.
     pub fn open_tab(self: &Rc<Self>, uri: &str) {
+        let preferences = self.preferences.borrow().clone();
         let (scrolled, store) = file_list::build_file_view();
         // Placeholder page when the folder has no visible entries.
         let empty = adw::StatusPage::builder()
             .icon_name("folder")
-            .title("This folder is empty")
+            .title(crate::l10n::tr("empty-folder"))
             .build();
         let stack = gtk::Stack::new();
         stack.add_named(&scrolled, Some("list"));
@@ -503,7 +542,8 @@ impl TabManager {
             selection: RefCell::new(gtk::SingleSelection::new(Some(gio::ListStore::new::<
                 FileObject,
             >()))),
-            mode: Cell::new(ViewMode::default()),
+            mode: Cell::new(mode_for_new_tab(&preferences)),
+            open_items: Cell::new(preferences.open_items),
             history: NavHistory::default(),
             hidden_sync: HiddenSync::new(self.show_hidden.get()),
             show_hidden: self.show_hidden.clone(),
@@ -570,6 +610,17 @@ mod tests {
     }
 
     #[test]
+    fn default_view_is_read_for_new_tabs_only() {
+        let existing_tab_mode = Cell::new(ViewMode::Compact);
+        let mut preferences = Preferences::default();
+        preferences.default_view = ViewMode::Details;
+
+        let new_tab_mode = mode_for_new_tab(&preferences);
+        assert_eq!(existing_tab_mode.get(), ViewMode::Compact);
+        assert_eq!(new_tab_mode, ViewMode::Details);
+    }
+
+    #[test]
     fn successful_trip_back_and_forward() {
         let (_tmp, a, b, c) = fixture();
         let history = NavHistory::default();
@@ -603,7 +654,7 @@ mod tests {
 
     #[test]
     fn failed_visit_keeps_history() {
-        let (_tmp, a, b, _c) = fixture();
+        let (_tmp, a, _b, _c) = fixture();
         let history = NavHistory::default();
         assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
         // Target missing: nothing loads, nothing changes.

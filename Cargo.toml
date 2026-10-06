@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/kito-core", "crates/kito-gtk"]
+members = ["crates/kito-core", "crates/kito-gtk", "crates/kito-i18n"]
 resolver = "2"
 
 [workspace.package]

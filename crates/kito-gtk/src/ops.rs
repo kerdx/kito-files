@@ -2,6 +2,7 @@
 //! Copy/move/delete run in a thread; the outcome returns to the main loop
 //! with toast + reload. No `%` progress for now (next step).
 
+use crate::preferences::PreferenceStore;
 use crate::tabs::TabManager;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -162,6 +163,7 @@ pub struct Ctx {
     pub manager: Rc<TabManager>,
     pub toast: adw::ToastOverlay,
     pub(crate) clipboard: Rc<RefCell<ClipTracker>>,
+    pub preferences: Rc<PreferenceStore>,
     /// Shows the path entry (Ctrl+L). Set by main.
     pub focus_path: Rc<dyn Fn()>,
 }
@@ -199,7 +201,7 @@ impl Ctx {
             .heading(heading)
             .body(body)
             .build();
-        dialog.add_response("ok", "Ok");
+        dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
         dialog.present(Some(&self.window));
     }
 
@@ -234,7 +236,7 @@ impl Ctx {
         };
         let objs = tab.selected_objects();
         let Some(first) = objs.first() else {
-            self.toast("Nothing selected");
+            self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         };
         tab.activate_entry(&first.uri(), first.is_dir());
@@ -249,7 +251,7 @@ impl Ctx {
             .map(|o| o.uri())
             .collect();
         if uris.is_empty() {
-            self.toast("Nothing selected");
+            self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         }
         // Publish internally first, then to the system clipboard (plain
@@ -263,7 +265,11 @@ impl Ctx {
             // Nothing published to the system: no owned provider.
             self.clipboard.borrow_mut().our_provider = None;
         }
-        self.toast(if cut { "Cut" } else { "Copied" });
+        self.toast(&crate::l10n::tr(if cut {
+            "toast-cut"
+        } else {
+            "toast-copied"
+        }));
     }
 
     pub fn paste(&self) {
@@ -271,7 +277,7 @@ impl Ctx {
             return;
         };
         let Some(display) = gdk::Display::default() else {
-            self.toast("Clipboard is empty");
+            self.toast(&crate::l10n::tr("clip-empty"));
             return;
         };
         // The system clipboard decides: read it first, then resolve
@@ -284,7 +290,7 @@ impl Ctx {
             .read_text_async(gio::Cancellable::NONE, move |result| {
                 let text = result.ok().flatten().map(|s| s.to_string());
                 match this.clipboard.borrow().resolve(text.as_deref(), generation) {
-                    PasteDecision::Stale => this.toast("Clipboard changed, try again"),
+                    PasteDecision::Stale => this.toast(&crate::l10n::tr("clip-changed")),
                     PasteDecision::Internal { uris, cut } => {
                         // Cuts move asynchronously: keep the state until
                         // completion, and refuse concurrent duplicate moves.
@@ -292,7 +298,7 @@ impl Ctx {
                             match this.clipboard.borrow_mut().begin_cut() {
                                 Some(op_generation) => Some(op_generation),
                                 None => {
-                                    this.toast("Move already in progress");
+                                    this.toast(&crate::l10n::tr("clip-moving"));
                                     return;
                                 }
                             }
@@ -306,9 +312,9 @@ impl Ctx {
                     }
                     PasteDecision::Unsupported => {
                         if text.as_ref().is_none_or(|t| t.trim().is_empty()) {
-                            this.toast("Clipboard is empty");
+                            this.toast(&crate::l10n::tr("clip-empty"));
                         } else {
-                            this.toast("Clipboard has no files to paste");
+                            this.toast(&crate::l10n::tr("clip-nofiles"));
                         }
                     }
                 }
@@ -319,7 +325,7 @@ impl Ctx {
     /// dispatch generation of a cut move, applied at completion.
     fn paste_uris(&self, uris: Vec<String>, cut: bool, dest: String, cut_op: Option<u64>) {
         if uris.is_empty() {
-            self.toast("Clipboard is empty");
+            self.toast(&crate::l10n::tr("clip-empty"));
             return;
         }
         let this = self.clone();
@@ -364,11 +370,15 @@ impl Ctx {
                 }
                 this.manager.reload_selected();
                 if failed == 0 {
-                    this.toast(&format!("Pasted {total} item(s)"));
+                    this.toast(&crate::l10n::tr_num("pasted-items", total as u64));
                 } else if let Some(error) = first_error {
-                    this.error_dialog("Could not paste", error);
+                    this.error_dialog(&crate::l10n::tr("error-paste"), error);
                 } else {
-                    this.toast(&format!("{failed} of {total} item(s) failed"));
+                    this.toast(&crate::l10n::tr_with_two_counts(
+                        "paste-failed",
+                        failed as u64,
+                        total as u64,
+                    ));
                 }
             },
         );
@@ -393,7 +403,7 @@ impl Ctx {
             .map(|o| o.uri())
             .collect();
         if uris.is_empty() {
-            self.toast("Nothing selected");
+            self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         }
         let mut failed = 0;
@@ -404,9 +414,13 @@ impl Ctx {
         }
         self.manager.reload_selected();
         if failed == 0 {
-            self.toast(&format!("Moved {} item(s) to trash", uris.len()));
+            self.toast(&crate::l10n::tr_num("moved-trash", uris.len() as u64));
         } else {
-            self.toast(&format!("{failed} of {} item(s) failed", uris.len()));
+            self.toast(&crate::l10n::tr_with_two_counts(
+                "moved-trash-failed",
+                failed as u64,
+                uris.len() as u64,
+            ));
         }
     }
 
@@ -419,7 +433,7 @@ impl Ctx {
             .map(|o| o.uri())
             .collect();
         if uris.is_empty() {
-            self.toast("Nothing selected");
+            self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         }
         let this = self.clone();
@@ -440,11 +454,15 @@ impl Ctx {
             move |(total, failed, first_error): (usize, i32, Option<String>)| {
                 this.manager.reload_selected();
                 if failed == 0 {
-                    this.toast(&format!("Restored {total} item(s)"));
+                    this.toast(&crate::l10n::tr_num("restored-items", total as u64));
                 } else if let Some(error) = first_error {
-                    this.error_dialog("Could not restore", error);
+                    this.error_dialog(&crate::l10n::tr("error-restore"), error);
                 } else {
-                    this.toast(&format!("{failed} of {total} item(s) not restored"));
+                    this.toast(&crate::l10n::tr_with_two_counts(
+                        "restored-failed",
+                        failed as u64,
+                        total as u64,
+                    ));
                 }
             },
         );
@@ -453,11 +471,11 @@ impl Ctx {
     /// Empties the trash: confirm, then delete in background.
     pub fn empty_trash(&self) {
         let dialog = adw::AlertDialog::builder()
-            .heading("Empty the Trash?")
-            .body("All items in the Trash will be permanently deleted.")
+            .heading(crate::l10n::tr("trash-empty-title"))
+            .body(crate::l10n::tr("trash-empty-body"))
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("empty", "Empty Trash");
+        dialog.add_response("cancel", &crate::l10n::tr("dialog-cancel"));
+        dialog.add_response("empty", &crate::l10n::tr("trash-empty-confirm"));
         dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         let this = self.clone();
@@ -475,11 +493,15 @@ impl Ctx {
                 move |(total, failed, error)| {
                     this.manager.reload_selected();
                     if let Some(error) = error {
-                        this.error_dialog("Could not empty the Trash", error);
+                        this.error_dialog(&crate::l10n::tr("error-trash"), error);
                     } else if failed == 0 {
-                        this.toast(&format!("Removed {total} item(s) from the Trash"));
+                        this.toast(&crate::l10n::tr_num("trash-removed", total as u64));
                     } else {
-                        this.toast(&format!("{failed} of {total} item(s) not removed"));
+                        this.toast(&crate::l10n::tr_with_two_counts(
+                            "trash-remove-failed",
+                            failed as u64,
+                            total as u64,
+                        ));
                     }
                 },
             );
@@ -496,18 +518,15 @@ impl Ctx {
             .map(|o| o.uri())
             .collect();
         if uris.is_empty() {
-            self.toast("Nothing selected");
+            self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         }
         let dialog = adw::AlertDialog::builder()
-            .heading("Delete permanently?")
-            .body(format!(
-                "{} item(s) will be deleted. This cannot be undone.",
-                uris.len()
-            ))
+            .heading(crate::l10n::tr("delete-title"))
+            .body(crate::l10n::tr_num("delete-body", uris.len() as u64))
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("delete", "Delete");
+        dialog.add_response("cancel", &crate::l10n::tr("dialog-cancel"));
+        dialog.add_response("delete", &crate::l10n::tr("delete-confirm"));
         dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         let this = self.clone();
@@ -531,9 +550,13 @@ impl Ctx {
                 move |(total, failed)| {
                     this.manager.reload_selected();
                     if failed == 0 {
-                        this.toast(&format!("Deleted {total} item(s)"));
+                        this.toast(&crate::l10n::tr_num("deleted-items", total as u64));
                     } else {
-                        this.toast(&format!("{failed} of {total} item(s) failed"));
+                        this.toast(&crate::l10n::tr_with_two_counts(
+                            "delete-failed-items",
+                            failed as u64,
+                            total as u64,
+                        ));
                     }
                 },
             );
@@ -547,19 +570,19 @@ impl Ctx {
     pub fn toggle_pin(&self) {
         let objs = self.manager.selected_objects();
         if objs.len() != 1 || !objs[0].is_dir() {
-            self.toast("Select a single folder to pin");
+            self.toast(&crate::l10n::tr("pin-select-folder"));
             return;
         }
         let uri = objs[0].uri();
         if kito_core::bookmarks::is_pinned(&uri) {
             match kito_core::bookmarks::unpin(&uri) {
-                Ok(_) => self.toast("Unpinned from Places"),
-                Err(e) => self.error_dialog("Could not unpin", e.to_string()),
+                Ok(_) => self.toast(&crate::l10n::tr("pin-unpinned")),
+                Err(e) => self.error_dialog(&crate::l10n::tr("error-unpin"), e.to_string()),
             }
         } else {
             match kito_core::bookmarks::pin(&objs[0].name(), &uri) {
-                Ok(_) => self.toast("Pinned to Places"),
-                Err(e) => self.error_dialog("Could not pin", e.to_string()),
+                Ok(_) => self.toast(&crate::l10n::tr("pin-pinned")),
+                Err(e) => self.error_dialog(&crate::l10n::tr("error-pin"), e.to_string()),
             }
         }
     }
@@ -582,7 +605,9 @@ impl Ctx {
             .label(confirm)
             .css_classes(["suggested-action"])
             .build();
-        let cancel_button = gtk::Button::builder().label("Cancel").build();
+        let cancel_button = gtk::Button::builder()
+            .label(crate::l10n::tr("dialog-cancel"))
+            .build();
         let buttons = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(8)
@@ -638,23 +663,23 @@ impl Ctx {
     pub fn rename_selected(&self) {
         let objs = self.manager.selected_objects();
         if objs.len() != 1 {
-            self.toast("Select a single item to rename");
+            self.toast(&crate::l10n::tr("rename-select"));
             return;
         }
         let uri = objs[0].uri();
         let name = objs[0].name();
         let this = self.clone();
         self.name_dialog(
-            "Rename",
-            "File name",
+            &crate::l10n::tr("rename-title"),
+            &crate::l10n::tr("rename-placeholder"),
             &name,
-            "Rename",
+            &crate::l10n::tr("rename-confirm"),
             move |text| match kito_core::rename(&uri, &text) {
                 Ok(_) => {
                     this.manager.reload_selected();
-                    this.toast("Renamed");
+                    this.toast(&crate::l10n::tr("renamed-ok"));
                 }
-                Err(e) => this.error_dialog("Could not rename", e.to_string()),
+                Err(e) => this.error_dialog(&crate::l10n::tr("error-rename"), e.to_string()),
             },
         );
     }
@@ -666,43 +691,47 @@ impl Ctx {
         };
         let this = self.clone();
         self.name_dialog(
-            "New Folder",
-            "Folder name",
-            "Untitled Folder",
-            "Create",
+            &crate::l10n::tr("new-folder-title"),
+            &crate::l10n::tr("new-folder-placeholder"),
+            &crate::l10n::tr("new-folder-initial"),
+            &crate::l10n::tr("new-folder-confirm"),
             move |text| match kito_core::mkdir(&dest, &text) {
                 Ok(_) => {
                     this.manager.reload_selected();
-                    this.toast("Folder created");
+                    this.toast(&crate::l10n::tr("folder-created"));
                 }
-                Err(e) => this.error_dialog("Could not create folder", e.to_string()),
+                Err(e) => this.error_dialog(&crate::l10n::tr("error-create-folder"), e.to_string()),
             },
         );
     }
 
     /// New file: the type chosen from the "Create" menu is only the initial
     /// suggested name, the real name is always written by the user.
-    pub fn new_file(&self, template: &'static str) {
+    pub fn new_file(&self, template: String) {
         let Some(dest) = self.manager.selected_uri() else {
             return;
         };
         if !dest.starts_with("file://") {
             self.error_dialog(
-                "Cannot create files here",
-                "Only local folders are supported.".to_string(),
+                &crate::l10n::tr("term-cannot-here"),
+                crate::l10n::tr("term-local-only"),
             );
             return;
         }
         let this = self.clone();
-        self.name_dialog("New File", "File name", template, "Create", move |text| {
-            match kito_core::create_file(&dest, &text) {
+        self.name_dialog(
+            &crate::l10n::tr("new-file-title"),
+            &crate::l10n::tr("new-file-placeholder"),
+            &template,
+            &crate::l10n::tr("new-file-confirm"),
+            move |text| match kito_core::create_file(&dest, &text) {
                 Ok(_) => {
                     this.manager.reload_selected();
-                    this.toast(&format!("Created {text}"));
+                    this.toast(&crate::l10n::tr_with_one("created-file", "name", &text));
                 }
-                Err(e) => this.error_dialog("Could not create file", e.to_string()),
-            }
-        });
+                Err(e) => this.error_dialog(&crate::l10n::tr("error-create-file"), e.to_string()),
+            },
+        );
     }
 
     /// Opens the system terminal in the current folder.
@@ -723,18 +752,19 @@ impl Ctx {
         // `None` on non-local locations: refuse with a clear message.
         let Some(path) = kito_core::uri_to_path(&uri) else {
             self.error_dialog(
-                "Cannot open a terminal here",
-                "Only local folders are supported.".to_string(),
+                &crate::l10n::tr("term-cannot-here"),
+                crate::l10n::tr("term-local-only"),
             );
             return;
         };
         let heading = if root {
-            "Could not open a root terminal"
+            "error-terminal-root"
         } else {
-            "Could not open a terminal"
+            "error-terminal"
         };
-        if let Err(e) = crate::terminal::open(&path, root) {
-            self.error_dialog(heading, e);
+        let choice = self.preferences.snapshot().terminal;
+        if let Err(e) = crate::terminal::open(&path, root, &choice) {
+            self.error_dialog(&crate::l10n::tr(heading), e.user_message());
         }
     }
 
@@ -752,13 +782,13 @@ impl Ctx {
         let info = match kito_core::props(&uri) {
             Ok(info) => info,
             Err(e) => {
-                self.error_dialog("Could not read properties", e.to_string());
+                self.error_dialog(&crate::l10n::tr("error-props"), e.to_string());
                 return;
             }
         };
 
         let dialog = adw::Dialog::builder()
-            .title("Properties")
+            .title(crate::l10n::tr("props-title"))
             .content_width(420)
             .build();
         let content = gtk::Box::builder()
@@ -803,7 +833,11 @@ impl Ctx {
         );
         titles.append(
             &gtk::Label::builder()
-                .label(if info.is_dir { "Folder" } else { "File" })
+                .label(crate::l10n::tr(if info.is_dir {
+                    "props-folder"
+                } else {
+                    "props-file"
+                }))
                 .halign(gtk::Align::Start)
                 .css_classes(["caption", "dim-label"])
                 .build(),
@@ -818,35 +852,35 @@ impl Ctx {
             .build();
         let type_label = match &info.content_type {
             Some(ct) if !info.is_dir => ct.clone(),
-            _ => "inode/directory".to_string(),
+            _ => crate::l10n::tr("props-folder"),
         };
-        grid.append(&prop_row("Type", &type_label));
+        grid.append(&prop_row(&crate::l10n::tr("props-type"), &type_label));
         let size = if info.is_dir {
             // Best-effort count: big folders don't block.
             kito_core::list_dir(&uri, true)
-                .map(|entries| format!("{} items", entries.len()))
+                .map(|entries| crate::l10n::tr_num("props-size-items", entries.len() as u64))
                 .unwrap_or_else(|_| "—".to_string())
         } else {
             crate::file_list::human_size(info.size)
         };
-        grid.append(&prop_row("Size", &size));
+        grid.append(&prop_row(&crate::l10n::tr("props-size"), &size));
         let location = info
             .uri
             .rsplit_once('/')
             .map(|(parent, _)| parent)
             .unwrap_or(&info.uri);
-        grid.append(&prop_row("Location", location));
+        grid.append(&prop_row(&crate::l10n::tr("props-location"), location));
         let modified = info
             .modified
             .and_then(|t| glib::DateTime::from_unix_local(t).ok())
             .and_then(|dt| dt.format("%Y-%m-%d %H:%M").ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "—".to_string());
-        grid.append(&prop_row("Modified", &modified));
+        grid.append(&prop_row(&crate::l10n::tr("props-modified"), &modified));
         content.append(&grid);
 
         let close = gtk::Button::builder()
-            .label("Close")
+            .label(crate::l10n::tr("props-close"))
             .halign(gtk::Align::End)
             .css_classes(["suggested-action"])
             .build();

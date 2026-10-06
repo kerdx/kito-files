@@ -8,6 +8,34 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 
+use crate::preferences::model::TerminalChoice;
+
+#[derive(Debug)]
+pub enum TerminalError {
+    NoTerminal,
+    NoRootShell,
+    UnsupportedSelected(String),
+    SelectedWithoutRoot(String),
+    Launch(String),
+}
+
+impl TerminalError {
+    /// A localized explanation; launch failures retain the technical GIO/OS detail.
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::NoTerminal => crate::l10n::tr("term-no-term"),
+            Self::NoRootShell => crate::l10n::tr("term-no-root"),
+            Self::UnsupportedSelected(terminal) => {
+                crate::l10n::tr_with_one("term-selected-unsupported", "terminal", terminal)
+            }
+            Self::SelectedWithoutRoot(terminal) => {
+                crate::l10n::tr_with_one("term-selected-no-root", "terminal", terminal)
+            }
+            Self::Launch(error) => crate::l10n::tr_with_one("term-launch-error", "error", error),
+        }
+    }
+}
+
 /// A known terminal emulator: how to open it in a folder and how to
 /// open a root shell in it. Arguments stay `OsString` from the `Path`
 /// down to the command: no lossy conversion, non-UTF-8 folders work.
@@ -164,6 +192,33 @@ fn which(prog: &str) -> bool {
     })
 }
 
+/// Returns only known terminal emulators that are currently executable on
+/// PATH. Detection inspects filesystem metadata only; it never launches one.
+pub fn available_terminal_programs() -> Vec<String> {
+    TERMINALS
+        .iter()
+        .filter(|terminal| which(terminal.prog))
+        .map(|terminal| terminal.prog.to_string())
+        .collect()
+}
+
+pub fn display_name(program: &str) -> String {
+    let pretty = match program {
+        "konsole" => "Konsole",
+        "gnome-terminal" => "GNOME Terminal",
+        "kgx" => "GNOME Console",
+        "xfce4-terminal" => "Xfce Terminal",
+        "tilix" => "Tilix",
+        "alacritty" => "Alacritty",
+        "kitty" => "Kitty",
+        "wezterm" => "WezTerm",
+        "foot" => "Foot",
+        "xterm" => "XTerm",
+        other => return other.to_string(),
+    };
+    format!("{pretty} ({program})")
+}
+
 /// Picks the first available terminal and builds `(program, args)`,
 /// without spawning anything. Testable with a fake table.
 /// A normal launch may validly have zero arguments (the workdir is set
@@ -174,7 +229,7 @@ fn select_command<'t>(
     root: bool,
     terms: &'t [Terminal],
     mut available: impl FnMut(&str) -> bool,
-) -> Result<(&'t str, Vec<OsString>), String> {
+) -> Result<(&'t str, Vec<OsString>), TerminalError> {
     let mut any_available = false;
     for terminal in terms {
         if !available(terminal.prog) {
@@ -190,27 +245,56 @@ fn select_command<'t>(
         return Ok((terminal.prog, (terminal.cwd)(dir)));
     }
     if root && any_available {
-        return Err("No installed terminal supports a root shell".to_string());
+        return Err(TerminalError::NoRootShell);
     }
-    Err("No terminal emulator found".to_string())
+    Err(TerminalError::NoTerminal)
+}
+
+/// Uses an explicitly selected available emulator, or falls back to the
+/// automatic search if that saved emulator has disappeared since startup.
+fn select_preferred_command<'t>(
+    dir: &Path,
+    root: bool,
+    choice: &TerminalChoice,
+    terms: &'t [Terminal],
+    mut available: impl FnMut(&str) -> bool,
+) -> Result<(&'t str, Vec<OsString>), TerminalError> {
+    let TerminalChoice::Emulator(program) = choice else {
+        return select_command(dir, root, terms, available);
+    };
+    if !available(program) {
+        return select_command(dir, root, terms, available);
+    }
+    let Some(terminal) = terms.iter().find(|terminal| terminal.prog == program) else {
+        return Err(TerminalError::UnsupportedSelected(program.clone()));
+    };
+    let args = if root {
+        let Some(build) = terminal.root else {
+            return Err(TerminalError::SelectedWithoutRoot(display_name(program)));
+        };
+        build(dir)
+    } else {
+        (terminal.cwd)(dir)
+    };
+    Ok((terminal.prog, args))
 }
 
 /// Spawns `prog` with `args` in `dir`. Split out so argument building
 /// is verifiable without spawning real terminals.
-fn spawn_command(prog: &str, args: &[OsString], dir: &Path) -> Result<(), String> {
+fn spawn_command(prog: &str, args: &[OsString], dir: &Path) -> Result<(), TerminalError> {
     Command::new(prog)
         .args(args)
         .current_dir(dir)
         .spawn()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| TerminalError::Launch(e.to_string()))
 }
 
 /// Opens the terminal in `dir`. With `root` the shell already starts
 /// as root (`sudo -s` inside the terminal: `sudo -i` would `cd` into
 /// root's home, `-s` stays in the current folder instead).
-pub fn open(dir: &Path, root: bool) -> Result<(), String> {
-    let (prog, args) = select_command(dir, root, &TERMINALS, which)?;
+pub fn open(dir: &Path, root: bool, choice: &TerminalChoice) -> Result<(), TerminalError> {
+    let (prog, args) = select_preferred_command(dir, root, choice, &TERMINALS, which)?;
     spawn_command(prog, &args, dir)
 }
 
@@ -319,11 +403,11 @@ mod tests {
     fn no_compatible_terminal_errors() {
         let dir = Path::new("/tmp/x");
         let err = select_command(dir, true, &TERMINALS, |p| p == "foot").unwrap_err();
-        assert!(err.contains("root shell"), "{err}");
+        assert!(matches!(err, TerminalError::NoRootShell));
         let err = select_command(dir, false, &TERMINALS, |_| false).unwrap_err();
-        assert!(err.contains("No terminal emulator found"), "{err}");
+        assert!(matches!(err, TerminalError::NoTerminal));
         let err = select_command(dir, true, &TERMINALS, |_| false).unwrap_err();
-        assert!(err.contains("No terminal emulator found"), "{err}");
+        assert!(matches!(err, TerminalError::NoTerminal));
     }
 
     #[test]
@@ -336,11 +420,41 @@ mod tests {
     }
 
     #[test]
+    fn saved_terminal_that_disappeared_falls_back_to_automatic() {
+        let dir = Path::new("/tmp/folder");
+        let choice = TerminalChoice::Emulator("missing-term".to_string());
+        let (prog, args) = select_preferred_command(dir, false, &choice, &FAKE_TERMS, |name| {
+            name == "other-term"
+        })
+        .unwrap();
+        assert_eq!(prog, "other-term");
+        assert_eq!(args, vec![dir.as_os_str().to_owned()]);
+    }
+
+    #[test]
+    fn manual_terminal_is_used_and_root_support_is_checked() {
+        let dir = Path::new("/tmp/folder");
+        let selected = TerminalChoice::Emulator("foot".to_string());
+        let (prog, _) =
+            select_preferred_command(dir, false, &selected, &TERMINALS, |name| name == "foot")
+                .unwrap();
+        assert_eq!(prog, "foot");
+
+        let error =
+            select_preferred_command(dir, true, &selected, &TERMINALS, |name| name == "foot")
+                .unwrap_err();
+        assert!(matches!(error, TerminalError::SelectedWithoutRoot(_)));
+    }
+
+    #[test]
     fn spawn_uses_workdir_without_real_terminal() {
         // `/bin/true` exits immediately: proves program + workdir wiring.
         let tmp = std::env::temp_dir();
         assert!(tmp.is_dir());
         assert!(spawn_command("/bin/true", &[], &tmp).is_ok());
-        assert!(spawn_command("/bin/does-not-exist-kito", &[], &tmp).is_err());
+        assert!(matches!(
+            spawn_command("/bin/does-not-exist-kito", &[], &tmp),
+            Err(TerminalError::Launch(_))
+        ));
     }
 }

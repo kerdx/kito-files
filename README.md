@@ -79,6 +79,27 @@ for Wayland or X11. Development testing is done on Wayland.
 - Open a detected terminal emulator in the current local folder, including a root
   shell via `sudo -s` where supported
 
+**Preferences**
+
+- Choose the default view for new tabs, single- or double-click opening, and Automatic
+  or an installed terminal emulator. Changes are saved automatically and shared by
+  all open windows; a default-view change affects only tabs opened afterward.
+- Choose **System language**, **English**, or **Italiano**. By default, Kito Files follows
+  the system message locale (including regional variants); unsupported or unavailable
+  locales use English. A manual choice overrides system detection and is applied on the
+  next launch. Returning to **System language** resumes automatic detection.
+- Preferences are stored atomically in `~/.config/kito-files/settings.conf`, honoring
+  an absolute `XDG_CONFIG_HOME` when set. This does not require dconf or GSettings.
+- The app interface is translated into English and Italian using embedded Fluent
+  catalogs. App translations are selected independently; standard GTK/libadwaita
+  strings continue to follow the system locale. The language choice currently needs a
+  restart because the interface is built once at startup.
+
+To add a translation, add a Fluent catalog under `crates/kito-i18n/locales/`, register
+it in `crates/kito-i18n/src/lib.rs`, extend the language choice and locale resolution,
+and add detection, fallback, plural, and parameterized-message tests. Catalogs are
+embedded into the binary, so development and installed launches use the same files.
+
 ---
 
 ## Dependencies
@@ -141,6 +162,14 @@ but trashing and network locations will fail.
 | `libadwaita` | 0.9 (feature `v1_9`) | adaptive widgets, dialogs, toasts, tabs |
 | `gio` | 0.22 | actions, application, monitors |
 | `glib` | 0.22 | main loop, spawning, error handling |
+
+**`kito-i18n`**
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `fluent-bundle` | 0.16 | Embedded messages, parameters and plurals |
+| `sys-locale` | 0.3 | System locale selection using Linux locale conventions |
+| `unic-langid` | 0.9 | Locale identifiers for Fluent |
 
 ---
 
@@ -264,7 +293,7 @@ network, trash) and the context menus.
 
 ## Architecture
 
-A Cargo workspace with two crates:
+A Cargo workspace with three crates:
 
 ```
 kito-files/
@@ -274,7 +303,9 @@ kito-files/
 │   │   └── src/
 │   │       ├── lib.rs          # list, copy, move, trash, delete, rename, mkdir, restore
 │   │       └── bookmarks.rs    # freedesktop bookmarks (~/.config/gtk-3.0/bookmarks)
-│   └── kito-gtk/         # UI only; calls into kito-core
+│   ├── kito-i18n/        # locale detection, Fluent catalogs and config helpers
+│   │   └── locales/      # embedded en.ftl and it.ftl catalogs
+│   └── kito-gtk/         # UI only; calls into kito-core and kito-i18n
 │       └── src/
 │           ├── main.rs         # window, header bar, breadcrumbs, actions, shortcuts
 │           ├── file_list.rs    # Icons / Compact / Details views
@@ -298,6 +329,9 @@ Design rules:
   listing and some smaller operations still run synchronously on the UI thread.
 - **No GNOME desktop coupling** — libadwaita is used as a widget library only: no
   GSettings/dconf, no libpanel, no Tracker, no desktop portals required.
+- **Localization** — the `kito-i18n` crate resolves the system locale through
+  `sys-locale`, supports an optional saved language override, and formats embedded
+  Fluent catalogs with English fallback. No runtime catalog path or `msgfmt` is needed.
 - **Freedesktop, not GNOME** — GIO/GVfs for files, freedesktop bookmarks, icon themes
   and `gio::AppInfo` for launching default applications.
 
