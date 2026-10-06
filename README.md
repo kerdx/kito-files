@@ -25,6 +25,8 @@ for Wayland or X11. Development testing is done on Wayland.
 - [Dependencies](#dependencies)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Preferences](#preferences)
+- [Languages](#languages)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
 - [Development](#development)
@@ -37,19 +39,27 @@ for Wayland or X11. Development testing is done on Wayland.
 **Navigation**
 
 - Classic view: exactly one folder on screen, with breadcrumbs in the header bar
-- Three view modes: **Icons**, **Compact** and **Details**, switchable from the menu
+- Three view modes: **Icons**, **Compact** and **Details**, selected through three
+  side-by-side buttons in the dedicated view popover at the top right. The toolbar
+  button shows the active tab's view icon
 - Tabs (`AdwTabView`), each tab keeps its own folder, view mode and back/forward history
 - Back / forward / up navigation, plus mouse side buttons (back = button 8, forward = button 9)
+- Failed navigation leaves the current folder and back/forward history unchanged
 - Editable path bar: `Ctrl+L` (or click the current breadcrumb) to type any path or URI
-- Show / hide hidden files (dotfiles)
+- Readable local paths and breadcrumb labels, with spaces and special characters
+  handled without double-encoding when confirming the current path
+- Show / hide hidden files (dotfiles) through the view popover; the active tab
+  updates immediately and other tabs apply the setting when selected
+- Empty-folder page when there are no visible items
 - Status bar with item and selection counters
 
 **Sidebar**
 
 - **Places** — XDG user directories (Home, Documents, Downloads, Pictures, Music, Videos, Desktop)
-- **Devices** — mounted volumes via `GVolumeMonitor`, with mount/unmount handling
+- **Devices** — volumes discovered through `GVolumeMonitor`, with mounting when needed
 - **Network** — network browsing entry point
-- **Trash** — with dedicated context menu (empty / background actions)
+- **Trash** — with dedicated context menu (empty / background actions) and an icon
+  that tracks whether the Trash is empty through asynchronous polling
 - Bookmarks / pins written to `~/.config/gtk-3.0/bookmarks`, the standard freedesktop
   bookmarks file. Changes made by other apps are picked up live through a directory monitor.
 
@@ -57,9 +67,16 @@ for Wayland or X11. Development testing is done on Wayland.
 
 - Copy and cut prepare the clipboard; paste performs copying or moving in a
   background thread, with the result reported through a toast
+- Paste follows the current system clipboard rather than an outdated internal
+  selection. Failed cut operations retain the failed items for another move attempt;
+  repeated paste cannot dispatch the same cut concurrently
 - Name collisions get a safe suffix: `report.txt` → `report (copy).txt`, `report (copy 2).txt`
+- Copying a folder into itself or a subfolder is rejected before creating the
+  destination; local destination checks also resolve symbolic links
 - Move to trash by default; permanent delete requires an explicit confirmation dialog
-- Restore items from the Trash to their original location
+- Permanent recursive deletion removes symbolic links without traversing their targets
+- Restore items from the Trash to their original path and name, preserving existing
+  files through collision suffixes
 - Empty the Trash (with confirmation)
 - Rename (`F2`) and new folder (`Ctrl+Shift+N`), both with input validation
 - Create empty files with suggested names for text, Word, spreadsheet and HTML files.
@@ -78,27 +95,6 @@ for Wayland or X11. Development testing is done on Wayland.
 - Minimal custom CSS on top of the stock theme — no GNOME desktop required, no dconf/GSettings
 - Open a detected terminal emulator in the current local folder, including a root
   shell via `sudo -s` where supported
-
-**Preferences**
-
-- Choose the default view for new tabs, single- or double-click opening, and Automatic
-  or an installed terminal emulator. Changes are saved automatically and shared by
-  all open windows; a default-view change affects only tabs opened afterward.
-- Choose **System language**, **English**, or **Italiano**. By default, Kito Files follows
-  the system message locale (including regional variants); unsupported or unavailable
-  locales use English. A manual choice overrides system detection and is applied
-  immediately to open windows; returning to **System language** resumes automatic
-  detection. Standard GTK/libadwaita controls continue to follow the system locale.
-- Preferences are stored atomically in `~/.config/kito-files/settings.conf`, honoring
-  an absolute `XDG_CONFIG_HOME` when set. This does not require dconf or GSettings.
-- The app interface is translated into English and Italian using embedded Fluent
-  catalogs. App translations are selected independently from GTK/libadwaita's built-in
-  strings, which continue to follow the system locale.
-
-To add a translation, add a Fluent catalog under `crates/kito-i18n/locales/`, register
-it in `crates/kito-i18n/src/lib.rs`, extend the language choice and locale resolution,
-and add detection, fallback, plural, and parameterized-message tests. Catalogs are
-embedded into the binary, so development and installed launches use the same files.
 
 ---
 
@@ -158,10 +154,12 @@ but trashing and network locations will fail.
 | Crate | Version | Purpose |
 |---|---|---|
 | `kito-core` | path dependency | file operations backend |
+| `kito-i18n` | path dependency | locale detection and translated messages |
 | `gtk4` | 0.11 (feature `gnome_50`) | UI toolkit bindings |
 | `libadwaita` | 0.9 (feature `v1_9`) | adaptive widgets, dialogs, toasts, tabs |
 | `gio` | 0.22 | actions, application, monitors |
 | `glib` | 0.22 | main loop, spawning, error handling |
+| `tempfile` | 3 *(dev)* | isolated configuration and operation tests |
 
 **`kito-i18n`**
 
@@ -266,9 +264,61 @@ kito-files PATH [PATH...]  # open each path in its own tab
 kito-files FILE            # open the folder containing FILE
 ```
 
-Everything else is done from the UI: the header bar (navigation + path), the menu at
-the top right (view mode, hidden files, about), the left sidebar (places, devices,
-network, trash) and the context menus.
+The header bar separates navigation, view controls and app settings:
+
+- **App menu**, next to the name at the top left: Preferences and About Kito Files.
+- **Navigation and path**: back, forward, up, clickable breadcrumbs and a path editor.
+- **View selector**, at the top right: Icons, Compact, Details and Show Hidden Files.
+  The popover stays open while changing view options.
+- **New tab** button: opens the current location in another tab.
+
+The sidebar provides places, devices, network and Trash. Context menus provide file
+operations, creation, terminal actions and properties. File selection currently
+supports one item at a time.
+
+---
+
+## Preferences
+
+Open **Preferences** from the app menu or press `Ctrl+,`. The libadwaita preferences
+dialog contains **General** and **Integration** pages:
+
+| Setting | Choices | Behavior |
+|---|---|---|
+| Default view | Icons, Compact, Details | Applies to new tabs; existing tabs keep their view |
+| Open items | Double click, Single click | Applies immediately to existing and new tabs; keyboard activation is unchanged |
+| Language | System language, English, Italiano | Updates app translations immediately in open windows |
+| Terminal | Automatic or an installed emulator | Uses the selected emulator for terminal actions |
+
+Defaults are Icons, double-click opening, system language and automatic terminal
+detection. If a saved terminal is no longer available, detection falls back to
+Automatic and the preferences dialog reports the missing choice. Root terminal
+actions require an emulator that supports launching a root shell and `sudo`.
+
+Changes are saved automatically and shared by open windows. Preferences are stored
+atomically in `~/.config/kito-files/settings.conf`, or
+`$XDG_CONFIG_HOME/kito-files/settings.conf` when `XDG_CONFIG_HOME` is an absolute path.
+Missing or invalid values fall back to defaults; dconf and GSettings are not required.
+
+---
+
+## Languages
+
+Kito Files includes **English** and **Italian** translations. By default it follows
+the system message locale, including regional variants such as `it_IT` and `en_US`.
+Unsupported or unavailable locales fall back to English.
+
+A manual language choice in Preferences overrides automatic detection and is saved
+between launches. Returning to **System language** resumes automatic selection.
+The app updates its interface immediately, including the open preferences dialog;
+standard GTK/libadwaita strings continue to follow the system locale independently.
+
+Translations use embedded Fluent catalogs with parameters, plural forms and English
+fallback. No separate translation files need to be installed alongside the binary.
+
+To add a language, add a catalog under `crates/kito-i18n/locales/`, register it in
+`crates/kito-i18n/src/lib.rs`, extend locale resolution and the preferences language
+selector, and add detection, fallback, plural and parameterized-message tests.
 
 ---
 
@@ -285,6 +335,7 @@ network, trash) and the context menus.
 | `Ctrl+L` | Edit the current path |
 | `F5` / `Ctrl+R` | Reload the folder |
 | `Ctrl+Shift+N` | New folder |
+| `Ctrl+,` | Open Preferences |
 | `Enter` | Open the selected item |
 | `Esc` | Leave the path editor |
 | Mouse button 8 / 9 | Back / Forward |
@@ -305,7 +356,7 @@ kito-files/
 │   │       └── bookmarks.rs    # freedesktop bookmarks (~/.config/gtk-3.0/bookmarks)
 │   ├── kito-i18n/        # locale detection, Fluent catalogs and config helpers
 │   │   └── locales/      # embedded en.ftl and it.ftl catalogs
-│   └── kito-gtk/         # UI only; calls into kito-core and kito-i18n
+│   └── kito-gtk/         # UI and desktop integration
 │       └── src/
 │           ├── main.rs         # window, header bar, breadcrumbs, actions, shortcuts
 │           ├── file_list.rs    # Icons / Compact / Details views
@@ -313,6 +364,9 @@ kito-files/
 │           ├── sidebar.rs      # Places, Devices, Network, Trash
 │           ├── ops.rs          # clipboard, file operations, properties, dialogs
 │           ├── context_menu.rs # file / background / trash popovers
+│           ├── l10n.rs         # shared app translations and live language updates
+│           ├── preferences/    # preference model, shared state and persistence
+│           ├── preferences_dialog.rs # General / Integration preferences UI
 │           └── terminal.rs     # terminal detection and launch, optional root shell
 └── data/                 # .desktop entry and application icon
 ```
@@ -324,9 +378,10 @@ Design rules:
   without a display server via `cargo test -p kito-core`.
 - **`kito-gtk` owns the UI and integration** — it calls `kito-core` for file operations
   and also handles configuration-directory setup and terminal executable detection.
-  Copy/move during paste, trash, permanent deletion, restore and emptying the Trash
+  Copy/move during paste, permanent deletion, restore and emptying the Trash
   run in background threads, with results delivered to the main loop. Directory
-  listing and some smaller operations still run synchronously on the UI thread.
+  listing, moving items to the Trash and some smaller operations still run
+  synchronously on the UI thread. The sidebar checks Trash contents asynchronously.
 - **No GNOME desktop coupling** — libadwaita is used as a widget library only: no
   GSettings/dconf, no libpanel, no Tracker, no desktop portals required.
 - **Localization** — the `kito-i18n` crate resolves the system locale through
@@ -340,7 +395,7 @@ Design rules:
 ## Development
 
 ```bash
-cargo test -p kito-core        # unit tests (no display needed)
+cargo test --workspace        # backend, localization and UI logic unit tests
 cargo clippy -- -D warnings    # lints
 cargo fmt --check              # formatting
 cargo run                     # manual testing in the current graphical session
