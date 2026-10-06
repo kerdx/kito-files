@@ -22,52 +22,90 @@ use std::{
     rc::Rc,
 };
 
-/// Menu row for the view choice: icon + label + check on the right
-/// visible only on the active item (Nautilus style). The toggle is a
-/// `ToggleButton`: mutual exclusion is handled by `build_window`.
-fn view_row(names: &[&str], label: &str) -> gtk::ToggleButton {
-    let icon = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(names));
-    icon.set_pixel_size(18);
+fn view_icon_name(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Icons => "view-grid-symbolic",
+        ViewMode::Compact => "view-list-symbolic",
+        ViewMode::Details => "view-list-bullet-symbolic",
+    }
+}
 
-    let check = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(&[
-        "object-select-symbolic",
-        "emblem-ok-symbolic",
-        "emblem-default",
-    ]));
-    check.set_pixel_size(16);
-    check.set_visible(false);
+fn view_label(mode: ViewMode) -> String {
+    crate::l10n::tr(match mode {
+        ViewMode::Icons => "view-icons",
+        ViewMode::Compact => "view-compact",
+        ViewMode::Details => "view-details",
+    })
+}
 
-    let row = gtk::Box::builder()
+fn view_choice_button(mode: ViewMode) -> gtk::ToggleButton {
+    let label = view_label(mode);
+    let icon = gtk::Image::from_icon_name(view_icon_name(mode));
+    icon.set_pixel_size(20);
+    let check = gtk::Image::from_icon_name("object-select-symbolic");
+    check.set_pixel_size(12);
+    check.set_opacity(0.0);
+
+    let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
+        .spacing(5)
+        .halign(gtk::Align::Center)
         .build();
-    row.append(&icon);
-    row.append(
-        &gtk::Label::builder()
-            .label(label)
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .build(),
-    );
-    row.append(&check);
+    content.append(&icon);
+    content.append(&check);
 
-    let button = gtk::ToggleButton::builder().has_frame(false).build();
-    button.set_child(Some(&row));
-    button.add_css_class("ctx-row");
-    button.connect_toggled(move |b| check.set_visible(b.is_active()));
+    let button = gtk::ToggleButton::builder()
+        .hexpand(true)
+        .tooltip_text(&label)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(&label)]);
+    button.set_child(Some(&content));
+    button.connect_toggled(move |button| {
+        check.set_opacity(if button.is_active() { 1.0 } else { 0.0 });
+    });
     button
 }
 
-fn set_view_row_label(button: &gtk::ToggleButton, text: &str) {
-    if let Some(row) = button.child().and_downcast::<gtk::Box>() {
-        if let Some(label) = row
-            .first_child()
-            .and_then(|icon| icon.next_sibling())
-            .and_downcast::<gtk::Label>()
-        {
-            label.set_text(text);
-        }
-    }
+fn update_view_choice_label(button: &gtk::ToggleButton, label: &str) {
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
+fn update_view_control(
+    mode: ViewMode,
+    icons: &gtk::ToggleButton,
+    compact: &gtk::ToggleButton,
+    details: &gtk::ToggleButton,
+    icon: &gtk::Image,
+    button: &gtk::MenuButton,
+    syncing: &Cell<bool>,
+) {
+    syncing.set(true);
+    icons.set_active(mode == ViewMode::Icons);
+    compact.set_active(mode == ViewMode::Compact);
+    details.set_active(mode == ViewMode::Details);
+    syncing.set(false);
+
+    icon.set_icon_name(Some(view_icon_name(mode)));
+    let current = crate::l10n::tr_with_one("view-current", "view", &view_label(mode));
+    button.set_tooltip_text(Some(&current));
+    let selector = crate::l10n::tr("view-selector");
+    button.update_property(&[
+        gtk::accessible::Property::Label(&selector),
+        gtk::accessible::Property::Description(&current),
+    ]);
+}
+
+fn app_menu_model() -> gio::Menu {
+    let menu = gio::Menu::new();
+    update_app_menu_model(&menu);
+    menu
+}
+
+fn update_app_menu_model(menu: &gio::Menu) {
+    menu.remove_all();
+    menu.append(Some(&tr("menu-preferences")), Some("win.preferences"));
+    menu.append(Some(&tr("menu-about")), Some("win.about"));
 }
 
 /// One `win.*` action entry: name + function on the context.
@@ -499,6 +537,19 @@ fn build_window(
         .build();
     header.pack_start(&app_label);
 
+    let app_menu_model = app_menu_model();
+    let app_menu_popover = gtk::PopoverMenu::from_model(Some(&app_menu_model));
+    let app_menu_button = gtk::MenuButton::builder()
+        .tooltip_text(tr("menu-application"))
+        .popover(&app_menu_popover)
+        .build();
+    let app_menu_icon = gtk::Image::from_icon_name("open-menu-symbolic");
+    app_menu_icon.set_pixel_size(18);
+    app_menu_button.set_child(Some(&app_menu_icon));
+    let app_menu_name = tr("menu-application");
+    app_menu_button.update_property(&[gtk::accessible::Property::Label(&app_menu_name)]);
+    header.pack_start(&app_menu_button);
+
     // Navigation: separate flat round arrows, like Nautilus (no linked).
     let nav = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -515,96 +566,87 @@ fn build_window(
     nav.append(&up_button);
     header.pack_start(&nav);
 
-    // Menu on the right: view + settings in a single button (Nautilus style).
-    // The view rows are CheckButtons with mutual exclusion wired later.
-    let overflow = gtk::Popover::new();
-    overflow.add_css_class("ctx-menu");
-    let overflow_list = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .margin_start(6)
-        .margin_end(6)
-        .margin_top(6)
-        .margin_bottom(6)
-        .width_request(216)
-        .build();
-    let icons_btn = view_row(&["view-grid", "view-grid-symbolic"], &tr("view-icons"));
-    let compact_btn = view_row(&["view-list", "view-list-symbolic"], &tr("view-compact"));
-    let details_btn = view_row(
-        &["view-list-details", "view-list-symbolic"],
-        &tr("view-details"),
-    );
+    // The view popover contains only view modes and the hidden-file switch.
     let initial_view = preferences.snapshot().default_view;
-    icons_btn.set_active(initial_view == ViewMode::Icons);
-    compact_btn.set_active(initial_view == ViewMode::Compact);
-    details_btn.set_active(initial_view == ViewMode::Details);
-    overflow_list.append(&icons_btn);
-    overflow_list.append(&compact_btn);
-    overflow_list.append(&details_btn);
-    overflow_list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let hidden_check = gtk::CheckButton::builder()
+    let icons_btn = view_choice_button(ViewMode::Icons);
+    let compact_btn = view_choice_button(ViewMode::Compact);
+    compact_btn.set_group(Some(&icons_btn));
+    let details_btn = view_choice_button(ViewMode::Details);
+    details_btn.set_group(Some(&icons_btn));
+    match initial_view {
+        ViewMode::Icons => icons_btn.set_active(true),
+        ViewMode::Compact => compact_btn.set_active(true),
+        ViewMode::Details => details_btn.set_active(true),
+    }
+    let view_choices = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .homogeneous(true)
+        .build();
+    view_choices.append(&icons_btn);
+    view_choices.append(&compact_btn);
+    view_choices.append(&details_btn);
+
+    let hidden_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(5)
+        .margin_bottom(5)
+        .build();
+    let hidden_label = gtk::Label::builder()
         .label(tr("view-hidden"))
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    let hidden_switch = gtk::Switch::builder()
+        .valign(gtk::Align::Center)
         .active(false)
+        .tooltip_text(tr("view-hidden"))
         .build();
-    hidden_check.add_css_class("ctx-row");
-    overflow_list.append(&hidden_check);
-    overflow_list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let about_button = gtk::Button::builder().has_frame(false).build();
-    about_button.add_css_class("ctx-row");
-    let about_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
-        .margin_start(2)
+    let hidden_accessible_name = tr("view-hidden");
+    hidden_switch.update_property(&[gtk::accessible::Property::Label(&hidden_accessible_name)]);
+    hidden_row.append(&hidden_label);
+    hidden_row.append(&hidden_switch);
+
+    let view_contents = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_start(8)
         .margin_end(8)
+        .margin_top(8)
+        .margin_bottom(8)
         .build();
-    let about_icon = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(&[
-        "help-about",
-        "help-info",
-        "dialog-information",
-    ]));
-    about_icon.set_pixel_size(18);
-    about_row.append(&about_icon);
-    let about_label = gtk::Label::builder()
-        .label(tr("menu-about"))
-        .halign(gtk::Align::Start)
-        .hexpand(true)
-        .build();
-    about_row.append(&about_label);
-    about_button.set_child(Some(&about_row));
-    overflow_list.append(&about_button);
-    let prefs_button = gtk::Button::builder().has_frame(false).build();
-    prefs_button.add_css_class("ctx-row");
-    let prefs_row = gtk::Box::builder()
+    view_contents.append(&view_choices);
+    view_contents.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    view_contents.append(&hidden_row);
+    let view_popover = gtk::Popover::new();
+    view_popover.set_child(Some(&view_contents));
+
+    let view_icon = gtk::Image::from_icon_name(view_icon_name(initial_view));
+    view_icon.set_pixel_size(18);
+    let view_arrow = gtk::Image::from_icon_name("pan-down-symbolic");
+    view_arrow.set_pixel_size(12);
+    let view_button_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
-        .margin_start(2)
-        .margin_end(8)
+        .spacing(5)
         .build();
-    let prefs_icon = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(&[
-        "preferences-system",
-        "preferences-other",
-        "emblem-system",
-    ]));
-    prefs_icon.set_pixel_size(18);
-    prefs_row.append(&prefs_icon);
-    let preferences_label = gtk::Label::builder()
-        .label(tr("menu-preferences"))
-        .halign(gtk::Align::Start)
-        .hexpand(true)
+    view_button_content.append(&view_icon);
+    view_button_content.append(&view_arrow);
+    let current_view = crate::l10n::tr_with_one("view-current", "view", &view_label(initial_view));
+    let view_button = gtk::MenuButton::builder()
+        .tooltip_text(&current_view)
+        .popover(&view_popover)
         .build();
-    prefs_row.append(&preferences_label);
-    prefs_button.set_child(Some(&prefs_row));
-    overflow_list.append(&prefs_button);
-    overflow.set_child(Some(&overflow_list));
-    let menu_button = gtk::MenuButton::builder()
-        .tooltip_text(tr("menu-view-settings"))
-        .popover(&overflow)
-        .build();
-    menu_button.set_child(Some(&gtk::Image::from_gicon(&gio::ThemedIcon::from_names(
-        &["view-more", "view-more-symbolic"],
-    ))));
-    // First pack_end = rightmost: menu next to the window controls.
-    header.pack_end(&menu_button);
+    view_button.set_child(Some(&view_button_content));
+    let view_selector_name = tr("view-selector");
+    view_button.update_property(&[
+        gtk::accessible::Property::Label(&view_selector_name),
+        gtk::accessible::Property::Description(&current_view),
+    ]);
+    // The first pack_end widget sits closest to the window controls.
+    header.pack_end(&view_button);
 
     let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], &tr("nav-new-tab"));
     header.pack_end(&new_tab_button);
@@ -711,6 +753,8 @@ fn build_window(
         let icons_btn = icons_btn.clone();
         let compact_btn = compact_btn.clone();
         let details_btn = details_btn.clone();
+        let view_icon = view_icon.clone();
+        let view_button = view_button.clone();
         let window = window.clone();
         let sidebar_slot = sidebar_slot.clone();
         let set_status = set_status.clone();
@@ -727,11 +771,15 @@ fn build_window(
                 sidebar.set_active(uri);
             }
             set_status(n, 0);
-            syncing_views.set(true);
-            icons_btn.set_active(mode == ViewMode::Icons);
-            compact_btn.set_active(mode == ViewMode::Compact);
-            details_btn.set_active(mode == ViewMode::Details);
-            syncing_views.set(false);
+            update_view_control(
+                mode,
+                &icons_btn,
+                &compact_btn,
+                &details_btn,
+                &view_icon,
+                &view_button,
+                &syncing_views,
+            );
         }
     });
     let on_history: tabs::OnHistory = Rc::new({
@@ -848,30 +896,10 @@ fn build_window(
         });
     }
 
-    // Menu ⋮: hidden check + about.
-    hidden_check.connect_toggled({
+    hidden_switch.connect_active_notify({
         let manager = manager.clone();
-        move |check| manager.set_show_hidden(check.is_active())
+        move |switch| manager.set_show_hidden(switch.is_active())
     });
-    about_button.connect_clicked({
-        let window = window.clone();
-        let overflow = overflow.clone();
-        move |_| {
-            overflow.popdown();
-            show_about(&window);
-        }
-    });
-    prefs_button.connect_clicked({
-        let window = window.clone();
-        let overflow = overflow.clone();
-        let preferences = preferences.clone();
-        let preferences_dialog = preferences_dialog.clone();
-        move |_| {
-            overflow.popdown();
-            preferences_dialog::present(&window, &preferences, &preferences_dialog);
-        }
-    });
-
     // Sidebar and arrows operate on the selected tab.
     let load: Rc<dyn Fn(&str)> = slot_load.clone();
 
@@ -891,14 +919,15 @@ fn build_window(
         let forward_button = forward_button.downgrade();
         let up_button = up_button.downgrade();
         let path_entry = path_entry.downgrade();
-        let menu_button = menu_button.downgrade();
+        let app_menu_button = app_menu_button.downgrade();
+        let app_menu_model = app_menu_model.downgrade();
+        let view_button = view_button.downgrade();
         let new_tab_button = new_tab_button.downgrade();
         let icons_btn = icons_btn.downgrade();
         let compact_btn = compact_btn.downgrade();
         let details_btn = details_btn.downgrade();
-        let hidden_check = hidden_check.downgrade();
-        let about_label = about_label.downgrade();
-        let preferences_label = preferences_label.downgrade();
+        let hidden_label = hidden_label.downgrade();
+        let hidden_switch = hidden_switch.downgrade();
         Rc::new(move |_| {
             if let Some(button) = back_button.upgrade() {
                 button.set_tooltip_text(Some(&tr("nav-back")));
@@ -912,29 +941,37 @@ fn build_window(
             if let Some(entry) = path_entry.upgrade() {
                 entry.set_placeholder_text(Some(&tr("path-placeholder")));
             }
-            if let Some(button) = menu_button.upgrade() {
-                button.set_tooltip_text(Some(&tr("menu-view-settings")));
+            if let Some(button) = app_menu_button.upgrade() {
+                let label = tr("menu-application");
+                button.set_tooltip_text(Some(&label));
+                button.update_property(&[gtk::accessible::Property::Label(&label)]);
+            }
+            if let Some(menu) = app_menu_model.upgrade() {
+                update_app_menu_model(&menu);
+            }
+            if let Some(button) = view_button.upgrade() {
+                let label = tr("view-selector");
+                button.update_property(&[gtk::accessible::Property::Label(&label)]);
             }
             if let Some(button) = new_tab_button.upgrade() {
                 button.set_tooltip_text(Some(&tr("nav-new-tab")));
             }
             if let Some(button) = icons_btn.upgrade() {
-                set_view_row_label(&button, &tr("view-icons"));
+                update_view_choice_label(&button, &tr("view-icons"));
             }
             if let Some(button) = compact_btn.upgrade() {
-                set_view_row_label(&button, &tr("view-compact"));
+                update_view_choice_label(&button, &tr("view-compact"));
             }
             if let Some(button) = details_btn.upgrade() {
-                set_view_row_label(&button, &tr("view-details"));
+                update_view_choice_label(&button, &tr("view-details"));
             }
-            if let Some(check) = hidden_check.upgrade() {
-                check.set_label(Some(&tr("view-hidden")));
+            if let Some(label) = hidden_label.upgrade() {
+                label.set_text(&tr("view-hidden"));
             }
-            if let Some(label) = about_label.upgrade() {
-                label.set_text(&tr("menu-about"));
-            }
-            if let Some(label) = preferences_label.upgrade() {
-                label.set_text(&tr("menu-preferences"));
+            if let Some(switch) = hidden_switch.upgrade() {
+                let label = tr("view-hidden");
+                switch.set_tooltip_text(Some(&label));
+                switch.update_property(&[gtk::accessible::Property::Label(&label)]);
             }
             if let Some(slot) = sidebar_slot.upgrade() {
                 if let Some(sidebar) = slot.borrow().as_ref() {
