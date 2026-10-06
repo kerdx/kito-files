@@ -13,6 +13,19 @@ pub struct Clipboard {
     pub cut: bool,
 }
 
+/// Outcome of applying a finished cut: what the completion may do
+/// with the system clipboard (only when it still belongs to the op).
+#[derive(Debug, PartialEq)]
+enum CutFinish {
+    /// Everything moved: state consumed, caller clears the system
+    /// clipboard so the moved-away URIs cannot be pasted again.
+    Consumed,
+    /// Some entries failed: only they are kept for retry.
+    Partial,
+    /// Clipboard moved on meanwhile: leave the new state alone.
+    Untouched,
+}
+
 /// What to paste for freshly-read system clipboard text.
 #[derive(Debug, PartialEq)]
 enum PasteDecision {
@@ -39,7 +52,12 @@ pub(crate) struct ClipTracker {
     own_change_pending: bool,
     /// Provider we published with: pointer identity (not text) proves
     /// a `changed` notification is ours.
+    /// Provider we published with: pointer identity (not text) proves
+    /// a `changed` notification is ours.
     our_provider: Option<gdk::ContentProvider>,
+    /// In-flight cut move, bound to its dispatch generation: repeated
+    /// pastes of the same cut refuse to start a concurrent move.
+    cut_in_flight: Option<u64>,
 }
 
 impl ClipTracker {
@@ -71,11 +89,37 @@ impl ClipTracker {
         self.generation += 1;
     }
 
-    /// Consumes the internal cut intent after dispatching the move.
-    fn consume_cut(&mut self) {
-        if self.entries.as_ref().is_some_and(|e| e.cut) {
-            self.entries = None;
+    /// Starts a cut move: marks this generation in flight so repeated
+    /// pastes cannot duplicate it. Returns the operation generation, or
+    /// `None` when a move for the current state is already running.
+    fn begin_cut(&mut self) -> Option<u64> {
+        if self.cut_in_flight == Some(self.generation) {
+            return None;
         }
+        self.cut_in_flight = Some(self.generation);
+        Some(self.generation)
+    }
+
+    /// Applies a finished cut move. Always retires a matching in-flight
+    /// mark; touches entries only when the clipboard still belongs to
+    /// this operation (same generation): full success consumes the cut,
+    /// partial success keeps just the failed entries, and anything else
+    /// leaves a newer state alone. Never converts to copy.
+    fn finish_cut(&mut self, op_generation: u64, failed_uris: &[String]) -> CutFinish {
+        if self.cut_in_flight == Some(op_generation) {
+            self.cut_in_flight = None;
+        }
+        if self.generation != op_generation {
+            return CutFinish::Untouched;
+        }
+        if failed_uris.is_empty() {
+            self.entries = None;
+            return CutFinish::Consumed;
+        }
+        if let Some(entries) = self.entries.as_mut() {
+            entries.uris.retain(|u| failed_uris.contains(u));
+        }
+        CutFinish::Partial
     }
 
     fn resolve(&self, text: Option<&str>, read_generation: u64) -> PasteDecision {
@@ -242,16 +286,26 @@ impl Ctx {
                 match this.clipboard.borrow().resolve(text.as_deref(), generation) {
                     PasteDecision::Stale => this.toast("Clipboard changed, try again"),
                     PasteDecision::Internal { uris, cut } => {
-                        if cut {
-                            this.clipboard.borrow_mut().consume_cut();
-                        }
-                        this.paste_uris(uris, cut, dest);
+                        // Cuts move asynchronously: keep the state until
+                        // completion, and refuse concurrent duplicate moves.
+                        let cut_op = if cut {
+                            match this.clipboard.borrow_mut().begin_cut() {
+                                Some(op_generation) => Some(op_generation),
+                                None => {
+                                    this.toast("Move already in progress");
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        this.paste_uris(uris, cut, dest, cut_op);
                     }
                     PasteDecision::External { uris } => {
-                        this.paste_uris(uris, false, dest);
+                        this.paste_uris(uris, false, dest, None);
                     }
                     PasteDecision::Unsupported => {
-                        if text.is_none() {
+                        if text.as_ref().is_none_or(|t| t.trim().is_empty()) {
                             this.toast("Clipboard is empty");
                         } else {
                             this.toast("Clipboard has no files to paste");
@@ -261,8 +315,9 @@ impl Ctx {
             });
     }
 
-    /// Copies (or moves, for a consumed cut) `uris` into `dest`.
-    fn paste_uris(&self, uris: Vec<String>, cut: bool, dest: String) {
+    /// Copies (or moves, for a cut) `uris` into `dest`. `cut_op` is the
+    /// dispatch generation of a cut move, applied at completion.
+    fn paste_uris(&self, uris: Vec<String>, cut: bool, dest: String, cut_op: Option<u64>) {
         if uris.is_empty() {
             self.toast("Clipboard is empty");
             return;
@@ -271,6 +326,7 @@ impl Ctx {
         Self::run_in_thread(
             move || {
                 let mut failed = 0;
+                let mut failed_uris = Vec::new();
                 let mut first_error = None;
                 for uri in &uris {
                     let r = if cut {
@@ -280,14 +336,32 @@ impl Ctx {
                     };
                     if let Err(e) = r {
                         failed += 1;
+                        if cut {
+                            failed_uris.push(uri.clone());
+                        }
                         if first_error.is_none() {
                             first_error = Some(e.to_string());
                         }
                     }
                 }
-                (uris.len(), failed, first_error)
+                (uris.len(), failed, failed_uris, first_error)
             },
-            move |(total, failed, first_error): (usize, i32, Option<String>)| {
+            move |(total, failed, failed_uris, first_error): (
+                usize,
+                i32,
+                Vec<String>,
+                Option<String>,
+            )| {
+                if let Some(op_generation) = cut_op {
+                    match this
+                        .clipboard
+                        .borrow_mut()
+                        .finish_cut(op_generation, &failed_uris)
+                    {
+                        CutFinish::Consumed => this.clear_system_clipboard(),
+                        CutFinish::Partial | CutFinish::Untouched => {}
+                    }
+                }
                 this.manager.reload_selected();
                 if failed == 0 {
                     this.toast(&format!("Pasted {total} item(s)"));
@@ -298,6 +372,17 @@ impl Ctx {
                 }
             },
         );
+    }
+
+    /// Empties the system clipboard after a fully consumed cut, so the
+    /// moved-away URIs cannot be pasted again. Called only when the
+    /// clipboard still belongs to the completed operation.
+    fn clear_system_clipboard(&self) {
+        if let Some(display) = gdk::Display::default() {
+            let clipboard = display.clipboard();
+            clipboard.set_text("");
+            self.clipboard.borrow_mut().our_provider = clipboard.content();
+        }
     }
 
     pub fn trash_selected(&self) {
@@ -850,25 +935,105 @@ mod tests {
     }
 
     #[test]
-    fn internal_cut_survives_without_external_changes() {
+    fn successful_move_consumes_cut() {
         let mut clip = ClipTracker::default();
-        let published = clip.publish(entries(&[A], true));
+        let published = clip.publish(entries(&[A, B], true));
         clip.on_own_changed();
-        assert_eq!(
-            clip.resolve(Some(&published), clip.generation),
-            PasteDecision::Internal {
-                uris: vec![A.to_string()],
-                cut: true,
-            }
-        );
-        // Consuming the cut drops the move intent afterwards.
-        clip.consume_cut();
+        let op = clip.begin_cut().expect("first move dispatches");
+        assert_eq!(clip.finish_cut(op, &[]), CutFinish::Consumed);
+        // Consumed: no retry, not even from the old text.
         assert_eq!(
             clip.resolve(Some(&published), clip.generation),
             PasteDecision::External {
-                uris: vec![A.to_string()]
+                uris: vec![A.to_string(), B.to_string()]
             }
         );
+    }
+
+    #[test]
+    fn failed_move_retries_as_move() {
+        let mut clip = ClipTracker::default();
+        let published = clip.publish(entries(&[A, B], true));
+        clip.on_own_changed();
+        let op = clip.begin_cut().expect("first move dispatches");
+        assert_eq!(
+            clip.finish_cut(op, &[A.to_string(), B.to_string()]),
+            CutFinish::Partial
+        );
+        // Nothing moved: the next paste retries the full move, never a copy.
+        assert_eq!(
+            clip.resolve(Some(&published), clip.generation),
+            PasteDecision::Internal {
+                uris: vec![A.to_string(), B.to_string()],
+                cut: true,
+            }
+        );
+    }
+
+    #[test]
+    fn partial_move_retries_only_failed() {
+        let mut clip = ClipTracker::default();
+        let published = clip.publish(entries(&[A, B], true));
+        clip.on_own_changed();
+        let op = clip.begin_cut().expect("first move dispatches");
+        assert_eq!(clip.finish_cut(op, &[B.to_string()]), CutFinish::Partial);
+        assert_eq!(
+            clip.resolve(Some(&published), clip.generation),
+            PasteDecision::Internal {
+                uris: vec![B.to_string()],
+                cut: true,
+            }
+        );
+    }
+
+    #[test]
+    fn new_publish_during_move_stays_intact() {
+        let mut clip = ClipTracker::default();
+        let published_a = clip.publish(entries(&[A], true));
+        let op = clip.begin_cut().expect("first move dispatches");
+        // New copy while the old move runs: independent state.
+        let published_b = clip.publish(entries(&[B], false));
+        clip.on_own_changed();
+        // Old completion touches nothing (not even with full success).
+        assert_eq!(clip.finish_cut(op, &[]), CutFinish::Untouched);
+        assert_eq!(
+            clip.resolve(Some(&published_b), clip.generation),
+            PasteDecision::Internal {
+                uris: vec![B.to_string()],
+                cut: false,
+            }
+        );
+        assert_ne!(published_a, published_b);
+    }
+
+    #[test]
+    fn external_replace_during_move_is_not_restored() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let op = clip.begin_cut().expect("first move dispatches");
+        clip.on_external_changed();
+        assert_eq!(clip.finish_cut(op, &[]), CutFinish::Untouched);
+        // Old cut is gone for good: foreign content pastes as copy.
+        assert_eq!(
+            clip.resolve(Some(B), clip.generation),
+            PasteDecision::External {
+                uris: vec![B.to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_paste_during_move_dispatches_once() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        clip.on_own_changed();
+        let op = clip.begin_cut().expect("first move dispatches");
+        // Second paste of the same cut: refused, no duplicate move.
+        assert_eq!(clip.begin_cut(), None);
+        // After completion the guard is released.
+        assert_eq!(clip.finish_cut(op, &[]), CutFinish::Consumed);
+        clip.publish(entries(&[A], true));
+        assert!(clip.begin_cut().is_some());
     }
 
     #[test]
