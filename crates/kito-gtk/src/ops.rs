@@ -242,17 +242,23 @@ impl Ctx {
         Self::run_in_thread(
             move || {
                 let mut failed = 0;
+                let mut first_error = None;
                 for uri in &uris {
-                    if kito_core::restore(uri).is_err() {
+                    if let Err(e) = kito_core::restore(uri) {
                         failed += 1;
+                        if first_error.is_none() {
+                            first_error = Some(e.to_string());
+                        }
                     }
                 }
-                (uris.len(), failed)
+                (uris.len(), failed, first_error)
             },
-            move |(total, failed)| {
+            move |(total, failed, first_error): (usize, i32, Option<String>)| {
                 this.manager.reload_selected();
                 if failed == 0 {
                     this.toast(&format!("Restored {total} item(s)"));
+                } else if let Some(error) = first_error {
+                    this.error_dialog("Could not restore", error);
                 } else {
                     this.toast(&format!("{failed} of {total} item(s) not restored"));
                 }

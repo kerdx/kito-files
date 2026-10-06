@@ -4,6 +4,8 @@
 pub mod bookmarks;
 
 use gio::prelude::*;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 
 /// Una voce di directory: il minimo che serve alla UI per la vista classica.
 #[derive(Debug, Clone)]
@@ -136,27 +138,18 @@ pub fn empty_trash() -> Result<(usize, usize), glib::Error> {
     empty_dir(TRASH_URI)
 }
 
-/// Riporta una voce del cestino nella sua posizione originale
-/// (`standard::trash::orig-path`). Se il nome è già occupato, il file
-/// viene comunque creato con un suffisso. Ritorna la URI finale.
+/// Riporta una voce del cestino nella sua posizione originale.
+/// Il nome viene dal percorso originale (il basename nel cestino può
+/// differire); se occupato, l'esistente è preservato con un suffisso.
+/// Ritorna l'URI finale. In caso di errore l'elemento resta nel cestino.
 pub fn restore(uri: &str) -> Result<String, glib::Error> {
     let file = gio::File::for_uri(uri);
     let info = file.query_info(
-        "standard::trash::orig-path",
+        gio::FILE_ATTRIBUTE_TRASH_ORIG_PATH.as_str(),
         gio::FileQueryInfoFlags::NONE,
         gio::Cancellable::NONE,
     )?;
-    let orig = info
-        .attribute_string("standard::trash::orig-path")
-        .ok_or_else(|| io_error("Unknown original location"))?;
-    let parent = gio::File::for_path(orig.as_str())
-        .parent()
-        .ok_or_else(|| io_error("Unknown original location"))?;
-    let name = file
-        .basename()
-        .and_then(|n| n.into_string().ok())
-        .unwrap_or_else(|| orig.to_string());
-    let dest = unique_child(&parent, &name);
+    let dest = restore_destination(&info)?;
     file.move_(
         &dest,
         gio::FileCopyFlags::NONE,
@@ -164,6 +157,48 @@ pub fn restore(uri: &str) -> Result<String, glib::Error> {
         Some(&mut |_, _| {}),
     )
     .map(|_| dest.uri().into())
+}
+
+/// Legge un attributo byte-string GIO come byte grezzi, senza passare
+/// dal getter gtk-rs (il cui debug assert pretende UTF-8 anche se il
+/// contenuto è opaco: `trash::orig-path` è una byte string). Vale in
+/// debug come in release.
+fn file_info_byte_string(info: &gio::FileInfo, attr: &std::ffi::CStr) -> Option<Vec<u8>> {
+    unsafe extern "C" {
+        fn g_file_info_get_attribute_byte_string(
+            info: *mut std::ffi::c_void,
+            attribute: *const std::ffi::c_char,
+        ) -> *const std::ffi::c_char;
+    }
+    let ptr =
+        unsafe { g_file_info_get_attribute_byte_string(info.as_ptr() as *mut _, attr.as_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes().to_vec())
+}
+
+/// Destinazione di ripristino dai metadati del cestino: directory
+/// originale + nome originale con suffisso se occupato. Il percorso
+/// originale è una byte string (`trash::orig-path`, non
+/// `standard::trash::orig-path`) e va letto come byte per preservare
+/// spazi, caratteri speciali e nomi non UTF-8. Testabile senza backend.
+fn restore_destination(info: &gio::FileInfo) -> Result<gio::File, glib::Error> {
+    let bytes = file_info_byte_string(info, c"trash::orig-path")
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| io_error("Unknown original location"))?;
+    let orig = std::path::PathBuf::from(OsStr::from_bytes(&bytes));
+    let name = orig
+        .file_name()
+        .ok_or_else(|| io_error("Unknown original location"))?;
+    let parent = orig
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| io_error("Unknown original location"))?;
+    if !parent.is_dir() {
+        return Err(io_error("Original location is no longer available"));
+    }
+    Ok(unique_child(&gio::File::for_path(parent), name))
 }
 
 /// Crea un file vuoto dentro `parent_dir_uri`. Se il nome è già occupato,
@@ -174,23 +209,7 @@ pub fn create_file(parent_dir_uri: &str, name: &str) -> Result<String, glib::Err
         return Err(io_error("Invalid file name"));
     }
     let dir = gio::File::for_uri(parent_dir_uri);
-    let mut candidate = dir.child(name);
-    if candidate.query_exists(gio::Cancellable::NONE) {
-        let (stem, ext) = stem_ext(name);
-        let mut i = 1;
-        loop {
-            let n = if i == 1 {
-                format!("{stem} (copy){ext}")
-            } else {
-                format!("{stem} (copy {i}){ext}")
-            };
-            candidate = dir.child(&n);
-            if !candidate.query_exists(gio::Cancellable::NONE) {
-                break;
-            }
-            i += 1;
-        }
-    }
+    let candidate = unique_child(&dir, OsStr::new(name));
     candidate.create(gio::FileCreateFlags::NONE, gio::Cancellable::NONE)?;
     Ok(candidate.uri().into())
 }
@@ -247,27 +266,36 @@ pub fn mkdir(parent_dir_uri: &str, name: &str) -> Result<String, glib::Error> {
     Ok(child.uri().into())
 }
 
-fn stem_ext(name: &str) -> (&str, &str) {
-    match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
+/// Divide `name` in (stelo, estensione) a livello di byte: l'ultimo
+/// `.` non iniziale. Versione byte-safe di nomi non UTF-8.
+fn stem_ext_os(name: &OsStr) -> (&OsStr, &OsStr) {
+    let bytes = name.as_bytes();
+    match bytes.iter().rposition(|&b| b == b'.') {
+        Some(i) if i > 0 => {
+            let (stem, ext) = bytes.split_at(i);
+            (OsStr::from_bytes(stem), OsStr::from_bytes(ext))
+        }
+        _ => (name, OsStr::new("")),
     }
 }
 
 /// `dest_dir/name`, oppure `name (copy).ext`, `name (copy 2).ext`...
-fn unique_child(dest_dir: &gio::File, name: &str) -> gio::File {
+/// Opera su `OsStr` per preservare i nomi non UTF-8.
+fn unique_child(dest_dir: &gio::File, name: &OsStr) -> gio::File {
     let mut candidate = dest_dir.child(name);
     if !candidate.query_exists(gio::Cancellable::NONE) {
         return candidate;
     }
-    let (stem, ext) = stem_ext(name);
+    let (stem, ext) = stem_ext_os(name);
     let mut i = 1;
     loop {
-        let numbered = if i == 1 {
-            format!("{stem} (copy){ext}")
+        let mut numbered = OsString::from(stem);
+        numbered.push(if i == 1 {
+            " (copy)".to_string()
         } else {
-            format!("{stem} (copy {i}){ext}")
-        };
+            format!(" (copy {i})")
+        });
+        numbered.push(ext);
         candidate = dest_dir.child(&numbered);
         if !candidate.query_exists(gio::Cancellable::NONE) {
             return candidate;
@@ -353,7 +381,7 @@ pub fn copy_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
         .and_then(|n| n.into_string().ok())
         .filter(|n| !n.is_empty())
         .ok_or_else(|| io_error("Invalid file name"))?;
-    let dest = unique_child(&gio::File::for_uri(dest_dir_uri), &name);
+    let dest = unique_child(&gio::File::for_uri(dest_dir_uri), OsStr::new(&name));
     copy_recursive(&src, &dest)
 }
 
@@ -366,7 +394,7 @@ pub fn move_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
         .and_then(|n| n.into_string().ok())
         .filter(|n| !n.is_empty())
         .ok_or_else(|| io_error("Invalid file name"))?;
-    let dest = unique_child(&gio::File::for_uri(dest_dir_uri), &name);
+    let dest = unique_child(&gio::File::for_uri(dest_dir_uri), OsStr::new(&name));
     src.move_(
         &dest,
         gio::FileCopyFlags::NONE,
@@ -486,9 +514,193 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("file.txt"), b"x").unwrap();
 
-        // File normale: senza `standard::trash::orig-path` non si ripristina.
+        // File normale: senza `trash::orig-path` non si ripristina.
         assert!(restore(&uri(&tmp.path().join("file.txt"))).is_err());
         assert!(tmp.path().join("file.txt").exists());
+    }
+
+    /// FileInfo con il solo attributo che conta, come lo dà il backend.
+    fn trash_info(orig_path: &str) -> gio::FileInfo {
+        let info = gio::FileInfo::new();
+        info.set_attribute_byte_string(gio::FILE_ATTRIBUTE_TRASH_ORIG_PATH.as_str(), orig_path);
+        info
+    }
+
+    #[test]
+    fn restore_destination_reads_orig_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("my doc (1) [x].txt");
+
+        // Nome preso dal percorso originale, spazi e speciali intatti.
+        let dest = restore_destination(&trash_info(orig.to_str().unwrap())).unwrap();
+        assert_eq!(
+            dest.uri().to_string(),
+            gio::File::for_path(&orig).uri().to_string()
+        );
+    }
+
+    #[test]
+    fn restore_destination_collision_keeps_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("report.txt");
+        std::fs::write(&orig, b"existing").unwrap();
+
+        let dest = restore_destination(&trash_info(orig.to_str().unwrap())).unwrap();
+        assert!(
+            dest.uri().to_string().ends_with("report%20(copy).txt")
+                || dest.uri().to_string().ends_with("report (copy).txt")
+        );
+        // L'esistente non viene toccato: solo calcolato il nome libero.
+        assert_eq!(std::fs::read(&orig).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn restore_destination_missing_metadata_errors() {
+        // Nessun attributo.
+        let err = restore_destination(&gio::FileInfo::new()).unwrap_err();
+        assert!(err.to_string().contains("Unknown original location"));
+
+        // Il vecchio nome attributo errato non viene più letto.
+        let info = gio::FileInfo::new();
+        info.set_attribute_byte_string("standard::trash::orig-path", "/tmp/x.txt");
+        let err = restore_destination(&info).unwrap_err();
+        assert!(err.to_string().contains("Unknown original location"));
+
+        // Directory originale sparita.
+        let missing = trash_info("/tmp/kito-definitely-gone-xyz/f.txt");
+        let err = restore_destination(&missing).unwrap_err();
+        assert!(err.to_string().contains("no longer available"));
+    }
+
+    #[test]
+    fn stem_ext_os_handles_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = OsStr::from_bytes(b"caf\xe9nota.txt");
+        let (stem, ext) = stem_ext_os(name);
+        assert_eq!(stem.as_bytes(), b"caf\xe9nota");
+        assert_eq!(ext.as_bytes(), b".txt");
+        let (stem, ext) = stem_ext_os(OsStr::new(".hidden"));
+        assert_eq!(stem.as_bytes(), b".hidden");
+        assert_eq!(ext.as_bytes(), b"");
+        let (stem, ext) = stem_ext_os(OsStr::new("noext"));
+        assert_eq!(stem.as_bytes(), b"noext");
+        assert_eq!(ext.as_bytes(), b"");
+    }
+
+    /// Cestina `path` via GIO. Ritorna `None` (skip) se il backend non
+    /// è disponibile in questo ambiente; non tocca altre voci.
+    fn trash_tempfile(path: &std::path::Path) -> Option<()> {
+        if let Err(e) = gio::File::for_path(path).trash(gio::Cancellable::NONE) {
+            eprintln!("SKIP trash e2e: backend unavailable ({e})");
+            return None;
+        }
+        assert!(!path.exists());
+        Some(())
+    }
+
+    /// URI `trash:///` della voce la cui origine è `orig`, o panico.
+    /// Confronta i byte grezzi (niente conversioni UTF-8: le altre voci
+    /// del cestino possono avere nomi arbitrari). gvfsd nota le nuove
+    /// voci con un monitor: breve retry prima di arrenderti.
+    fn find_trash_entry(orig: &std::path::Path) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let want = orig.as_os_str().as_bytes();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let trash = gio::File::for_uri(TRASH_URI);
+            let children = trash
+                .enumerate_children(
+                    "standard::name,trash::orig-path",
+                    gio::FileQueryInfoFlags::NONE,
+                    gio::Cancellable::NONE,
+                )
+                .unwrap();
+            while let Some(info) = children.next_file(gio::Cancellable::NONE).unwrap() {
+                if file_info_byte_string(&info, c"trash::orig-path").as_deref() == Some(want) {
+                    return children.child(&info).uri().to_string();
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("trash entry not found for {}", orig.display());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Temp dir sotto la home: /tmp sta su un mount dove il cestino non
+    /// è supportato, la home sì. Solo elementi della prova, mai esistenti.
+    fn home_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("kito-restore-test-")
+            .tempdir_in(glib::home_dir().join(".cache"))
+            .unwrap()
+    }
+
+    #[test]
+    fn restore_roundtrip_through_trash() {
+        // Nome voce unico per processo: riusare lo stesso nome in run
+        // ravvicinati confonde il monitor di gvfsd-trash (eventi
+        // coalescenti, la voce poi non appare più).
+        let unique = format!(
+            "round trip (1) {}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tmp = home_tempdir();
+        let path = tmp.path().join(&unique);
+        std::fs::write(&path, b"payload").unwrap();
+        let Some(()) = trash_tempfile(&path) else {
+            return;
+        };
+
+        // Un solo ciclo trash->restore: cicli multipli ravvicinati sullo
+        // stesso nome perdono eventi nel monitor di gvfsd-trash (la sua
+        // cache diverge e la voce non appare più; problema del demone,
+        // non del ripristino). La collisione è coperta a livello unit.
+        let restored = restore(&find_trash_entry(&path)).unwrap();
+        assert_eq!(restored, gio::File::for_path(&path).uri().to_string());
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    }
+
+    /// Imposta `trash::orig-path` a byte grezzi via C API diretta (il
+    /// setter del binding accetta solo `&str`). Solo per i test.
+    unsafe fn set_orig_path_raw(info: &gio::FileInfo, raw: &[u8]) {
+        unsafe extern "C" {
+            fn g_file_info_set_attribute_byte_string(
+                info: *mut std::ffi::c_void,
+                attribute: *const std::ffi::c_char,
+                value: *const std::ffi::c_char,
+            );
+        }
+        let path = std::ffi::CString::new(raw).unwrap();
+        unsafe {
+            g_file_info_set_attribute_byte_string(
+                info.as_ptr() as *mut _,
+                c"trash::orig-path".as_ptr(),
+                path.as_ptr(),
+            );
+        }
+    }
+
+    #[test]
+    fn restore_destination_non_utf8_orig_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut raw = tmp.path().as_os_str().as_bytes().to_vec();
+        raw.extend_from_slice(b"/weird \xff.txt");
+        let info = gio::FileInfo::new();
+        unsafe { set_orig_path_raw(&info, &raw) };
+
+        let dest = restore_destination(&info).unwrap();
+        assert_eq!(
+            dest.uri().to_string(),
+            gio::File::for_path(OsStr::from_bytes(&raw))
+                .uri()
+                .to_string()
+        );
     }
 
     #[test]
