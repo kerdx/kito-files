@@ -192,64 +192,143 @@ fn trash_icon(full: bool) -> gio::ThemedIcon {
     }
 }
 
-/// `true` if the trash contains at least one entry. If the trash backend
-/// is unavailable (no gvfs) it does not block: treated as empty.
-fn trash_is_full() -> bool {
-    gio::File::for_uri(kito_core::TRASH_URI)
-        .enumerate_children(
-            "standard::name",
-            gio::FileQueryInfoFlags::NONE,
-            gio::Cancellable::NONE,
-        )
-        .map(|children| {
-            children
-                .next_file(gio::Cancellable::NONE)
-                .ok()
-                .flatten()
-                .is_some()
-        })
-        .unwrap_or(false)
+/// Trash icon updater state: pure generation-guarded logic, no widgets,
+/// no I/O. Async probes report back with their generation; superseded
+/// results are ignored, so overlapping queries and stale answers can
+/// never flip the icon wrongly. Starts empty until the first result.
+#[derive(Default)]
+struct TrashIconState {
+    applied: bool,
+    next_generation: u64,
+    pending: u64,
+}
+
+impl TrashIconState {
+    /// Currently shown state.
+    fn current(&self) -> bool {
+        self.applied
+    }
+
+    /// Starts a probe, returning its generation.
+    fn begin_query(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.pending = self.next_generation;
+        self.pending
+    }
+
+    /// Applies a finished probe. Returns the new state iff the icon
+    /// must change; stale generations return `None`.
+    fn apply_result(&mut self, generation: u64, full: bool) -> Option<bool> {
+        if generation != self.pending {
+            return None;
+        }
+        self.pending = 0;
+        let changed = full != self.applied;
+        self.applied = full;
+        changed.then_some(full)
+    }
+}
+
+/// Applies a finished probe to the image if still alive: the icon
+/// changes only when the guarded state actually flips.
+fn apply_trash_result(
+    image: &glib::WeakRef<gtk::Image>,
+    state: &Rc<RefCell<TrashIconState>>,
+    generation: u64,
+    full: bool,
+) {
+    let Some(image) = image.upgrade() else {
+        return;
+    };
+    if let Some(full) = state.borrow_mut().apply_result(generation, full) {
+        image.set_from_gicon(&trash_icon(full));
+    }
+}
+
+/// One async fullness probe: enumerate (async) + first entry (async),
+/// then apply through the generation guard. Never blocks the UI thread;
+/// backend errors count as empty without crashing.
+fn poll_trash_once(image: &glib::WeakRef<gtk::Image>, state: &Rc<RefCell<TrashIconState>>) {
+    let generation = state.borrow_mut().begin_query();
+    let image_weak = image.clone();
+    let state = state.clone();
+    gio::File::for_uri(kito_core::TRASH_URI).enumerate_children_async(
+        "standard::name",
+        gio::FileQueryInfoFlags::NONE,
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |listed| {
+            let image_weak = image_weak.clone();
+            let state = state.clone();
+            match listed {
+                Ok(children) => children.next_files_async(
+                    1,
+                    glib::Priority::DEFAULT,
+                    None::<&gio::Cancellable>,
+                    move |first| {
+                        let full = first.map(|infos| !infos.is_empty()).unwrap_or(false);
+                        apply_trash_result(&image_weak, &state, generation, full);
+                    },
+                ),
+                Err(_) => apply_trash_result(&image_weak, &state, generation, false),
+            }
+        },
+    );
 }
 
 fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
     let button = nav_row(
-        &trash_icon(trash_is_full()),
+        &trash_icon(false),
         "Trash",
         load,
         kito_core::TRASH_URI.to_string(),
     );
-    // The row updates itself: if a full trash becomes empty
-    // (or vice versa) the icon changes without reloading the sidebar.
+    // The icon follows the trash asynchronously: an initial probe plus
+    // a bounded 3s poll, both async so the UI thread never blocks. The
+    // generation guard drops superseded answers; weak references and an
+    // explicit teardown on destroy keep nothing alive past the row.
+    let state: Rc<RefCell<TrashIconState>> = Rc::default();
+    let timer_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    if let Some(image) = button
+        .child()
+        .and_downcast::<gtk::Box>()
+        .and_then(|b| b.first_child())
+        .and_downcast::<gtk::Image>()
     {
-        let image = button
-            .child()
-            .and_downcast::<gtk::Box>()
-            .and_then(|b| b.first_child())
-            .and_downcast::<gtk::Image>();
-        if let Some(image) = image {
-            let (tx, rx) = std::sync::mpsc::channel::<bool>();
-            glib::timeout_add_local(std::time::Duration::from_secs(3), move || {
-                let _ = tx.send(trash_is_full());
-                glib::ControlFlow::Continue
-            });
-            let mut last = trash_is_full();
-            glib::idle_add_local(move || match rx.try_recv() {
-                Ok(full) => {
-                    if full != last {
-                        last = full;
-                        image.set_from_gicon(&trash_icon(full));
-                    }
-                    glib::ControlFlow::Continue
+        let query: Rc<dyn Fn()> = Rc::new({
+            let image_weak = image.downgrade();
+            let state = state.clone();
+            move || poll_trash_once(&image_weak, &state)
+        });
+        query();
+        let timer_query = query.clone();
+        let timer_weak = image.downgrade();
+        let timer_slot = timer_id.clone();
+        *timer_id.borrow_mut() = Some(glib::timeout_add_local(
+            std::time::Duration::from_secs(3),
+            move || {
+                if timer_weak.upgrade().is_none() {
+                    *timer_slot.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
                 }
-                Err(_) => glib::ControlFlow::Break,
-            });
-        }
+                timer_query();
+                glib::ControlFlow::Continue
+            },
+        ));
+        let timer_slot = timer_id.clone();
+        button.connect_destroy(move |_| {
+            if let Some(id) = timer_slot.borrow_mut().take() {
+                id.remove();
+            }
+        });
     }
     let gesture = gtk::GestureClick::builder()
         .button(gtk::gdk::BUTTON_SECONDARY)
         .build();
     let button_weak = button.downgrade();
     let window = window.clone();
+    // Menu icon from the last applied probe: no sync query on click.
+    let menu_state = state.clone();
     gesture.connect_pressed(move |gesture, _, x, y| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
         let Some(button) = button_weak.upgrade() else {
@@ -269,7 +348,7 @@ fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
             .margin_top(6)
             .margin_bottom(6)
             .build();
-        let image = gtk::Image::from_gicon(&trash_icon(trash_is_full()));
+        let image = gtk::Image::from_gicon(&trash_icon(menu_state.borrow().current()));
         image.set_pixel_size(18);
         row.append(&image);
         row.append(
@@ -529,5 +608,81 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
             .build(),
         places: places_rows,
         other: other_rows,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_empty_and_full() {
+        let mut state = TrashIconState::default();
+        assert!(!state.current());
+        let query = state.begin_query();
+        assert_eq!(state.apply_result(query, true), Some(true));
+        assert!(state.current());
+
+        let mut fresh = TrashIconState::default();
+        let query = fresh.begin_query();
+        assert_eq!(fresh.apply_result(query, false), None);
+        assert!(!fresh.current());
+    }
+
+    #[test]
+    fn empty_to_full_and_back() {
+        let mut state = TrashIconState::default();
+        let query = state.begin_query();
+        assert_eq!(state.apply_result(query, true), Some(true));
+        let query = state.begin_query();
+        assert_eq!(state.apply_result(query, false), Some(false));
+        assert!(!state.current());
+    }
+
+    #[test]
+    fn superseded_results_are_ignored() {
+        let mut state = TrashIconState::default();
+        let old = state.begin_query();
+        let live = state.begin_query();
+        // Late answer from the superseded query: ignored, stays active.
+        assert_eq!(state.apply_result(old, true), None);
+        assert!(!state.current());
+        assert_eq!(state.apply_result(live, true), Some(true));
+        assert!(state.current());
+    }
+
+    #[test]
+    fn backend_errors_keep_polling_without_wedging() {
+        let mut state = TrashIconState::default();
+        for _ in 0..5 {
+            let query = state.begin_query();
+            assert_eq!(state.apply_result(query, false), None);
+        }
+        assert!(!state.current());
+        // Still accepts a real change afterwards.
+        let query = state.begin_query();
+        assert_eq!(state.apply_result(query, true), Some(true));
+    }
+
+    #[test]
+    fn only_flips_reach_the_widget() {
+        let mut state = TrashIconState::default();
+        let mut shown = Vec::new();
+        let stale = state.begin_query();
+        let live = state.begin_query();
+        // Superseded: no widget access.
+        if let Some(full) = state.apply_result(stale, true) {
+            shown.push(full);
+        }
+        // Unchanged: no widget access.
+        if let Some(full) = state.apply_result(live, false) {
+            shown.push(full);
+        }
+        // Flip: single update.
+        let query = state.begin_query();
+        if let Some(full) = state.apply_result(query, true) {
+            shown.push(full);
+        }
+        assert_eq!(shown, vec![true]);
     }
 }
