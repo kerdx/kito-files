@@ -5,17 +5,17 @@
 > coffee break and occasionally writes a comment explaining something nobody
 > asked about. Proceed with a sense of humour.
 
-**A lightweight, native file manager for Wayland, written in Rust with GTK4 and libadwaita.**
+**A lightweight, native Linux file manager, written in Rust with GTK4 and libadwaita.**
 
 Kito Files follows the classic, one-folder-at-a-time layout. It is fast, has no desktop
-environment hard dependencies, and runs on GNOME, KDE and pure Wayland window managers
-(sway, Hyprland, river, labwc) alike.
+environment hard dependencies, and uses GTK's automatic display backend selection
+for Wayland or X11. Development testing is done on Wayland.
 
 - **App ID:** `it.kito.KitoFiles`
 - **Binary:** `kito-files`
 - **Version:** 0.1.0 — *early development / MVP*
 - **License:** MIT
-- **Platform:** Wayland only (no X11)
+- **Platform:** Linux; tested on Wayland
 
 ---
 
@@ -55,13 +55,18 @@ environment hard dependencies, and runs on GNOME, KDE and pure Wayland window ma
 
 **File operations**
 
-- Copy, cut, paste and move — run in a background thread, result reported with a toast
+- Copy and cut prepare the clipboard; paste performs copying or moving in a
+  background thread, with the result reported through a toast
 - Name collisions get a safe suffix: `report.txt` → `report (copy).txt`, `report (copy 2).txt`
 - Move to trash by default; permanent delete requires an explicit confirmation dialog
 - Restore items from the Trash to their original location
 - Empty the Trash (with confirmation)
 - Rename (`F2`) and new folder (`Ctrl+Shift+N`), both with input validation
-- Open files and folders with the system default application (`gio::AppInfo`, `xdg-open` fallback)
+- Create empty files with suggested names for text, Word, spreadsheet and HTML files.
+  These are empty placeholders: `.docx` and `.xlsx` files are not valid Office
+  documents until created or saved in an appropriate application
+- Open folders in the current tab and files with the system default application (`gio::AppInfo`)
+- Properties dialog with name, location, type, size and modification time
 - Context menus for files, empty space, and the Trash
 
 **Integration**
@@ -71,6 +76,8 @@ environment hard dependencies, and runs on GNOME, KDE and pure Wayland window ma
 - Uses the system Adwaita theme through `AdwStyleManager`; icons come from the
   freedesktop icon theme (Papirus, Breeze, Adwaita… all work)
 - Minimal custom CSS on top of the stock theme — no GNOME desktop required, no dconf/GSettings
+- Open a detected terminal emulator in the current local folder, including a root
+  shell via `sudo -s` where supported
 
 ---
 
@@ -105,11 +112,12 @@ sudo pacman -S gtk4 libadwaita glib2 gdk-pixbuf2 pkgconf gcc
 
 | Component | Version required | Notes |
 |---|---|---|
-| GTK4 | >= 4.22 | `gtk4-wayland` build on rolling distros |
+| GTK4 | >= 4.22 | Uses the available display backend automatically |
 | libadwaita | >= 1.9 | widget library only — no gnome-shell/mutter dragged in |
 | GLib / GIO / gdk-pixbuf | >= 2.88 | |
-| Wayland compositor | any | X11 is deliberately not supported |
+| Graphical session | Wayland or X11 | Tested on Wayland |
 | **gvfs** | recommended | required for Trash (`trash:///`) and network backends |
+| Terminal emulator / `sudo` | optional | For terminal actions / root shells |
 
 `gvfs` is an *optional runtime* dependency: without it, local file operations still work,
 but trashing and network locations will fail.
@@ -141,7 +149,7 @@ but trashing and network locations will fail.
 ### 1. Clone the repository
 
 ```bash
-git clone <repo-url> kito-files
+git clone https://github.com/kerdx/kito-files.git
 cd kito-files
 ```
 
@@ -165,19 +173,18 @@ The binary is produced at `target/release/kito-files`
 ### 3. Run
 
 ```bash
-GDK_BACKEND=wayland cargo run --release
+cargo run --release
 ```
 
 Or directly:
 
 ```bash
-GDK_BACKEND=wayland ./target/release/kito-files
+./target/release/kito-files
 # open a specific folder, or several
 ./target/release/kito-files ~/Documents ~/Downloads
 ```
 
-> `GDK_BACKEND=wayland` is a safety net: Kito Files is Wayland-only, and forcing the
-> backend prevents an accidental fallback to X11.
+GTK automatically selects the display backend for the current session.
 
 ### 4. Install (optional, per-user)
 
@@ -190,12 +197,14 @@ install -Dm644 data/it.kito.KitoFiles.desktop ~/.local/share/applications/it.kit
 install -Dm644 data/it.kito.KitoFiles.svg ~/.local/share/icons/hicolor/scalable/apps/it.kito.KitoFiles.svg
 ```
 
-The checked-in `.desktop` file points at the debug binary for development.
-Before installing, edit the `Exec` line so it matches where you installed the binary:
+The checked-in `.desktop` file launches the binary through `PATH`:
 
 ```ini
 Exec=kito-files %U
 ```
+
+Make sure `~/.local/bin` is in your session's `PATH` before launching from the
+desktop menu.
 
 Refresh the desktop database so the launcher appears:
 
@@ -271,22 +280,26 @@ kito-files/
 │           ├── file_list.rs    # Icons / Compact / Details views
 │           ├── tabs.rs         # AdwTabView, per-tab state and history
 │           ├── sidebar.rs      # Places, Devices, Network, Trash
-│           ├── ops.rs          # clipboard, trash, rename, new folder, dialogs
-│           └── context_menu.rs # file / background / trash popovers
+│           ├── ops.rs          # clipboard, file operations, properties, dialogs
+│           ├── context_menu.rs # file / background / trash popovers
+│           └── terminal.rs     # terminal detection and launch, optional root shell
 └── data/                 # .desktop entry and application icon
 ```
 
 Design rules:
 
-- **`kito-core` is pure and testable** — every file operation runs on `gio::File`,
-  never on `std::fs` in the UI thread, and can be exercised with `cargo test -p kito-core`
-  on temporary directories without a display server.
-- **`kito-gtk` is UI only** — it never touches the filesystem directly; long operations
-  are dispatched to a background thread and their result returns to the main loop as a toast.
+- **`kito-core` has no GTK dependency** — file operations use `gio::File`, while
+  freedesktop bookmarks use `std::fs`. Unit tests run on temporary directories
+  without a display server via `cargo test -p kito-core`.
+- **`kito-gtk` owns the UI and integration** — it calls `kito-core` for file operations
+  and also handles configuration-directory setup and terminal executable detection.
+  Copy/move during paste, trash, permanent deletion, restore and emptying the Trash
+  run in background threads, with results delivered to the main loop. Directory
+  listing and some smaller operations still run synchronously on the UI thread.
 - **No GNOME desktop coupling** — libadwaita is used as a widget library only: no
   GSettings/dconf, no libpanel, no Tracker, no desktop portals required.
 - **Freedesktop, not GNOME** — GIO/GVfs for files, freedesktop bookmarks, icon themes
-  and `xdg-open` for launching applications.
+  and `gio::AppInfo` for launching default applications.
 
 ---
 
@@ -296,11 +309,11 @@ Design rules:
 cargo test -p kito-core        # unit tests (no display needed)
 cargo clippy -- -D warnings    # lints
 cargo fmt --check              # formatting
-GDK_BACKEND=wayland cargo run  # manual testing on a Wayland session
+cargo run                     # manual testing in the current graphical session
 ```
 
-Manual testing is done on Wayland only (GNOME, sway, Hyprland); Xorg is intentionally
-not supported.
+Manual testing is done on Wayland (GNOME, sway, Hyprland). GTK selects the available
+Wayland or X11 backend automatically; X11 has not been part of development testing.
 
 ---
 
