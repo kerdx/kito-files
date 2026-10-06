@@ -1,7 +1,7 @@
 //! Apertura del terminale di sistema nella cartella corrente.
 //! GIO non espone i terminali: si cerca l'eseguibile in PATH e si usano
 //! le opzioni `--working-directory` / `-e` note. La shell root gira
-//! dentro il terminale (`sudo -i`): `pkexec` sanitizzerebbe l'ambiente
+//! dentro il terminale (`sudo -s`): `pkexec` sanitizzerebbe l'ambiente
 //! e il terminale non raggiungerebbe il display Wayland.
 
 use std::process::Command;
@@ -26,7 +26,7 @@ const TERMINALS: [Terminal; 10] = [
                 d.into(),
                 "-e".into(),
                 "sudo".into(),
-                "-i".into(),
+                "-s".into(),
             ]
         },
     },
@@ -38,7 +38,7 @@ const TERMINALS: [Terminal; 10] = [
                 format!("--working-directory={d}"),
                 "--".into(),
                 "sudo".into(),
-                "-i".into(),
+                "-s".into(),
             ]
         },
     },
@@ -51,7 +51,7 @@ const TERMINALS: [Terminal; 10] = [
                 d.into(),
                 "--".into(),
                 "sudo".into(),
-                "-i".into(),
+                "-s".into(),
             ]
         },
     },
@@ -63,7 +63,7 @@ const TERMINALS: [Terminal; 10] = [
                 format!("--working-directory={d}"),
                 "-x".into(),
                 "sudo".into(),
-                "-i".into(),
+                "-s".into(),
             ]
         },
     },
@@ -74,19 +74,19 @@ const TERMINALS: [Terminal; 10] = [
             vec![
                 format!("--working-directory={d}"),
                 "-e".into(),
-                "sudo -i".into(),
+                "sudo -s".into(),
             ]
         },
     },
     Terminal {
         prog: "alacritty",
         cwd: |_| vec![],
-        root: |_| vec!["-e".into(), "sudo".into(), "-i".into()],
+        root: |_| vec!["-e".into(), "sudo".into(), "-s".into()],
     },
     Terminal {
         prog: "kitty",
         cwd: |_| vec![],
-        root: |_| vec!["sudo".into(), "-i".into()],
+        root: |_| vec!["sudo".into(), "-s".into()],
     },
     Terminal {
         prog: "wezterm",
@@ -98,7 +98,7 @@ const TERMINALS: [Terminal; 10] = [
                 d.into(),
                 "--".into(),
                 "sudo".into(),
-                "-i".into(),
+                "-s".into(),
             ]
         },
     },
@@ -110,7 +110,7 @@ const TERMINALS: [Terminal; 10] = [
     Terminal {
         prog: "xterm",
         cwd: |_| vec![],
-        root: |_| vec!["-e".into(), "sudo".into(), "-i".into()],
+        root: |_| vec!["-e".into(), "sudo".into(), "-s".into()],
     },
 ];
 
@@ -129,7 +129,8 @@ fn which(prog: &str) -> bool {
 }
 
 /// Apre il terminale in `dir`. Con `root` la shell parte già root
-/// (`sudo -i` dentro il terminale: nessuna sanitizzazione d'ambiente).
+/// (`sudo -s` dentro il terminale: `sudo -i` farebbe `cd` nella home di
+/// root, `-s` invece parte nella cartella corrente).
 pub fn open(dir: &str, root: bool) -> Result<(), String> {
     for terminal in TERMINALS {
         if !which(terminal.prog) {
@@ -141,7 +142,10 @@ pub fn open(dir: &str, root: bool) -> Result<(), String> {
             (terminal.cwd)(dir)
         };
         if args.is_empty() {
-            return Err(format!("A root shell is not supported by {}", terminal.prog));
+            return Err(format!(
+                "A root shell is not supported by {}",
+                terminal.prog
+            ));
         }
         return Command::new(terminal.prog)
             .args(&args)

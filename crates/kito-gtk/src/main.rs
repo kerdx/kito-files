@@ -7,6 +7,7 @@ mod file_list;
 mod ops;
 mod sidebar;
 mod tabs;
+mod terminal;
 
 use adw::prelude::*;
 use file_list::ViewMode;
@@ -58,9 +59,17 @@ type ActionDef = (&'static str, fn(&ops::Ctx));
 /// Registra le azioni `win.*` (menu + scorciatoie) sulla finestra.
 fn register_actions(app: &adw::Application, window: &adw::ApplicationWindow, ctx: Rc<ops::Ctx>) {
     let group = gio::SimpleActionGroup::new();
-    let defs: [ActionDef; 14] = [
+    let defs: [ActionDef; 22] = [
         ("open", ops::Ctx::open_selected),
         ("new-folder", ops::Ctx::new_folder),
+        ("new-text-file", |c| c.new_file("New Text File.txt")),
+        ("new-empty-file", |c| c.new_file("New File")),
+        ("new-word-doc", |c| c.new_file("New Word Document.docx")),
+        ("new-spreadsheet", |c| c.new_file("New Spreadsheet.xlsx")),
+        ("new-html-page", |c| c.new_file("New HTML Page.html")),
+        ("open-terminal", ops::Ctx::open_terminal),
+        ("open-terminal-root", ops::Ctx::open_terminal_root),
+        ("properties", ops::Ctx::show_properties),
         ("empty-trash", ops::Ctx::empty_trash),
         ("restore", ops::Ctx::restore_selected),
         ("pin", ops::Ctx::toggle_pin),
@@ -164,10 +173,18 @@ fn load_pathbar_css() {
         .ctx-menu {\
             padding: 0;\
         }\
+        .ctx-sub {\
+            background-color: alpha(@window_fg_color, 0.04);\
+            border-top-right-radius: 9px;\
+            border-bottom-right-radius: 9px;\
+        }\
+        .ctx-divider {\
+            background-color: alpha(@window_fg_color, 0.10);\
+        }\
         .ctx-row {\
             border-radius: 8px;\
             min-height: 22px;\
-            padding: 5px 8px;\
+            padding: 0;\
         }\
         .ctx-row:hover {\
             background-color: alpha(@accent_bg_color, 0.14);\

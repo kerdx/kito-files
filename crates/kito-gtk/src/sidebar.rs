@@ -182,13 +182,69 @@ fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::Appli
 
 /// Riga Cestino in Places: apre `trash:///` e ha il menu "Empty Trash…"
 /// sul click destro (attiva `win.empty-trash`, che chiede conferma).
+/// Icona del cestino: `user-trash-full` se c'è qualcosa dentro, altrimenti
+/// la variante vuota. Papirus ha entrambe.
+fn trash_icon(full: bool) -> gio::ThemedIcon {
+    if full {
+        gio::ThemedIcon::new("user-trash-full")
+    } else {
+        gio::ThemedIcon::new("user-trash")
+    }
+}
+
+/// `true` se il cestino contiene almeno una voce. Se il backend cestino
+/// non è disponibile (gvfs assente) non blocca: si tratta come vuoto.
+fn trash_is_full() -> bool {
+    gio::File::for_uri(kito_core::TRASH_URI)
+        .enumerate_children(
+            "standard::name",
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .map(|children| {
+            children
+                .next_file(gio::Cancellable::NONE)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+        .unwrap_or(false)
+}
+
 fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
     let button = nav_row(
-        &gio::ThemedIcon::from_names(&["user-trash", "user-trash-full"]),
+        &trash_icon(trash_is_full()),
         "Trash",
         load,
         kito_core::TRASH_URI.to_string(),
     );
+    // La riga si aggiorna da sola: se un cestino pieno diventa vuoto
+    // (o viceversa) l'icona cambia senza ricaricare la sidebar.
+    {
+        let image = button
+            .child()
+            .and_downcast::<gtk::Box>()
+            .and_then(|b| b.first_child())
+            .and_downcast::<gtk::Image>();
+        if let Some(image) = image {
+            let (tx, rx) = std::sync::mpsc::channel::<bool>();
+            glib::timeout_add_local(std::time::Duration::from_secs(3), move || {
+                let _ = tx.send(trash_is_full());
+                glib::ControlFlow::Continue
+            });
+            let mut last = trash_is_full();
+            glib::idle_add_local(move || match rx.try_recv() {
+                Ok(full) => {
+                    if full != last {
+                        last = full;
+                        image.set_from_gicon(&trash_icon(full));
+                    }
+                    glib::ControlFlow::Continue
+                }
+                Err(_) => glib::ControlFlow::Break,
+            });
+        }
+    }
     let gesture = gtk::GestureClick::builder()
         .button(gtk::gdk::BUTTON_SECONDARY)
         .build();
@@ -213,10 +269,7 @@ fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
             .margin_top(6)
             .margin_bottom(6)
             .build();
-        let image = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(&[
-            "user-trash",
-            "user-trash-full",
-        ]));
+        let image = gtk::Image::from_gicon(&trash_icon(trash_is_full()));
         image.set_pixel_size(18);
         row.append(&image);
         row.append(

@@ -210,10 +210,7 @@ pub fn props(uri: &str) -> Result<Props, glib::Error> {
         uri: uri.to_string(),
         is_dir: info.file_type() == gio::FileType::Directory,
         size: info.size(),
-        modified: info
-            .attribute_uint64("time::modified")
-            .try_into()
-            .ok(),
+        modified: info.attribute_uint64("time::modified").try_into().ok(),
         content_type: info.content_type().map(|s| s.to_string()),
     })
 }

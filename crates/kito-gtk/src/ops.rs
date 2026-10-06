@@ -362,6 +362,76 @@ impl Ctx {
         }
     }
 
+    /// Dialog con un campo di testo: `on_ok` riceve il valore scritto.
+    /// Il testo iniziale resta selezionato, basta digitare sopra.
+    fn name_dialog<F>(&self, title: &str, placeholder: &str, initial: &str, confirm: &str, on_ok: F)
+    where
+        F: Fn(String) + 'static,
+    {
+        let dialog = adw::Dialog::builder()
+            .title(title)
+            .content_width(360)
+            .build();
+        let entry = gtk::Entry::builder()
+            .text(initial)
+            .placeholder_text(placeholder)
+            .build();
+        let confirm_button = gtk::Button::builder()
+            .label(confirm)
+            .css_classes(["suggested-action"])
+            .build();
+        let cancel_button = gtk::Button::builder().label("Cancel").build();
+        let buttons = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk::Align::End)
+            .build();
+        buttons.append(&cancel_button);
+        buttons.append(&confirm_button);
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_start(16)
+            .margin_end(16)
+            .margin_top(16)
+            .margin_bottom(16)
+            .build();
+        content.append(&entry);
+        content.append(&buttons);
+        dialog.set_child(Some(&content));
+
+        let ok: Rc<dyn Fn()> = Rc::new({
+            let dialog = dialog.clone();
+            let entry = entry.clone();
+            move || {
+                let text = entry.text().to_string();
+                dialog.close();
+                on_ok(text);
+            }
+        });
+        cancel_button.connect_clicked({
+            let dialog = dialog.clone();
+            move |_| {
+                dialog.close();
+            }
+        });
+        confirm_button.connect_clicked({
+            let ok = ok.clone();
+            move |_| ok()
+        });
+        entry.connect_activate({
+            let ok = ok.clone();
+            move |_| ok()
+        });
+        dialog.present(Some(&self.window));
+        // La selezione del testo esiste solo a widget focalizzato.
+        let entry = entry.clone();
+        glib::idle_add_local_once(move || {
+            entry.grab_focus();
+            entry.select_region(0, -1);
+        });
+    }
+
     /// F2: rinomina il singolo selezionato.
     pub fn rename_selected(&self) {
         let objs = self.manager.selected_objects();
@@ -370,63 +440,21 @@ impl Ctx {
             return;
         }
         let uri = objs[0].uri();
-        let dialog = adw::Dialog::builder()
-            .title("Rename")
-            .content_width(360)
-            .build();
-        let entry = gtk::Entry::builder().text(objs[0].name()).build();
-        let rename_button = gtk::Button::builder()
-            .label("Rename")
-            .css_classes(["suggested-action"])
-            .build();
-        let cancel_button = gtk::Button::builder().label("Cancel").build();
-        let buttons = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .halign(gtk::Align::End)
-            .build();
-        buttons.append(&cancel_button);
-        buttons.append(&rename_button);
-        let content = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
-            .margin_start(16)
-            .margin_end(16)
-            .margin_top(16)
-            .margin_bottom(16)
-            .build();
-        content.append(&entry);
-        content.append(&buttons);
-        dialog.set_child(Some(&content));
-
+        let name = objs[0].name();
         let this = self.clone();
-        let do_rename = Rc::new({
-            let dialog = dialog.clone();
-            let entry = entry.clone();
-            let this = this.clone();
-            move || {
-                dialog.close();
-                match kito_core::rename(&uri, &entry.text()) {
-                    Ok(_) => {
-                        this.manager.reload_selected();
-                        this.toast("Renamed");
-                    }
-                    Err(e) => this.error_dialog("Could not rename", e.to_string()),
+        self.name_dialog(
+            "Rename",
+            "File name",
+            &name,
+            "Rename",
+            move |text| match kito_core::rename(&uri, &text) {
+                Ok(_) => {
+                    this.manager.reload_selected();
+                    this.toast("Renamed");
                 }
-            }
-        });
-        cancel_button.connect_clicked({
-            let dialog = dialog.clone();
-            move |_| {
-                dialog.close();
-            }
-        });
-        rename_button.connect_clicked({
-            let do_rename = do_rename.clone();
-            move |_| do_rename()
-        });
-        entry.connect_activate(move |_| do_rename());
-        dialog.present(Some(&self.window));
+                Err(e) => this.error_dialog("Could not rename", e.to_string()),
+            },
+        );
     }
 
     /// Nuova cartella nella cartella corrente (menu sfondo, Ctrl+Shift+N).
@@ -434,71 +462,25 @@ impl Ctx {
         let Some(dest) = self.manager.selected_uri() else {
             return;
         };
-        let dialog = adw::Dialog::builder()
-            .title("New Folder")
-            .content_width(360)
-            .build();
-        let entry = gtk::Entry::builder()
-            .text("Untitled Folder")
-            .placeholder_text("Folder name")
-            .build();
-        entry.select_region(0, -1);
-        let create_button = gtk::Button::builder()
-            .label("Create")
-            .css_classes(["suggested-action"])
-            .build();
-        let cancel_button = gtk::Button::builder().label("Cancel").build();
-        let buttons = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .halign(gtk::Align::End)
-            .build();
-        buttons.append(&cancel_button);
-        buttons.append(&create_button);
-        let content = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
-            .margin_start(16)
-            .margin_end(16)
-            .margin_top(16)
-            .margin_bottom(16)
-            .build();
-        content.append(&entry);
-        content.append(&buttons);
-        dialog.set_child(Some(&content));
-
         let this = self.clone();
-        let do_create = Rc::new({
-            let dialog = dialog.clone();
-            let entry = entry.clone();
-            let this = this.clone();
-            move || {
-                dialog.close();
-                match kito_core::mkdir(&dest, &entry.text()) {
-                    Ok(_) => {
-                        this.manager.reload_selected();
-                        this.toast("Folder created");
-                    }
-                    Err(e) => this.error_dialog("Could not create folder", e.to_string()),
+        self.name_dialog(
+            "New Folder",
+            "Folder name",
+            "Untitled Folder",
+            "Create",
+            move |text| match kito_core::mkdir(&dest, &text) {
+                Ok(_) => {
+                    this.manager.reload_selected();
+                    this.toast("Folder created");
                 }
-            }
-        });
-        cancel_button.connect_clicked({
-            let dialog = dialog.clone();
-            move |_| {
-                dialog.close();
-            }
-        });
-        create_button.connect_clicked({
-            let do_create = do_create.clone();
-            move |_| do_create()
-        });
-        entry.connect_activate(move |_| do_create());
-        dialog.present(Some(&self.window));
+                Err(e) => this.error_dialog("Could not create folder", e.to_string()),
+            },
+        );
     }
 
-    /// Crea un file vuoto con nome fisso (unificato se occupato).
-    pub fn new_file(&self, name: &'static str) {
+    /// Nuovo file: il tipo scelto dal menu "Crea" è solo il nome iniziale
+    /// proposto, il nome vero e proprio lo scrive sempre l'utente.
+    pub fn new_file(&self, template: &'static str) {
         let Some(dest) = self.manager.selected_uri() else {
             return;
         };
@@ -509,13 +491,16 @@ impl Ctx {
             );
             return;
         }
-        match kito_core::create_file(&dest, name) {
-            Ok(_) => {
-                self.manager.reload_selected();
-                self.toast(&format!("Created {name}"));
+        let this = self.clone();
+        self.name_dialog("New File", "File name", template, "Create", move |text| {
+            match kito_core::create_file(&dest, &text) {
+                Ok(_) => {
+                    this.manager.reload_selected();
+                    this.toast(&format!("Created {text}"));
+                }
+                Err(e) => this.error_dialog("Could not create file", e.to_string()),
             }
-            Err(e) => self.error_dialog("Could not create file", e.to_string()),
-        }
+        });
     }
 
     /// Apre il terminale di sistema nella cartella corrente.
@@ -591,12 +576,14 @@ impl Ctx {
         } else {
             info.content_type
                 .as_deref()
-                .and_then(gio::content_type_get_icon)
-                .map(|icon| icon.to_string())
+                .map(gio::content_type_get_icon)
+                .and_then(|icon| icon.downcast::<gio::ThemedIcon>().ok())
+                .and_then(|themed| themed.names().first().map(|n| n.to_string()))
                 .unwrap_or_else(|| "text-x-generic".to_string())
         };
         header.append(&gtk::Image::from_gicon(&gio::ThemedIcon::from_names(&[
-            &icon_name, "text-x-generic",
+            &icon_name,
+            "text-x-generic",
         ])));
         let titles = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -661,7 +648,9 @@ impl Ctx {
             .build();
         close.connect_clicked({
             let dialog = dialog.clone();
-            move |_| dialog.close()
+            move |_| {
+                dialog.close();
+            }
         });
         content.append(&close);
         dialog.set_child(Some(&content));
