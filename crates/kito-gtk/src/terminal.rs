@@ -11,12 +11,15 @@ use std::process::Command;
 /// A known terminal emulator: how to open it in a folder and how to
 /// open a root shell in it. Arguments stay `OsString` from the `Path`
 /// down to the command: no lossy conversion, non-UTF-8 folders work.
+/// An empty `cwd` list is valid (the workdir is set on the command);
+/// `root: None` means a root shell is unsupported and the terminal is
+/// skipped when one is requested.
 struct Terminal {
     prog: &'static str,
     /// Arguments to open the terminal in `dir`.
     cwd: fn(&Path) -> Vec<OsString>,
-    /// Arguments for a root shell in `dir`; empty = unsupported.
-    root: fn(&Path) -> Vec<OsString>,
+    /// Arguments for a root shell in `dir`; `None` = unsupported.
+    root: Option<fn(&Path) -> Vec<OsString>>,
 }
 
 /// `key=value` as a single `OsString`, preserving `dir` bytes.
@@ -30,7 +33,7 @@ const TERMINALS: [Terminal; 10] = [
     Terminal {
         prog: "konsole",
         cwd: |d| vec![OsString::from("--workdir"), d.as_os_str().to_owned()],
-        root: |d| {
+        root: Some(|d| {
             vec![
                 OsString::from("--workdir"),
                 d.as_os_str().to_owned(),
@@ -38,19 +41,19 @@ const TERMINALS: [Terminal; 10] = [
                 OsString::from("sudo"),
                 OsString::from("-s"),
             ]
-        },
+        }),
     },
     Terminal {
         prog: "gnome-terminal",
         cwd: |d| vec![joined("--working-directory=", d)],
-        root: |d| {
+        root: Some(|d| {
             vec![
                 joined("--working-directory=", d),
                 OsString::from("--"),
                 OsString::from("sudo"),
                 OsString::from("-s"),
             ]
-        },
+        }),
     },
     Terminal {
         prog: "kgx",
@@ -60,7 +63,7 @@ const TERMINALS: [Terminal; 10] = [
                 d.as_os_str().to_owned(),
             ]
         },
-        root: |d| {
+        root: Some(|d| {
             vec![
                 OsString::from("--working-directory"),
                 d.as_os_str().to_owned(),
@@ -68,46 +71,46 @@ const TERMINALS: [Terminal; 10] = [
                 OsString::from("sudo"),
                 OsString::from("-s"),
             ]
-        },
+        }),
     },
     Terminal {
         prog: "xfce4-terminal",
         cwd: |d| vec![joined("--working-directory=", d)],
-        root: |d| {
+        root: Some(|d| {
             vec![
                 joined("--working-directory=", d),
                 OsString::from("-x"),
                 OsString::from("sudo"),
                 OsString::from("-s"),
             ]
-        },
+        }),
     },
     Terminal {
         prog: "tilix",
         cwd: |d| vec![joined("--working-directory=", d)],
-        root: |d| {
+        root: Some(|d| {
             vec![
                 joined("--working-directory=", d),
                 OsString::from("-e"),
                 OsString::from("sudo -s"),
             ]
-        },
+        }),
     },
     Terminal {
         prog: "alacritty",
         cwd: |_| vec![],
-        root: |_| {
+        root: Some(|_| {
             vec![
                 OsString::from("-e"),
                 OsString::from("sudo"),
                 OsString::from("-s"),
             ]
-        },
+        }),
     },
     Terminal {
         prog: "kitty",
         cwd: |_| vec![],
-        root: |_| vec![OsString::from("sudo"), OsString::from("-s")],
+        root: Some(|_| vec![OsString::from("sudo"), OsString::from("-s")]),
     },
     Terminal {
         prog: "wezterm",
@@ -118,7 +121,7 @@ const TERMINALS: [Terminal; 10] = [
                 d.as_os_str().to_owned(),
             ]
         },
-        root: |d| {
+        root: Some(|d| {
             vec![
                 OsString::from("start"),
                 OsString::from("--cwd"),
@@ -127,23 +130,23 @@ const TERMINALS: [Terminal; 10] = [
                 OsString::from("sudo"),
                 OsString::from("-s"),
             ]
-        },
+        }),
     },
     Terminal {
         prog: "foot",
         cwd: |d| vec![joined("--working-dir=", d)],
-        root: |_| vec![],
+        root: None,
     },
     Terminal {
         prog: "xterm",
         cwd: |_| vec![],
-        root: |_| {
+        root: Some(|_| {
             vec![
                 OsString::from("-e"),
                 OsString::from("sudo"),
                 OsString::from("-s"),
             ]
-        },
+        }),
     },
 ];
 
@@ -163,28 +166,31 @@ fn which(prog: &str) -> bool {
 
 /// Picks the first available terminal and builds `(program, args)`,
 /// without spawning anything. Testable with a fake table.
+/// A normal launch may validly have zero arguments (the workdir is set
+/// on the command); a requested root shell skips terminals without root
+/// support and uses the next compatible one.
 fn select_command<'t>(
     dir: &Path,
     root: bool,
     terms: &'t [Terminal],
     mut available: impl FnMut(&str) -> bool,
 ) -> Result<(&'t str, Vec<OsString>), String> {
+    let mut any_available = false;
     for terminal in terms {
         if !available(terminal.prog) {
             continue;
         }
-        let args = if root {
-            (terminal.root)(dir)
-        } else {
-            (terminal.cwd)(dir)
-        };
-        if args.is_empty() {
-            return Err(format!(
-                "A root shell is not supported by {}",
-                terminal.prog
-            ));
+        any_available = true;
+        if root {
+            let Some(build) = terminal.root else {
+                continue;
+            };
+            return Ok((terminal.prog, build(dir)));
         }
-        return Ok((terminal.prog, args));
+        return Ok((terminal.prog, (terminal.cwd)(dir)));
+    }
+    if root && any_available {
+        return Err("No installed terminal supports a root shell".to_string());
     }
     Err("No terminal emulator found".to_string())
 }
@@ -218,23 +224,23 @@ mod tests {
         Terminal {
             prog: "missing-term",
             cwd: |d| vec![joined("--dir=", d)],
-            root: |_| vec![],
+            root: None,
         },
         Terminal {
             prog: "fake-term",
             cwd: |d| vec![joined("--dir=", d)],
-            root: |d| {
+            root: Some(|d| {
                 vec![
                     joined("--dir=", d),
                     OsString::from("-e"),
                     OsString::from("sudo -s"),
                 ]
-            },
+            }),
         },
         Terminal {
             prog: "other-term",
             cwd: |d| vec![d.as_os_str().to_owned()],
-            root: |d| vec![d.as_os_str().to_owned()],
+            root: Some(|d| vec![d.as_os_str().to_owned()]),
         },
     ];
 
@@ -247,16 +253,81 @@ mod tests {
     }
 
     #[test]
-    fn select_root_unsupported_errors() {
+    fn normal_launch_allows_zero_args() {
+        // Alacritty, Kitty and Xterm run with no arguments; the workdir
+        // comes from the command itself. Real table, no PATH lookup.
+        let dir = Path::new("/tmp/My Folder");
+        for prog in ["alacritty", "kitty", "xterm"] {
+            let (picked, args) = select_command(dir, false, &TERMINALS, |p| p == prog).unwrap();
+            assert_eq!(picked, prog);
+            assert!(args.is_empty());
+        }
+    }
+
+    #[test]
+    fn normal_launch_with_args() {
+        let dir = Path::new("/tmp/My Folder");
+        let (prog, args) = select_command(dir, false, &TERMINALS, |p| p == "konsole").unwrap();
+        assert_eq!(prog, "konsole");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--workdir"),
+                OsString::from("/tmp/My Folder")
+            ]
+        );
+    }
+
+    #[test]
+    fn root_command_for_compatible_terminal() {
+        let dir = Path::new("/tmp/My Folder");
+        let (prog, args) =
+            select_command(dir, true, &TERMINALS, |p| p == "gnome-terminal").unwrap();
+        assert_eq!(prog, "gnome-terminal");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--working-directory=/tmp/My Folder"),
+                OsString::from("--"),
+                OsString::from("sudo"),
+                OsString::from("-s"),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_skips_unsupported_terminal() {
+        // foot has no root support: the next compatible one wins.
         let dir = Path::new("/tmp/x");
-        let err = select_command(dir, true, &FAKE_TERMS, |p| p == "missing-term").unwrap_err();
-        assert!(err.contains("missing-term"));
-        assert!(select_command(dir, false, &FAKE_TERMS, |_| false).is_err());
+        let (prog, args) =
+            select_command(dir, true, &TERMINALS, |p| p == "foot" || p == "xterm").unwrap();
+        assert_eq!(prog, "xterm");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-e"),
+                OsString::from("sudo"),
+                OsString::from("-s")
+            ]
+        );
+        // Fake table, same shape.
+        let (prog, _) = select_command(dir, true, &FAKE_TERMS, |_| true).unwrap();
+        assert_eq!(prog, "fake-term");
+    }
+
+    #[test]
+    fn no_compatible_terminal_errors() {
+        let dir = Path::new("/tmp/x");
+        let err = select_command(dir, true, &TERMINALS, |p| p == "foot").unwrap_err();
+        assert!(err.contains("root shell"), "{err}");
+        let err = select_command(dir, false, &TERMINALS, |_| false).unwrap_err();
+        assert!(err.contains("No terminal emulator found"), "{err}");
+        let err = select_command(dir, true, &TERMINALS, |_| false).unwrap_err();
+        assert!(err.contains("No terminal emulator found"), "{err}");
     }
 
     #[test]
     fn select_preserves_non_utf8_bytes() {
-        use std::os::unix::ffi::OsStrExt;
         let raw = b"/tmp/bad \xff dir";
         let dir = Path::new(OsStr::from_bytes(raw));
         let (prog, args) = select_command(dir, false, &FAKE_TERMS, |p| p == "other-term").unwrap();
