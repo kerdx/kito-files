@@ -1,6 +1,6 @@
-//! Operazioni file: clipboard, cestino, elimina, rinomina, copia/sposta.
-//! Copia/sposta/elimina girano in un thread; l'esito torna sul main loop
-//! con toast + reload. Niente `%` di avanzamento per ora (prossimo step).
+//! File operations: clipboard, trash, delete, rename, copy/move.
+//! Copy/move/delete run in a thread; the outcome returns to the main loop
+//! with toast + reload. No `%` progress for now (next step).
 
 use crate::tabs::TabManager;
 use adw::prelude::*;
@@ -19,7 +19,7 @@ pub struct Ctx {
     pub manager: Rc<TabManager>,
     pub toast: adw::ToastOverlay,
     pub clipboard: Rc<RefCell<Clipboard>>,
-    /// Mostra l'entry del percorso (Ctrl+L). Impostata da main.
+    /// Shows the path entry (Ctrl+L). Set by main.
     pub focus_path: Rc<dyn Fn()>,
 }
 
@@ -28,7 +28,7 @@ impl Ctx {
         self.toast.add_toast(adw::Toast::new(msg));
     }
 
-    /// Ctrl+L: passa alla modalità scrittura percorso.
+    /// Ctrl+L: switches to path writing mode.
     pub fn focus_path(&self) {
         (self.focus_path)();
     }
@@ -42,9 +42,9 @@ impl Ctx {
         dialog.present(Some(&self.window));
     }
 
-    /// Esegue `job` in un thread; `done` gira sul main loop.
-    /// `done` tocca widget GTK, quindi resta sul main thread: il worker
-    /// spedisce il risultato via channel e un idle locale lo recapita.
+    /// Runs `job` in a thread; `done` runs on the main loop.
+    /// `done` touches GTK widgets, so it stays on the main thread: the worker
+    /// sends the result via channel and a local idle delivers it.
     fn run_in_thread<F, R>(job: F, done: impl FnOnce(R) + 'static)
     where
         F: FnOnce() -> R + Send + 'static,
@@ -79,7 +79,7 @@ impl Ctx {
         tab.activate_entry(&first.uri(), first.is_dir());
     }
 
-    /// Ctrl+C / Ctrl+X: stato interno + `text/uri-list` per le altre app.
+    /// Ctrl+C / Ctrl+X: internal state + `text/uri-list` for other apps.
     pub fn copy_selected(&self, cut: bool) {
         let uris: Vec<String> = self
             .manager
@@ -149,8 +149,8 @@ impl Ctx {
         );
     }
 
-    /// Incolla da altre app: legge `text/plain` con righe `file://`.
-    /// Solo copia, mai sposta.
+    /// Paste from other apps: reads `text/plain` with `file://` lines.
+    /// Copy only, never move.
     fn paste_from_system(&self, dest: String) {
         let Some(display) = gdk::Display::default() else {
             self.toast("Clipboard is empty");
@@ -226,7 +226,7 @@ impl Ctx {
         }
     }
 
-    /// Dal cestino: riporta le voci selezionate nella posizione originale.
+    /// From the trash: restores the selected entries to the original location.
     pub fn restore_selected(&self) {
         let uris: Vec<String> = self
             .manager
@@ -266,7 +266,7 @@ impl Ctx {
         );
     }
 
-    /// Svuota il cestino: conferma, poi eliminazione in background.
+    /// Empties the trash: confirm, then delete in background.
     pub fn empty_trash(&self) {
         let dialog = adw::AlertDialog::builder()
             .heading("Empty the Trash?")
@@ -303,7 +303,7 @@ impl Ctx {
         dialog.present(Some(&self.window));
     }
 
-    /// Maiusc+Canc: conferma e poi cancella davvero, ricorsivo.
+    /// Shift+Delete: confirm and then really delete, recursively.
     pub fn delete_selected(&self) {
         let uris: Vec<String> = self
             .manager
@@ -357,9 +357,9 @@ impl Ctx {
         dialog.present(Some(&self.window));
     }
 
-    /// Pin/unpin della singola cartella selezionata (menu contestuale).
-    /// Scrive in `~/.config/gtk-3.0/bookmarks`: la sidebar si ricarica
-    /// da sola via monitor (vale anche per pin fatti da Nautilus).
+    /// Pin/unpin of the single selected folder (context menu).
+    /// Writes to `~/.config/gtk-3.0/bookmarks`: the sidebar reloads
+    /// on its own via monitor (also applies to pins made by Nautilus).
     pub fn toggle_pin(&self) {
         let objs = self.manager.selected_objects();
         if objs.len() != 1 || !objs[0].is_dir() {
@@ -380,8 +380,8 @@ impl Ctx {
         }
     }
 
-    /// Dialog con un campo di testo: `on_ok` riceve il valore scritto.
-    /// Il testo iniziale resta selezionato, basta digitare sopra.
+    /// Dialog with a text field: `on_ok` receives the written value.
+    /// The initial text stays selected, just type over it.
     fn name_dialog<F>(&self, title: &str, placeholder: &str, initial: &str, confirm: &str, on_ok: F)
     where
         F: Fn(String) + 'static,
@@ -442,7 +442,7 @@ impl Ctx {
             move |_| ok()
         });
         dialog.present(Some(&self.window));
-        // La selezione del testo esiste solo a widget focalizzato.
+        // Text selection exists only on a focused widget.
         let entry = entry.clone();
         glib::idle_add_local_once(move || {
             entry.grab_focus();
@@ -450,7 +450,7 @@ impl Ctx {
         });
     }
 
-    /// F2: rinomina il singolo selezionato.
+    /// F2: renames the single selected item.
     pub fn rename_selected(&self) {
         let objs = self.manager.selected_objects();
         if objs.len() != 1 {
@@ -475,7 +475,7 @@ impl Ctx {
         );
     }
 
-    /// Nuova cartella nella cartella corrente (menu sfondo, Ctrl+Shift+N).
+    /// New folder in the current folder (background menu, Ctrl+Shift+N).
     pub fn new_folder(&self) {
         let Some(dest) = self.manager.selected_uri() else {
             return;
@@ -496,8 +496,8 @@ impl Ctx {
         );
     }
 
-    /// Nuovo file: il tipo scelto dal menu "Crea" è solo il nome iniziale
-    /// proposto, il nome vero e proprio lo scrive sempre l'utente.
+    /// New file: the type chosen from the "Create" menu is only the initial
+    /// suggested name, the real name is always written by the user.
     pub fn new_file(&self, template: &'static str) {
         let Some(dest) = self.manager.selected_uri() else {
             return;
@@ -521,12 +521,12 @@ impl Ctx {
         });
     }
 
-    /// Apre il terminale di sistema nella cartella corrente.
+    /// Opens the system terminal in the current folder.
     pub fn open_terminal(&self) {
         self.launch_terminal(false);
     }
 
-    /// Apre il terminale con una shell root (`sudo -i` dentro il terminale).
+    /// Opens the terminal with a root shell (`sudo -i` inside the terminal).
     pub fn open_terminal_root(&self) {
         self.launch_terminal(true);
     }
@@ -535,7 +535,9 @@ impl Ctx {
         let Some(uri) = self.manager.selected_uri() else {
             return;
         };
-        let Some(path) = uri.strip_prefix("file://") else {
+        // Real local path via GIO (decoded: spaces, Unicode, `%`, `#`...).
+        // `None` on non-local locations: refuse with a clear message.
+        let Some(path) = kito_core::uri_to_path(&uri) else {
             self.error_dialog(
                 "Cannot open a terminal here",
                 "Only local folders are supported.".to_string(),
@@ -547,12 +549,12 @@ impl Ctx {
         } else {
             "Could not open a terminal"
         };
-        if let Err(e) = crate::terminal::open(path, root) {
+        if let Err(e) = crate::terminal::open(&path, root) {
             self.error_dialog(heading, e);
         }
     }
 
-    /// Proprietà: la voce selezionata (se una sola) oppure la cartella.
+    /// Properties: the selected entry (if just one) or the folder.
     pub fn show_properties(&self) {
         let selected = self.manager.selected_objects();
         let uri = if selected.len() == 1 {
@@ -584,7 +586,7 @@ impl Ctx {
             .margin_bottom(20)
             .build();
 
-        // Intestazione: icona grande + nome + tipo.
+        // Header: big icon + name + type.
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(14)
@@ -625,7 +627,7 @@ impl Ctx {
         header.append(&titles);
         content.append(&header);
 
-        // Righe nome/valore.
+        // Name/value rows.
         let grid = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
@@ -636,7 +638,7 @@ impl Ctx {
         };
         grid.append(&prop_row("Type", &type_label));
         let size = if info.is_dir {
-            // Conteggio best-effort: le cartelle grandi non bloccano.
+            // Best-effort count: big folders don't block.
             kito_core::list_dir(&uri, true)
                 .map(|entries| format!("{} items", entries.len()))
                 .unwrap_or_else(|_| "—".to_string())
@@ -676,7 +678,7 @@ impl Ctx {
     }
 }
 
-/// Riga etichetta/valore per la finestra Proprietà.
+/// Label/value row for the Properties window.
 fn prop_row(label: &str, value: &str) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)

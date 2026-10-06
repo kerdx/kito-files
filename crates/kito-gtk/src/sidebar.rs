@@ -1,26 +1,26 @@
-//! Sidebar luoghi: Places (XDG + bookmark) + Devices (volumi) + Network.
-//! Tutte le stringhe sono in inglese (sorgente i18n, vedi agents.md).
+//! Places sidebar: Places (XDG + bookmarks) + Devices (volumes) + Network.
+//! All strings are in English (i18n source, see agents.md).
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::{cell::RefCell, rc::Rc};
 
 type LoadFn = Rc<dyn Fn(&str)>;
-/// Righe della sidebar per la evidenziazione della cartella corrente.
+/// Sidebar rows for highlighting the current folder.
 type Rows = Rc<RefCell<Vec<(String, gtk::Button)>>>;
 
-/// URI normalizzata: confronto senza barre finali (`file:///` incluso).
+/// Normalized URI: comparison without trailing slashes (`file:///` included).
 fn normalize(uri: &str) -> String {
     uri.trim_end_matches('/').to_string()
 }
 
-/// Registra la riga e la aggiunge al contenitore.
+/// Registers the row and adds it to the container.
 fn add_row(container: &gtk::Box, rows: &Rows, uri: &str, button: &gtk::Button) {
     rows.borrow_mut().push((normalize(uri), button.clone()));
     container.append(button);
 }
 
-/// Riga cliccabile con icona + etichetta.
+/// Clickable row with icon + label.
 fn nav_row(icon: &impl IsA<gio::Icon>, label: &str, load: LoadFn, uri: String) -> gtk::Button {
     let button = gtk::Button::builder()
         .has_frame(false)
@@ -35,8 +35,8 @@ fn nav_row(icon: &impl IsA<gio::Icon>, label: &str, load: LoadFn, uri: String) -
         .margin_bottom(4)
         .build();
     row.append(&{
-        // 22px: a questa misura Papirus/Breeze hanno le icone a colori,
-        // a 16px sono monocromatiche.
+        // 22px: at this size Papirus/Breeze have color icons,
+        // at 16px they are monochrome.
         let image = gtk::Image::from_gicon(icon);
         image.set_pixel_size(22);
         image
@@ -67,8 +67,8 @@ fn section_header(title: &str) -> gtk::Label {
         .build()
 }
 
-/// Riga bookmark con click destro per toglierla. La sidebar si ricarica
-/// da sola via monitor sul file (vedi `build_sidebar`).
+/// Bookmark row with right-click to remove it. The sidebar reloads
+/// on its own via monitor on the file (see `build_sidebar`).
 fn bookmark_row(name: &str, uri: &str, load: LoadFn) -> gtk::Button {
     let button = nav_row(
         &gio::ThemedIcon::new("user-bookmarks"),
@@ -112,8 +112,8 @@ fn place_icon(primary: &str) -> gio::ThemedIcon {
     gio::ThemedIcon::from_names(&[primary, "folder"])
 }
 
-/// Nome localizzato della cartella da GIO (es. "Documenti" su sistema
-/// italiano). È un dato del sistema, non una stringa UI da tradurre.
+/// Localized folder name from GIO (e.g. "Documents" on an Italian
+/// system). It is system data, not a UI string to translate.
 fn display_name(path: &std::path::Path, fallback: &str) -> String {
     gio::File::for_path(path)
         .query_info(
@@ -126,7 +126,7 @@ fn display_name(path: &std::path::Path, fallback: &str) -> String {
 }
 
 fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::ApplicationWindow) {
-    // Home non è una XDG user dir: presa a parte.
+    // Home is not an XDG user dir: taken separately.
     let home = glib::home_dir();
     {
         let button = nav_row(
@@ -169,7 +169,7 @@ fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::Appli
         );
         add_row(parent, rows, &uri, &button);
     }
-    // Cestino: fine dei luoghi fissi, prima dei bookmark dell'utente.
+    // Trash: end of fixed places, before the user bookmarks.
     {
         let button = trash_row(load.clone(), window);
         add_row(parent, rows, kito_core::TRASH_URI, &button);
@@ -180,10 +180,10 @@ fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::Appli
     }
 }
 
-/// Riga Cestino in Places: apre `trash:///` e ha il menu "Empty Trash…"
-/// sul click destro (attiva `win.empty-trash`, che chiede conferma).
-/// Icona del cestino: `user-trash-full` se c'è qualcosa dentro, altrimenti
-/// la variante vuota. Papirus ha entrambe.
+/// Trash row in Places: opens `trash:///` and has the "Empty Trash…"
+/// menu on right-click (activates `win.empty-trash`, which asks first).
+/// Trash icon: `user-trash-full` if there is something inside, otherwise
+/// the empty variant. Papirus has both.
 fn trash_icon(full: bool) -> gio::ThemedIcon {
     if full {
         gio::ThemedIcon::new("user-trash-full")
@@ -192,8 +192,8 @@ fn trash_icon(full: bool) -> gio::ThemedIcon {
     }
 }
 
-/// `true` se il cestino contiene almeno una voce. Se il backend cestino
-/// non è disponibile (gvfs assente) non blocca: si tratta come vuoto.
+/// `true` if the trash contains at least one entry. If the trash backend
+/// is unavailable (no gvfs) it does not block: treated as empty.
 fn trash_is_full() -> bool {
     gio::File::for_uri(kito_core::TRASH_URI)
         .enumerate_children(
@@ -218,8 +218,8 @@ fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
         load,
         kito_core::TRASH_URI.to_string(),
     );
-    // La riga si aggiorna da sola: se un cestino pieno diventa vuoto
-    // (o viceversa) l'icona cambia senza ricaricare la sidebar.
+    // The row updates itself: if a full trash becomes empty
+    // (or vice versa) the icon changes without reloading the sidebar.
     {
         let image = button
             .child()
@@ -307,7 +307,7 @@ fn error_dialog(window: &adw::ApplicationWindow, body: String) {
     dialog.present(Some(window));
 }
 
-/// Riga volume: se montato apre, altrimenti tenta il mount e poi apre.
+/// Volume row: if mounted it opens, otherwise it tries to mount first.
 fn volume_row(volume: &gio::Volume, load: LoadFn, window: adw::ApplicationWindow) -> gtk::Button {
     let button = gtk::Button::builder()
         .has_frame(false)
@@ -361,14 +361,14 @@ fn volume_row(volume: &gio::Volume, load: LoadFn, window: adw::ApplicationWindow
     button
 }
 
-/// Evidenzia/spegne la riga: sfondo e colore dell'etichetta.
+/// Highlights/unhighlights the row: background and label color.
 fn set_row_active(button: &gtk::Button, active: bool) {
     if active {
         button.add_css_class("active");
     } else {
         button.remove_css_class("active");
     }
-    // L'etichetta è figlia del bottone: la classe va impostata a mano.
+    // The label is a child of the button: the class must be set by hand.
     if let Some(box_) = button.child().and_downcast::<gtk::Box>() {
         if let Some(label) = box_.last_child().and_downcast::<gtk::Label>() {
             if active {
@@ -380,9 +380,9 @@ fn set_row_active(button: &gtk::Button, active: bool) {
     }
 }
 
-/// Sidebar: widget + registro righe per evidenziare la cartella aperta.
-/// `places` viene ricreato a ogni refresh (pulito e ripopolato),
-/// `other` contiene le righe statiche (network).
+/// Sidebar: widget + row registry to highlight the open folder.
+/// `places` is recreated on every refresh (cleared and repopulated),
+/// `other` holds the static rows (network).
 pub struct Sidebar {
     widget: gtk::ScrolledWindow,
     places: Rows,
@@ -394,7 +394,7 @@ impl Sidebar {
         &self.widget
     }
 
-    /// Evidenzia la riga corrispondente a `uri`, spegne le altre.
+    /// Highlights the row matching `uri`, turns the others off.
     pub fn set_active(&self, uri: &str) {
         let target = normalize(uri);
         for (key, button) in self
@@ -408,9 +408,9 @@ impl Sidebar {
     }
 }
 
-/// Sidebar completa in uno ScrolledWindow. Si aggiorna da sola su
-/// mount/unmount (GVolumeMonitor) e su modifiche ai bookmark
-/// (monitor su `~/.config/gtk-3.0`, così valgono anche pin fatti da Nautilus).
+/// Full sidebar in a ScrolledWindow. Updates itself on
+/// mount/unmount (GVolumeMonitor) and on bookmark changes
+/// (monitor on `~/.config/gtk-3.0`, so pins made by Nautilus count too).
 pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
     let places_rows: Rows = Rc::new(RefCell::new(Vec::new()));
     let other_rows: Rows = Rc::new(RefCell::new(Vec::new()));
@@ -439,15 +439,15 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         let load = load.clone();
         let rows = places_rows.clone();
         let window = window.clone();
-        // Trattenuto apposta: ciclo monitor -> handler -> refresh -> monitor,
-        // vita pari al processo.
+        // Kept on purpose: monitor -> handler -> refresh -> monitor loop,
+        // living as long as the process.
         let _monitor = monitor.clone();
         move || {
             let _ = &_monitor;
             while let Some(child) = places.first_child() {
                 places.remove(&child);
             }
-            // Le righe vengono ricreate: registro ripulito e ripopolato.
+            // Rows are recreated: registry cleared and repopulated.
             rows.borrow_mut().clear();
             xdg_places(&load, &places, &rows, &window);
         }
@@ -495,7 +495,7 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
             for volume in gio::VolumeMonitor::get().volumes() {
                 devices.append(&volume_row(&volume, load.clone(), window.clone()));
             }
-            // Nessun volume: comunque il filesystem radice è raggiungibile.
+            // No volumes: the root filesystem is reachable anyway.
             if devices.first_child().is_none() {
                 devices.append(&nav_row(
                     &gio::ThemedIcon::from_names(&[

@@ -1,17 +1,17 @@
-//! Viste classiche: icone, compatta, dettagli. Un GObject riga + factory
-//! su ListStore condiviso; niente subclassing di widget.
+//! Classic views: icons, compact, details. One row GObject + factory
+//! on a shared ListStore; no widget subclassing.
 
 use glib::subclass::prelude::ObjectSubclassIsExt as _;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::rc::Rc;
 
-/// Click destro su una riga: oggetto + punto + widget di ancoraggio.
-/// Il gestore seleziona l'oggetto e apre il menu.
+/// Right-click on a row: object + point + anchor widget.
+/// The handler selects the object and opens the menu.
 pub type SecondaryHandler = Rc<dyn Fn(&FileObject, f64, f64, &gtk::Widget)>;
 
-/// Lega il click destro alla riga per l'oggetto corrente. Chiamato a ogni
-/// bind (le righe sono riciclate): rimuove il gesture precedente.
+/// Binds right-click to the row for the current object. Called on every
+/// bind (rows are recycled): removes the previous gesture.
 fn set_secondary(row: &impl IsA<gtk::Widget>, obj: &FileObject, on_secondary: &SecondaryHandler) {
     let controllers = row.observe_controllers();
     let mut kept = 0;
@@ -48,7 +48,7 @@ fn set_secondary(row: &impl IsA<gtk::Widget>, obj: &FileObject, on_secondary: &S
     row.add_controller(gesture);
 }
 
-/// Modalità di vista della tab.
+/// View mode of the tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
@@ -128,7 +128,7 @@ impl FileObject {
     }
 }
 
-/// 1234567 -> "1.2 MB", -1 (cartelle) -> "—".
+/// 1234567 -> "1.2 MB", -1 (folders) -> "—".
 pub fn human_size(bytes: i64) -> String {
     if bytes < 0 {
         return "—".to_string();
@@ -155,7 +155,7 @@ fn fallback_icon(is_dir: bool) -> gio::ThemedIcon {
     gio::ThemedIcon::new(if is_dir { "folder" } else { "text-x-generic" })
 }
 
-/// Riga icona + nome (usata da compatta e dettagli).
+/// Icon + name row (used by compact and details).
 fn name_factory(pixel_size: i32, on_secondary: &SecondaryHandler) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_, list_item| {
@@ -167,7 +167,7 @@ fn name_factory(pixel_size: i32, on_secondary: &SecondaryHandler) -> gtk::Signal
             .margin_top(4)
             .margin_bottom(4)
             .build();
-        // 22px: a 16px Papirus/Breeze sono monocromatiche.
+        // 22px: at 16px Papirus/Breeze are monochrome.
         let image = gtk::Image::new();
         image.set_pixel_size(pixel_size);
         row.append(&image);
@@ -202,7 +202,7 @@ fn name_factory(pixel_size: i32, on_secondary: &SecondaryHandler) -> gtk::Signal
     factory
 }
 
-/// Colonna di sole etichette (Size, Type nei dettagli).
+/// Label-only column (Size, Type in details).
 fn text_factory(
     get: fn(&FileObject) -> String,
     on_secondary: &SecondaryHandler,
@@ -210,8 +210,8 @@ fn text_factory(
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, list_item| {
         let label = gtk::Label::builder()
-            // Riempie la cella (così il menu arriva anche cliccando lo
-            // spazio a destra del testo), testo comunque a sinistra.
+            // Fills the cell (so the menu also arrives by clicking the
+            // space right of the text), text still on the left.
             .xalign(0.0)
             .margin_start(8)
             .margin_end(8)
@@ -285,8 +285,8 @@ fn build_icons(selection: gtk::SingleSelection, on_secondary: &SecondaryHandler)
             &gtk::Label::builder()
                 .halign(gtk::Align::Center)
                 .justify(gtk::Justification::Center)
-                // Larghezza fissa in caratteri su 3 righe: il contenitore
-                // non deve mai allargarsi oltre.
+                // Fixed width in characters over 3 lines: the container
+                // must never grow wider.
                 .width_chars(12)
                 .max_width_chars(12)
                 .wrap(true)
@@ -318,7 +318,7 @@ fn build_icons(selection: gtk::SingleSelection, on_secondary: &SecondaryHandler)
     gtk::GridView::new(Some(selection), Some(factory))
 }
 
-/// Costruisce la vista per `mode` sullo store dato. Ritorna widget e selezione.
+/// Builds the view for `mode` on the given store. Returns widget and selection.
 pub fn build_view(
     mode: ViewMode,
     store: &gio::ListStore,
@@ -330,19 +330,19 @@ pub fn build_view(
         ViewMode::Compact => build_compact(selection.clone(), on_secondary).upcast(),
         ViewMode::Details => build_details(selection.clone(), on_secondary).upcast(),
     };
-    // Doppio click / Invio gestito dalla tab (vede la selezione corrente).
+    // Double-click / Enter handled by the tab (sees the current selection).
     widget.set_vexpand(true);
     (widget, selection)
 }
 
-/// Vista + store vuoto; popolare con [`reload`].
+/// View + empty store; populate with [`reload`].
 pub fn build_file_view() -> (gtk::ScrolledWindow, gio::ListStore) {
     let store = gio::ListStore::new::<FileObject>();
     let scrolled = gtk::ScrolledWindow::builder().vexpand(true).build();
     (scrolled, store)
 }
 
-/// Riempie lo store con `dir_uri`. Ritorna il numero di voci.
+/// Fills the store with `dir_uri`. Returns the entry count.
 pub fn reload(
     store: &gio::ListStore,
     dir_uri: &str,

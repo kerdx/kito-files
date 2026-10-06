@@ -1,5 +1,5 @@
-//! Tab con AdwTabView: ogni tab ha vista, modalità, store e cartella propri.
-//! La sidebar e i pulsanti operano sempre sulla tab selezionata.
+//! Tabs with AdwTabView: each tab has its own view, mode, store and folder.
+//! The sidebar and the buttons always operate on the selected tab.
 
 use crate::file_list;
 use crate::file_list::{FileObject, SecondaryHandler, ViewMode};
@@ -10,18 +10,18 @@ use std::{
     rc::Rc,
 };
 
-/// Chiamata a ogni navigazione: aggiorna pathbar + status + vista della tab.
+/// Called on every navigation: updates the tab's pathbar + status + view.
 pub type OnNavigate = Rc<dyn Fn(&str, usize, ViewMode)>;
-/// Aggiorna i pulsanti indietro/avanti.
+/// Updates the back/forward buttons.
 pub type OnHistory = Rc<dyn Fn(bool, bool)>;
-/// Aggiorna la status bar: elementi totali, elementi selezionati.
+/// Updates the status bar: total items, selected items.
 pub type OnStatus = Rc<dyn Fn(usize, usize)>;
 
 pub struct FileTab {
     page: adw::TabPage,
     store: gio::ListStore,
     scrolled: gtk::ScrolledWindow,
-    /// Lista oppure pagina "cartella vuota".
+    /// List or "empty folder" page.
     stack: gtk::Stack,
     selection: RefCell<gtk::SingleSelection>,
     mode: Cell<ViewMode>,
@@ -43,7 +43,7 @@ fn activate_at(tab: &Rc<FileTab>, pos: u32) {
     tab.activate_entry(&obj.uri(), obj.is_dir());
 }
 
-/// Collega doppio click / Invio alla vista appena creata.
+/// Wires double-click / Enter to the freshly created view.
 fn wire_activate(tab: &Rc<FileTab>, widget: &gtk::Widget) {
     if let Ok(view) = widget.clone().downcast::<gtk::ColumnView>() {
         let tab = tab.clone();
@@ -54,13 +54,13 @@ fn wire_activate(tab: &Rc<FileTab>, widget: &gtk::Widget) {
     }
 }
 
-/// `true` se `uri` è il cestino (backend GIO, gvfs).
+/// `true` if `uri` is the trash (GIO backend, gvfs).
 fn is_trash_uri(uri: &str) -> bool {
     uri.starts_with("trash:")
 }
 
-/// Ricostruisce widget + selezione per la modalità della tab.
-/// Il click destro seleziona prima la riga e poi apre il menu su di essa.
+/// Rebuilds widget + selection for the tab's mode.
+/// Right-click first selects the row, then opens the menu on it.
 fn rebuild_view(tab: &Rc<FileTab>) {
     let on_secondary: SecondaryHandler = Rc::new({
         let tab = tab.clone();
@@ -68,7 +68,7 @@ fn rebuild_view(tab: &Rc<FileTab>) {
             if let Some(pos) = tab.store.find(obj) {
                 tab.selection.borrow().select_item(pos, true);
             }
-            // Nel cestino il menu cambia: ripristino invece di rinomina.
+            // In trash the menu changes: restore instead of rename.
             if is_trash_uri(&tab.current.borrow()) {
                 crate::context_menu::show_trash(anchor, x, y, &tab.window);
             } else {
@@ -78,7 +78,7 @@ fn rebuild_view(tab: &Rc<FileTab>) {
     });
     let (widget, selection) = file_list::build_view(tab.mode.get(), &tab.store, &on_secondary);
     wire_activate(tab, &widget);
-    // Selezione -> status bar (elementi selezionati).
+    // Selection -> status bar (selected items).
     {
         let on_status = tab.on_status.clone();
         let store = tab.store.clone();
@@ -111,8 +111,8 @@ impl FileTab {
     }
 
     pub fn load(&self, uri: &str) {
-        // Navigazione utente: registra nello storico (reload escluso:
-        // stessa URI, niente da registrare).
+        // User navigation: record in history (reload excluded:
+        // same URI, nothing to record).
         let current = self.current.borrow().clone();
         if !current.is_empty() && current != uri {
             self.back_stack.borrow_mut().push(current);
@@ -169,7 +169,7 @@ impl FileTab {
         self.load_raw(&next);
     }
 
-    /// Riallinea pathbar + status + storico + vista alla tab (cambio tab).
+    /// Realigns pathbar + status + history + view to the tab (tab switch).
     fn sync_chrome(&self) {
         (self.on_navigate)(
             &self.current.borrow(),
@@ -181,7 +181,7 @@ impl FileTab {
         self.emit_history();
     }
 
-    /// Ricarica la cartella corrente della tab.
+    /// Reloads the tab's current folder.
     pub fn reload(&self) {
         let uri = self.current.borrow().clone();
         if !uri.is_empty() {
@@ -189,7 +189,7 @@ impl FileTab {
         }
     }
 
-    /// Oggetto selezionato nella vista della tab (selezione singola).
+    /// Selected object in the tab's view (single selection).
     pub fn selected_objects(&self) -> Vec<FileObject> {
         self.selection
             .borrow()
@@ -199,12 +199,12 @@ impl FileTab {
             .collect()
     }
 
-    /// Doppio click / Invio / voce "Open": entra o lancia.
+    /// Double-click / Enter / "Open" item: enters or launches.
     pub fn activate_entry(&self, uri: &str, is_dir: bool) {
         if is_dir {
             self.load(uri);
         } else {
-            // App predefinita del sistema (mimeapps.list), senza finestra "apri con".
+            // System default app (mimeapps.list), no "open with" window.
             if let Err(e) = gio::AppInfo::launch_default_for_uri(uri, gio::AppLaunchContext::NONE) {
                 eprintln!("open file: {e}");
             }
@@ -284,27 +284,27 @@ impl TabManager {
         self.selected().map(|t| t.current.borrow().clone())
     }
 
-    /// Carica `uri` nella tab selezionata (usato da sidebar e freccia su).
+    /// Loads `uri` into the selected tab (used by sidebar and up arrow).
     pub fn load_selected(&self, uri: &str) {
         if let Some(tab) = self.selected() {
             tab.load(uri);
         }
     }
 
-    /// Ricarica la tab selezionata (dopo un'operazione file).
+    /// Reloads the selected tab (after a file operation).
     pub fn reload_selected(&self) {
         if let Some(tab) = self.selected() {
             tab.reload();
         }
     }
 
-    /// Attiva/disattiva i file nascosti e ricarica la tab.
+    /// Toggles hidden files and reloads the tab.
     pub fn set_show_hidden(&self, show: bool) {
         self.show_hidden.set(show);
         self.reload_selected();
     }
 
-    /// Imposta la vista della tab selezionata.
+    /// Sets the selected tab's view.
     pub fn set_mode(&self, mode: ViewMode) {
         if let Some(tab) = self.selected() {
             tab.set_mode(mode);
@@ -323,17 +323,17 @@ impl TabManager {
         }
     }
 
-    /// Oggetti selezionati nella tab attiva (menu contestuale, scorciatoie).
+    /// Selected objects in the active tab (context menu, shortcuts).
     pub fn selected_objects(&self) -> Vec<FileObject> {
         self.selected()
             .map(|t| t.selected_objects())
             .unwrap_or_default()
     }
 
-    /// Apre `uri` in una nuova tab e la seleziona.
+    /// Opens `uri` in a new tab and selects it.
     pub fn open_tab(self: &Rc<Self>, uri: &str) {
         let (scrolled, store) = file_list::build_file_view();
-        // Pagina sostitutiva quando la cartella non ha voci visibili.
+        // Placeholder page when the folder has no visible entries.
         let empty = adw::StatusPage::builder()
             .icon_name("folder")
             .title("This folder is empty")
@@ -343,7 +343,7 @@ impl TabManager {
         stack.add_named(&empty, Some("empty"));
         stack.set_visible_child_name("list");
         let page = self.tab_view.append(&stack);
-        // Selezione fittizia: rimpiazzata da rebuild_view.
+        // Dummy selection: replaced by rebuild_view.
         let tab = Rc::new(FileTab {
             page: page.clone(),
             store,
@@ -364,9 +364,9 @@ impl TabManager {
         });
         self.tabs.borrow_mut().push(tab.clone());
 
-        // Click destro sullo sfondo (o sulla pagina "cartella vuota"):
-        // le righe rivendicano la sequenza, quindi qui arriva solo la
-        // parte vuota. Menu con "New Folder…", nel cestino "Empty Trash…".
+        // Right-click on the background (or the "empty folder" page):
+        // rows claim the sequence, so only the empty part arrives here.
+        // Menu with "New Folder…", in trash "Empty Trash…".
         let background = gtk::GestureClick::builder().button(3).build();
         background.connect_pressed({
             let window = self.window.clone();

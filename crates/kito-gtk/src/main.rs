@@ -1,6 +1,6 @@
-//! Kito Files: finestra Adwaita + vista classica (una cartella alla volta).
-//! Nota versione: gtk `gnome_50` ma adw `v1_9` perché Fedora 44 monta
-//! libadwaita 1.9 di sistema (v1_10 solo quando il runtime si aggiorna).
+//! Kito Files: Adwaita window + classic view (one folder at a time).
+//! Version note: gtk `gnome_50` but adw `v1_9` because Fedora 44 ships
+//! system libadwaita 1.9 (v1_10 only when the runtime updates).
 
 mod context_menu;
 mod file_list;
@@ -17,9 +17,9 @@ use std::{
     rc::Rc,
 };
 
-/// Riga-menu per la scelta della vista: icona + etichetta + spunta a destra
-/// visibile solo sulla voce attiva (stile Nautilus). Il toggle è un
-/// `ToggleButton`: la mutua esclusione la gestisce `build_window`.
+/// Menu row for the view choice: icon + label + check on the right
+/// visible only on the active item (Nautilus style). The toggle is a
+/// `ToggleButton`: mutual exclusion is handled by `build_window`.
 fn view_row(names: &[&str], label: &str) -> gtk::ToggleButton {
     let icon = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(names));
     icon.set_pixel_size(18);
@@ -53,10 +53,10 @@ fn view_row(names: &[&str], label: &str) -> gtk::ToggleButton {
     button
 }
 
-/// Una voce di azione `win.*`: nome + funzione sul contesto.
+/// One `win.*` action entry: name + function on the context.
 type ActionDef = (&'static str, fn(&ops::Ctx));
 
-/// Registra le azioni `win.*` (menu + scorciatoie) sulla finestra.
+/// Registers the `win.*` actions (menu + shortcuts) on the window.
 fn register_actions(app: &adw::Application, window: &adw::ApplicationWindow, ctx: Rc<ops::Ctx>) {
     let group = gio::SimpleActionGroup::new();
     let defs: [ActionDef; 22] = [
@@ -102,8 +102,8 @@ fn register_actions(app: &adw::Application, window: &adw::ApplicationWindow, ctx
     app.set_accels_for_action("win.new-folder", &["<Control><Shift>n"]);
 }
 
-/// Pulsante con icona dal tema di sistema: nome base prima (stile pieno
-/// del tema, es. Papirus/Breeze), variante `-symbolic` come ripiego.
+/// Button with a system-theme icon: base name first (full theme style,
+/// e.g. Papirus/Breeze), `-symbolic` variant as fallback.
 fn themed_button(names: &[&str], tooltip: &str) -> gtk::Button {
     let button = gtk::Button::builder().tooltip_text(tooltip).build();
     button.set_child(Some(&gtk::Image::from_gicon(&gio::ThemedIcon::from_names(
@@ -112,7 +112,7 @@ fn themed_button(names: &[&str], tooltip: &str) -> gtk::Button {
     button
 }
 
-/// Freccia di navigazione: piatta e rotonda, come Nautilus.
+/// Navigation arrow: flat and round, like Nautilus.
 fn nav_button(names: &[&str], tooltip: &str) -> gtk::Button {
     let button = themed_button(names, tooltip);
     button.add_css_class("flat");
@@ -120,12 +120,26 @@ fn nav_button(names: &[&str], tooltip: &str) -> gtk::Button {
     button
 }
 
-/// `file:///home/utente` -> `/home/utente` per la pathbar.
-fn uri_to_display(uri: &str) -> &str {
-    uri.strip_prefix("file://").unwrap_or(uri)
+/// Builds the `(label, target URI)` crumbs for `uri` without widgets:
+/// labels are GIO-decoded (`My Folder`, not `My%20Folder`), targets keep
+/// the exact encoded URIs. Non-local schemes yield a single crumb.
+fn crumb_items(uri: &str) -> Vec<(String, String)> {
+    let Some(path) = uri.strip_prefix("file://") else {
+        return Vec::new();
+    };
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut out = Vec::with_capacity(segments.len() + 1);
+    out.push(("/".to_string(), "file:///".to_string()));
+    let mut prefix = String::from("file://");
+    for segment in segments {
+        prefix = format!("{prefix}/{segment}");
+        let label = kito_core::uri_file_name(&prefix).unwrap_or_else(|| segment.to_string());
+        out.push((label, prefix.clone()));
+    }
+    out
 }
 
-/// Stile premium: pathbar a pillola, menu contestuale, sidebar, status bar.
+/// Premium style: pill pathbar, context menu, sidebar, status bar.
 fn load_pathbar_css() {
     let css = "\
         .app-title {\
@@ -230,7 +244,7 @@ fn load_pathbar_css() {
     }
 }
 
-/// Bottone breadcrumb. Se `current`, pill evidenziata che apre la scrittura.
+/// Breadcrumb button. If `current`, highlighted pill that opens editing.
 fn crumb_button(
     label: &str,
     tooltip: &str,
@@ -253,7 +267,7 @@ fn crumb_button(
     button
 }
 
-/// Separatore `›` tenue tra i segmenti.
+/// Faint `›` separator between segments.
 fn crumb_sep() -> gtk::Label {
     gtk::Label::builder()
         .label("›")
@@ -263,57 +277,57 @@ fn crumb_sep() -> gtk::Label {
         .build()
 }
 
-/// Ricostruisce i breadcrumb per `uri`. Ogni segmento apre il prefisso,
-/// tranne l'ultimo (cartella corrente, `/` incluso): apre la scrittura.
+/// Rebuilds the breadcrumbs for `uri`. Each segment opens its prefix,
+/// except the last one (current folder, `/` included): it opens editing.
 fn rebuild_crumbs(crumbs: &gtk::Box, uri: &str, load: &Rc<dyn Fn(&str)>, edit: &Rc<dyn Fn()>) {
     while let Some(child) = crumbs.first_child() {
         crumbs.remove(&child);
     }
-    let Some(path) = uri.strip_prefix("file://") else {
-        // Schemi non-file (cestino, rete): nome leggibile, il click
-        // apre la scrittura del percorso come per i path file://.
-        let label = if uri.starts_with("trash:") {
-            "Trash"
+    let Some(_path) = uri.strip_prefix("file://") else {
+        // Non-file schemes (trash, network): readable name, clicking
+        // opens path writing like for file:// paths.
+        let label: String = if uri.starts_with("trash:") {
+            "Trash".to_string()
         } else if uri.starts_with("network:") {
-            "Browse network"
+            "Browse network".to_string()
         } else {
-            uri_to_display(uri)
+            kito_core::uri_to_display(uri)
         };
         let edit = edit.clone();
-        crumbs.append(&crumb_button(label, "Edit path", true, move || edit()));
+        crumbs.append(&crumb_button(&label, "Edit path", true, move || edit()));
         return;
     };
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    // `/` da solo: è già la cartella corrente, quindi modifica.
-    if segments.is_empty() {
+    // `/` alone: already the current folder, so it edits.
+    let items = crumb_items(uri);
+    if items.len() == 1 {
         let edit = edit.clone();
         crumbs.append(&crumb_button("/", "Edit path", true, move || edit()));
         return;
     }
-    {
-        let load = load.clone();
-        crumbs.append(&crumb_button("/", "Filesystem root", false, move || {
-            load("file:///")
-        }));
-    }
-    let mut prefix = String::from("file://");
-    for (i, segment) in segments.iter().enumerate() {
-        crumbs.append(&crumb_sep());
-        prefix = format!("{prefix}/{segment}");
-        if i + 1 == segments.len() {
-            let edit = edit.clone();
-            crumbs.append(&crumb_button(segment, "Edit path", true, move || edit()));
-        } else {
-            let target = prefix.clone();
+    let last = items.len() - 1;
+    for (i, (label, target)) in items.iter().enumerate() {
+        if i == 0 {
             let load = load.clone();
-            crumbs.append(&crumb_button(segment, segment, false, move || {
+            let target = target.clone();
+            crumbs.append(&crumb_button(label, "Filesystem root", false, move || {
                 load(&target)
             }));
+            continue;
+        }
+        crumbs.append(&crumb_sep());
+        if i == last {
+            let edit = edit.clone();
+            crumbs.append(&crumb_button(label, "Edit path", true, move || edit()));
+        } else {
+            let target = target.clone();
+            let label = label.clone();
+            let load = load.clone();
+            crumbs.append(&crumb_button(&label, &label, false, move || load(&target)));
         }
     }
 }
 
-/// Dialog About minimale.
+/// Minimal About dialog.
 fn show_about(window: &adw::ApplicationWindow) {
     let dialog = adw::AboutDialog::builder()
         .application_name("Kito Files")
@@ -335,8 +349,8 @@ fn main() -> glib::ExitCode {
     app.connect_activate(|app| {
         build_window(app, Vec::new());
     });
-    // `kito-files ~/Scaricati`, "apri cartella con Kito Files": una tab per file.
-    // Se è un file (non cartella), apre la cartella che lo contiene.
+    // `kito-files ~/Downloads`, "open folder with Kito Files": one tab per file.
+    // If it is a file (not a folder), opens the folder containing it.
     app.connect_open(|app, files, _hint| {
         let mut uris = Vec::new();
         for file in files {
@@ -355,7 +369,7 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
-/// Costruisce una finestra. `initial_uris` vuoto = apre la home.
+/// Builds a window. Empty `initial_uris` = opens home.
 fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     load_pathbar_css();
     let window = adw::ApplicationWindow::builder()
@@ -369,9 +383,9 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         .orientation(gtk::Orientation::Vertical)
         .build();
 
-    // Percorso: breadcrumb cliccabili <-> entry scrivibile (Ctrl+L).
-    // È il titolo della header bar: si centra nella barra unica e
-    // si allarga fino ai pulsanti laterali.
+    // Path: clickable breadcrumbs <-> writable entry (Ctrl+L).
+    // It is the header bar title: centered in the single bar and
+    // stretching to the side buttons.
     let path_stack = gtk::Stack::builder()
         .hexpand(true)
         .halign(gtk::Align::Fill)
@@ -404,8 +418,8 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     path_stack.add_named(&path_entry, Some("edit"));
     path_stack.set_visible_child_name("crumbs");
 
-    // Barra unica in stile Nautilus: sinistra (nome + menu + navigazione),
-    // percorso al centro, vista e tab a destra. Niente seconda riga.
+    // Single Nautilus-style bar: left (name + menu + navigation),
+    // path in the center, view and tabs on the right. No second row.
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&path_stack));
     content.append(&header);
@@ -417,7 +431,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         .build();
     header.pack_start(&app_label);
 
-    // Navigazione: frecce piatte rotonde separate, come Nautilus (niente linked).
+    // Navigation: separate flat round arrows, like Nautilus (no linked).
     let nav = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(4)
@@ -433,8 +447,8 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     nav.append(&up_button);
     header.pack_start(&nav);
 
-    // Menu a destra: vista + impostazioni in un solo pulsante (stile Nautilus).
-    // Le righe della vista sono CheckButton con mutua esclusione collegata dopo.
+    // Menu on the right: view + settings in a single button (Nautilus style).
+    // The view rows are CheckButtons with mutual exclusion wired later.
     let overflow = gtk::Popover::new();
     overflow.add_css_class("ctx-menu");
     let overflow_list = gtk::Box::builder()
@@ -493,14 +507,14 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     menu_button.set_child(Some(&gtk::Image::from_gicon(&gio::ThemedIcon::from_names(
         &["view-more", "view-more-symbolic"],
     ))));
-    // Primo pack_end = il più a destra: menu attaccato ai controlli finestra.
+    // First pack_end = rightmost: menu next to the window controls.
     header.pack_end(&menu_button);
 
     let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], "New tab");
     header.pack_end(&new_tab_button);
 
-    // TEMP-VERIFY: apre il menu per lo screenshot.
-    // Corpo: sidebar a sinistra, tab + status a destra.
+    // TEMP-VERIFY: opens the menu for the screenshot.
+    // Body: sidebar on the left, tabs + status on the right.
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .build();
@@ -520,7 +534,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     right.append(&tab_bar);
     right.append(&tab_view);
 
-    // Status bar: contatore elementi + selezione, riga sottile.
+    // Status bar: item + selection counter, thin row.
     let status = gtk::Label::builder()
         .halign(gtk::Align::Start)
         .margin_start(14)
@@ -536,7 +550,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     status_bar.append(&status);
     right.append(&status_bar);
 
-    // Slot manager: serve ai breadcrumb (creati prima del manager).
+    // Manager slot: needed by breadcrumbs (created before the manager).
     let manager_slot: Rc<RefCell<Option<Rc<tabs::TabManager>>>> = Rc::new(RefCell::new(None));
     let slot_load: Rc<dyn Fn(&str)> = Rc::new({
         let manager_slot = manager_slot.clone();
@@ -547,15 +561,23 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         }
     });
 
-    // Ctrl+L o click sull'ultimo segmento: entry con percorso corrente.
+    // Ctrl+L or click on the last segment: entry with the current path.
+    // The shown (text, uri) pair is stored: Enter unchanged navigates to
+    // the stored URI, so Ctrl+L + Enter is always a no-op round-trip
+    // (even for lossy-shown non-UTF-8 paths: never opens another folder).
+    let shown_text_uri: Rc<RefCell<(String, String)>> =
+        Rc::new(RefCell::new((String::new(), String::new())));
     let show_path_entry: Rc<dyn Fn()> = Rc::new({
         let path_stack = path_stack.clone();
         let path_entry = path_entry.clone();
         let manager_slot = manager_slot.clone();
+        let shown_text_uri = shown_text_uri.clone();
         move || {
             if let Some(manager) = manager_slot.borrow().as_ref() {
                 if let Some(uri) = manager.selected_uri() {
-                    path_entry.set_text(uri_to_display(&uri));
+                    let text = kito_core::uri_to_display(&uri);
+                    *shown_text_uri.borrow_mut() = (text.clone(), uri);
+                    path_entry.set_text(&text);
                 }
             }
             path_stack.set_visible_child_name("edit");
@@ -564,11 +586,11 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         }
     });
 
-    // Pathbar + titolo + status + vista seguono la tab selezionata.
+    // Pathbar + title + status + view follow the selected tab.
     let syncing_views = Rc::new(Cell::new(false));
-    // Sidebar creata dopo: slot per evidenziare la cartella corrente.
+    // Sidebar created later: slot to highlight the current folder.
     let sidebar_slot: Rc<RefCell<Option<sidebar::Sidebar>>> = Rc::new(RefCell::new(None));
-    // Status bar: totali + selezione, testo ricomposto a ogni cambiamento.
+    // Status bar: totals + selection, text recomposed on every change.
     let set_status: tabs::OnStatus = Rc::new({
         let status = status.clone();
         move |items: usize, selected: usize| {
@@ -597,7 +619,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         move |uri: &str, n: usize, mode: ViewMode| {
             rebuild_crumbs(&crumbs, uri, &slot_load, &show_path_entry);
             path_stack.set_visible_child_name("crumbs");
-            // Titolo finestra: nome della cartella, non l'URI grezzo.
+            // Window title: folder name, not the raw URI.
             let name = gio::File::for_uri(uri)
                 .basename()
                 .map(|b| b.display().to_string())
@@ -622,7 +644,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
             forward_button.set_sensitive(can_forward);
         }
     });
-    // File nascosti (quelli con il `.` davanti): stato condiviso con le tab.
+    // Hidden files (those starting with `.`): state shared with tabs.
     let show_hidden = Rc::new(Cell::new(false));
     let manager = tabs::TabManager::new(
         tab_view,
@@ -634,7 +656,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     );
     *manager_slot.borrow_mut() = Some(manager.clone());
 
-    // Selettore vista: un solo pulsante attivo, la tab segue.
+    // View selector: a single active button, the tab follows.
     let view_buttons = [
         (icons_btn.clone(), ViewMode::Icons),
         (compact_btn.clone(), ViewMode::Compact),
@@ -662,23 +684,21 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     }
     *manager_slot.borrow_mut() = Some(manager.clone());
 
-    // Invio nell'entry: vai al percorso (assoluto o file://).
+    // Enter in the entry: unchanged text reloads the stored URI,
+    // edited text resolves as URI (with "://") or local path.
     path_entry.connect_activate({
         let manager = manager.clone();
+        let shown_text_uri = shown_text_uri.clone();
         move |entry| {
-            let text = entry.text().trim().to_string();
-            if text.is_empty() {
+            let text = entry.text().to_string();
+            let (shown_text, shown_uri) = shown_text_uri.borrow().clone();
+            let Some(uri) = kito_core::resolve_path_text(&text, &shown_text, &shown_uri) else {
                 return;
-            }
-            let uri = if text.contains("://") {
-                text
-            } else {
-                gio::File::for_path(&text).uri().into()
             };
             manager.load_selected(&uri);
         }
     });
-    // Esc nell'entry: torna ai breadcrumb.
+    // Esc in the entry: back to breadcrumbs.
     let esc_key = gtk::EventControllerKey::new();
     esc_key.connect_key_pressed({
         let path_stack = path_stack.clone();
@@ -703,7 +723,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
     });
     register_actions(app, &window, ctx.clone());
 
-    // Menu ⋮: check nascosti + about.
+    // Menu ⋮: hidden check + about.
     hidden_check.connect_toggled({
         let manager = manager.clone();
         move |check| manager.set_show_hidden(check.is_active())
@@ -717,7 +737,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         }
     });
 
-    // Sidebar e frecce operano sulla tab selezionata.
+    // Sidebar and arrows operate on the selected tab.
     let load: Rc<dyn Fn(&str)> = slot_load.clone();
 
     let sidebar = sidebar::build_sidebar(load.clone(), window.clone());
@@ -733,7 +753,7 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         let manager = manager.clone();
         move |_| manager.go_forward()
     });
-    // Tasti laterali del mouse: 8 = indietro, 9 = avanti.
+    // Extra mouse buttons: 8 = back, 9 = forward.
     for (button_no, go) in [
         (8u32, tabs::TabManager::go_back as fn(&tabs::TabManager)),
         (9u32, tabs::TabManager::go_forward as fn(&tabs::TabManager)),
@@ -780,5 +800,39 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         for uri in &initial_uris {
             manager.open_tab(uri);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crumb_items_decode_labels_keep_uris() {
+        assert_eq!(
+            crumb_items("file:///tmp/My%20Folder/sub%23dir"),
+            vec![
+                ("/".to_string(), "file:///".to_string()),
+                ("tmp".to_string(), "file:///tmp".to_string()),
+                (
+                    "My Folder".to_string(),
+                    "file:///tmp/My%20Folder".to_string()
+                ),
+                (
+                    "sub#dir".to_string(),
+                    "file:///tmp/My%20Folder/sub%23dir".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn crumb_items_root_and_non_local() {
+        assert_eq!(
+            crumb_items("file:///"),
+            vec![("/".to_string(), "file:///".to_string())]
+        );
+        assert!(crumb_items("trash:///").is_empty());
+        assert!(crumb_items("network:///").is_empty());
     }
 }

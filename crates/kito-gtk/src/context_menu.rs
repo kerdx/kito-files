@@ -1,24 +1,24 @@
-//! Menu contestuale premium: popover compatto con righe icona + etichetta.
+//! Premium context menu: compact popover with icon + label rows.
 //!
-//! Il sottomenu ("Crea") è una seconda popover accanto alla prima, non
-//! una colonna interna: così il menu principale non cambia dimensione e
-//! resta fermo. Entrambi i popover restano sempre `autohide`: la
-//! chiusura a cascata è gestita dai nostri handler `closed`, senza
-//! toccare `autohide` su popover visibili (GTK vi unrealizza la
-//! superficie e sbilancia i grab -> finestra sorda ai click).
+//! The submenu ("Create") is a second popover next to the first one, not
+//! an inner column: this way the main menu keeps its size and stays
+//! put. Both popovers always stay `autohide`: cascading close is handled
+//! by our `closed` handlers, without touching `autohide` on visible
+//! popovers (GTK would unrealize their surface there and unbalance the
+//! grabs -> window deaf to clicks).
 
 use adw::prelude::*;
 use gtk::gio;
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
-/// Una riga del menu: icone, etichetta, azione `win.*` (vuota se è un
-/// sottomenu) e flag distruttiva.
+/// One menu row: icons, label, `win.*` action (empty for a
+/// submenu) and destructive flag.
 struct Row {
     icons: &'static [&'static str],
     label: &'static str,
     action: &'static str,
     danger: bool,
-    /// Sottomenu: righe + indici dei divisori.
+    /// Submenu: rows + separator indexes.
     sub: Option<(&'static [Row], &'static [usize])>,
 }
 
@@ -61,7 +61,7 @@ const fn menu(
     }
 }
 
-/// Menu su una voce selezionata (riga o cella).
+/// Menu on a selected entry (row or cell).
 const ROWS: [Row; 9] = [
     row(&["document-open"], "Open", "open"),
     row(&["bookmark-new", "list-add"], "Pin to Places", "pin"),
@@ -82,10 +82,10 @@ const ROWS: [Row; 9] = [
     ),
 ];
 
-/// Gruppi: [0..2, 2..5, 5..8, 8..9].
+/// Groups: [0..2, 2..5, 5..8, 8..9].
 const SEPARATORS_AFTER: [usize; 3] = [1, 4, 7];
 
-/// Menu su una voce dentro il cestino: ripristino e cancellazione.
+/// Menu on an entry inside the trash: restore and delete.
 const TRASH_ROWS: [Row; 5] = [
     row(&["document-revert", "edit-undo"], "Restore", "restore"),
     row(&["edit-cut"], "Cut", "cut"),
@@ -98,11 +98,11 @@ const TRASH_ROWS: [Row; 5] = [
     ),
 ];
 
-/// Gruppi: [0..1, 1..3, 3..4, 4..5].
+/// Groups: [0..1, 1..3, 3..4, 4..5].
 const TRASH_SEPARATORS_AFTER: [usize; 3] = [0, 2, 3];
 
-/// Colonna "Crea": il tipo è solo il nome iniziale, il nome vero e
-/// proprio lo chiede sempre il dialog.
+/// "Create" column: the type is only the initial name, the dialog
+/// always asks for the real name.
 const CREATE_ROWS: [Row; 6] = [
     row(
         &["folder-new", "folder-new-symbolic"],
@@ -120,7 +120,7 @@ const CREATE_ROWS: [Row; 6] = [
     row(&["text-html"], "HTML Page", "new-html-page"),
 ];
 
-/// Menu sullo sfondo (area vuota della cartella).
+/// Menu on the background (empty folder area).
 const BACKGROUND_ROWS: [Row; 5] = [
     menu(&["list-add", "folder-new"], "Create", &CREATE_ROWS, &[]),
     row(&["edit-paste"], "Paste", "paste"),
@@ -141,22 +141,22 @@ const BACKGROUND_ROWS: [Row; 5] = [
     ),
 ];
 
-/// Gruppi: [0..1, 1..2, 2..4, 4..5].
+/// Groups: [0..1, 1..2, 2..4, 4..5].
 const BACKGROUND_SEPARATORS_AFTER: [usize; 3] = [0, 2, 4];
 
-/// Sfondo del cestino: l'unica azione sensata è svuotarlo.
+/// Trash background: the only sensible action is emptying it.
 const TRASH_BACKGROUND_ROWS: [Row; 1] = [danger_row(
     &["user-trash-full", "user-trash"],
     "Empty Trash…",
     "empty-trash",
 )];
 
-/// Attesa prima di chiudere il sottomenu quando il puntatore esce dalle
-/// sue righe: dà tempo di arrivarci davvero.
+/// Delay before closing the submenu when the pointer leaves its
+/// rows: gives it time to actually get there.
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
 
-/// Sottomenu aperto e timer che lo chiude. Il riferimento è debole:
-/// le righe del menu stanno dentro i popover, non li tengono vivi.
+/// Open submenu and timer that closes it. The reference is weak:
+/// menu rows live inside the popovers, they don't keep them alive.
 #[derive(Default)]
 struct MenuState {
     submenu: RefCell<Option<glib::WeakRef<gtk::Popover>>>,
@@ -164,16 +164,16 @@ struct MenuState {
 }
 
 impl MenuState {
-    /// Chiude il sottomenu; la chiusura del figlio chiude anche il
-    /// padre (cascata in `open_submenu`), e la chiusura del padre
-    /// chiude il figlio (handler in `popup`).
+    /// Closes the submenu; closing the child also closes the
+    /// parent (cascade in `open_submenu`), and closing the parent
+    /// closes the child (handler in `popup`).
     fn close_submenu(&self) {
         self.cancel_close();
-        // `take()` fuori dall'`if let`: il `RefMut` temporaneo muore a
-        // fine istruzione, prima di `popdown()`. Nello scrutinee di
-        // `if let` (edition 2021) vivrebbe fino a fine blocco, e
-        // `popdown()` emette `closed` in modo sincrono rientrando qui
-        // via `connect_closed` -> "RefCell already borrowed" -> abort.
+        // `take()` outside `if let`: the temporary `RefMut` dies at the
+        // end of the statement, before `popdown()`. In the `if let`
+        // scrutinee (edition 2021) it would live until the end of the
+        // block, and `popdown()` emits `closed` synchronously reentering
+        // here via `connect_closed` -> "RefCell already borrowed" -> abort.
         let submenu = self.submenu.borrow_mut().take();
         if let Some(weak) = submenu {
             if let Some(popover) = weak.upgrade() {
@@ -182,7 +182,7 @@ impl MenuState {
         }
     }
 
-    /// Il puntatore è ancora dentro il menu: nessuna chiusura in arrivo.
+    /// The pointer is still inside the menu: no close pending.
     fn cancel_close(&self) {
         let timer = self.timer.borrow_mut().take();
         if let Some(id) = timer {
@@ -190,7 +190,7 @@ impl MenuState {
         }
     }
 
-    /// Chiude fra `CLOSE_DELAY`, se il puntatore non rientra.
+    /// Closes after `CLOSE_DELAY`, if the pointer does not come back.
     fn schedule_close(self: &Rc<Self>) {
         self.cancel_close();
         let this = self.clone();
@@ -201,7 +201,7 @@ impl MenuState {
     }
 }
 
-/// Contenitore verticale delle righe di un menu.
+/// Vertical container for a menu's rows.
 fn menu_box() -> gtk::Box {
     gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -214,7 +214,7 @@ fn menu_box() -> gtk::Box {
         .build()
 }
 
-/// Riga del menu: bottone piatto con icona, etichetta e freccia.
+/// Menu row: flat button with icon, label and arrow.
 fn row_button(r: &Row) -> gtk::Button {
     let button = gtk::Button::builder().has_frame(false).build();
     button.add_css_class("ctx-row");
@@ -250,7 +250,7 @@ fn row_button(r: &Row) -> gtk::Button {
     button
 }
 
-/// Costruisce il popover con le sue righe, senza aprirlo.
+/// Builds the popover with its rows, without opening it.
 fn build(
     anchor: &gtk::Widget,
     rows: &[Row],
@@ -265,8 +265,8 @@ fn build(
     for (i, r) in rows.iter().enumerate() {
         let button = row_button(r);
         if let Some((sub_rows, sub_separators)) = r.sub {
-            // Il sottomenu si apre sfiorando la riga; il click resta
-            // un modo alternativo.
+            // The submenu opens on row hover; click stays
+            // an alternative way.
             let motion = gtk::EventControllerMotion::new();
             motion.connect_enter({
                 let state = state.clone();
@@ -290,7 +290,7 @@ fn build(
                 open_submenu(&anchor, &popover, sub_rows, sub_separators, &window, &state)
             });
         } else {
-            // Su una riga normale il sottomeno non serve: via subito.
+            // On a plain row the submenu is not needed: away at once.
             let motion = gtk::EventControllerMotion::new();
             motion.connect_enter({
                 let state = state.clone();
@@ -323,11 +323,11 @@ fn build(
     popover
 }
 
-/// Apre il sottomenu accanto alla riga `anchor`, una volta sola.
-/// La chiusura a cascata è nei due handler `closed`: il figlio chiude
-/// il padre e il padre chiude il figlio. Niente `set_autohide`: su un
-/// popover visibile GTK ne unrealizza la superficie e i grab restano
-/// sbilanciati (finestra sorda ai click).
+/// Opens the submenu next to the `anchor` row, only once.
+/// Cascading close lives in the two `closed` handlers: the child closes
+/// the parent and the parent closes the child. No `set_autohide`: on a
+/// visible popover GTK unrealizes its surface and grabs stay
+/// unbalanced (window deaf to clicks).
 fn open_submenu(
     anchor: &gtk::Button,
     parent: &gtk::Popover,
@@ -349,7 +349,7 @@ fn open_submenu(
         &sub_state,
         Some(parent),
     );
-    // Corpo del sottomenu: dentro annulla la chiusura, fuori la programa.
+    // Submenu body: inside cancels the close, outside schedules it.
     if let Some(list) = child.child() {
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter({
@@ -362,7 +362,7 @@ fn open_submenu(
         });
         list.add_controller(motion);
     }
-    // Chiudere il figlio (click fuori, ESC, ...) ripristina il padre.
+    // Closing the child (outside click, ESC, ...) restores the parent.
     let parent_on_close = parent.clone();
     child.connect_closed({
         let state = state.clone();
@@ -372,7 +372,7 @@ fn open_submenu(
         }
     });
 
-    // Attaccato al bordo della riga dal lato con spazio, in alto.
+    // Attached to the row edge on the side with room, at the top.
     let side = submenu_side(anchor.upcast_ref());
     child.set_position(side);
     let x = if matches!(side, gtk::PositionType::Left) {
@@ -381,7 +381,7 @@ fn open_submenu(
         anchor.width()
     };
     child.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x, 0, 1, 1)));
-    // Stacca il sottomenu dal menu con un piccolo margine.
+    // Detach the submenu from the menu with a small margin.
     child.set_margin_start(6);
     child.set_margin_end(6);
     child.set_margin_top(6);
@@ -391,10 +391,10 @@ fn open_submenu(
     child.popup();
 }
 
-/// Lato del sottomenu: a destra della riga se lo schermo ha spazio,
-/// altrimenti a sinistra.
+/// Submenu side: right of the row if the screen has room,
+/// otherwise left.
 fn submenu_side(anchor: &gtk::Widget) -> gtk::PositionType {
-    /// Larghezza comoda per il sottomenu.
+    /// Comfortable width for the submenu.
     const NEEDED: f32 = 240.0;
     let Some(root) = anchor.root() else {
         return gtk::PositionType::Right;
@@ -410,7 +410,7 @@ fn submenu_side(anchor: &gtk::Widget) -> gtk::PositionType {
     }
 }
 
-/// Costruisce e apre il menu ancorato a `(x, y)` su `anchor`.
+/// Builds and opens the menu anchored at `(x, y)` on `anchor`.
 fn popup(
     anchor: &gtk::Widget,
     x: f64,
@@ -421,7 +421,7 @@ fn popup(
 ) {
     let state = Rc::new(MenuState::default());
     let popover = build(anchor, rows, separators_after, window, &state, None);
-    // Uscendo dal menu si chiude anche un eventuale sottomenu.
+    // Leaving the menu also closes a possible submenu.
     if let Some(list) = popover.child() {
         let motion = gtk::EventControllerMotion::new();
         motion.connect_leave({
@@ -439,9 +439,9 @@ fn popup(
     popover.popup();
 }
 
-/// A destra del click se lo schermo ha spazio, altrimenti a sinistra.
+/// Right of the click if the screen has room, otherwise left.
 fn side_for(anchor: &gtk::Widget, x: f64) -> gtk::PositionType {
-    /// Larghezza del menu principale.
+    /// Width of the main menu.
     const NEEDED: f32 = 240.0;
     let Some(root) = anchor.root() else {
         return gtk::PositionType::Right;
@@ -458,17 +458,17 @@ fn side_for(anchor: &gtk::Widget, x: f64) -> gtk::PositionType {
     }
 }
 
-/// Click destro su una voce: menu completo, la voce è già selezionata.
+/// Right-click on an entry: full menu, the entry is already selected.
 pub fn show(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::ApplicationWindow) {
     popup(anchor, x, y, window, &ROWS, &SEPARATORS_AFTER);
 }
 
-/// Click destro su una voce del cestino: ripristina, copia, elimina.
+/// Right-click on a trash entry: restore, copy, delete.
 pub fn show_trash(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::ApplicationWindow) {
     popup(anchor, x, y, window, &TRASH_ROWS, &TRASH_SEPARATORS_AFTER);
 }
 
-/// Click destro sullo sfondo: crea, incolla, terminale, proprietà.
+/// Right-click on the background: create, paste, terminal, properties.
 pub fn show_background(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::ApplicationWindow) {
     popup(
         anchor,
@@ -480,7 +480,7 @@ pub fn show_background(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::Appli
     );
 }
 
-/// Click destro sullo sfondo del cestino: svuota il cestino.
+/// Right-click on the trash background: empty the trash.
 pub fn show_trash_background(
     anchor: &gtk::Widget,
     x: f64,

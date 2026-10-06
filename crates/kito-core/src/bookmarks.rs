@@ -1,5 +1,5 @@
-//! Bookmark stile freedesktop (`~/.config/gtk-3.0/bookmarks`, righe
-//! `uri nome...`). Stesso file di Nautilus: i pin sono condivisi.
+//! Freedesktop-style bookmarks (`~/.config/gtk-3.0/bookmarks`, lines
+//! `uri name...`). Same file as Nautilus: pins are shared.
 
 use std::path::PathBuf;
 
@@ -42,7 +42,7 @@ pub fn is_pinned(uri: &str) -> bool {
     read().iter().any(|(_, u)| normalize(u) == needle)
 }
 
-/// Aggiunge il pin (crea file e cartelle se mancano). Idempotente.
+/// Adds the pin (creates file and folders if missing). Idempotent.
 pub fn pin_to(path: &std::path::Path, name: &str, uri: &str) -> Result<(), glib::Error> {
     let needle = normalize(uri);
     if read_from(path).iter().any(|(_, u)| normalize(u) == needle) {
@@ -65,7 +65,7 @@ pub fn pin(name: &str, uri: &str) -> Result<(), glib::Error> {
     pin_to(&path(), name, uri)
 }
 
-/// Rimuove il pin. Ritorna `true` se c'era.
+/// Removes the pin. Returns `true` if it was there.
 pub fn unpin_from(path: &std::path::Path, uri: &str) -> Result<bool, glib::Error> {
     let needle = normalize(uri);
     let kept: Vec<String> = read_from(path)
@@ -101,7 +101,7 @@ mod tests {
         assert!(!is_pinned_in(&file, "file:///tmp/docs"));
 
         pin_to(&file, "Docs", "file:///tmp/docs/").unwrap();
-        pin_to(&file, "Docs", "file:///tmp/docs").unwrap(); // idempotente
+        pin_to(&file, "Docs", "file:///tmp/docs").unwrap(); // idempotent
         assert_eq!(read_from(&file).len(), 1);
 
         assert!(unpin_from(&file, "file:///tmp/docs").unwrap());

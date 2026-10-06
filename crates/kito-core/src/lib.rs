@@ -1,5 +1,5 @@
-//! Operazioni file pure su GIO, senza dipendenze GTK.
-//! Testabile in isolamento: `cargo test -p kito-core`.
+//! Pure GIO file operations, no GTK dependencies.
+//! Testable in isolation: `cargo test -p kito-core`.
 
 pub mod bookmarks;
 
@@ -7,26 +7,26 @@ use gio::prelude::*;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
-/// Una voce di directory: il minimo che serve alla UI per la vista classica.
+/// A directory entry: the minimum the UI needs for the classic view.
 #[derive(Debug, Clone)]
 pub struct Entry {
-    /// Nome file (basename, non il path intero).
+    /// File name (basename, not the full path).
     pub name: String,
-    /// URI `file://` completa, stabile anche con nomi strani.
+    /// Full `file://` URI, stable even with weird names.
     pub uri: String,
-    /// `true` se directory (segue i symlink come fa GIO).
+    /// `true` if directory (follows symlinks like GIO does).
     pub is_dir: bool,
-    /// Dimensione in byte, -1 se cartella o sconosciuta.
+    /// Size in bytes, -1 if folder or unknown.
     pub size: i64,
-    /// Tipo contenuto MIME (solo file), es. `text/plain`.
+    /// MIME content type (files only), e.g. `text/plain`.
     pub content_type: Option<String>,
-    /// Icona dal tema (tipo contenuto, cartelle speciali, symlink...).
+    /// Theme icon (content type, special folders, symlinks...).
     pub icon: Option<gio::Icon>,
 }
 
-/// Elenca il contenuto di `dir_uri` (es. `file:///home/utente`).
-/// Restituisce le voci ordinate: prima le directory, poi i file, per nome.
-/// Con `show_hidden = false` salta i file che iniziano per `.`.
+/// Lists the contents of `dir_uri` (e.g. `file:///home/user`).
+/// Returns sorted entries: directories first, then files, by name.
+/// With `show_hidden = false` skips files starting with `.`.
 pub fn list_dir(dir_uri: &str, show_hidden: bool) -> Result<Vec<Entry>, glib::Error> {
     let dir = gio::File::for_uri(dir_uri);
     let enumerator = dir.enumerate_children(
@@ -69,29 +69,29 @@ fn io_error(msg: &str) -> glib::Error {
     glib::Error::new(gio::IOErrorEnum::InvalidFilename, msg)
 }
 
-/// Sposta nel cestino (file o cartella). Niente conferma qui: la UI chiede.
+/// Moves to trash (file or folder). No confirmation here: the UI asks.
 pub fn trash(uri: &str) -> Result<(), glib::Error> {
     gio::File::for_uri(uri).trash(gio::Cancellable::NONE)
 }
 
-/// Cancellazione permanente ricorsiva. La UI chiede conferma prima.
-/// I collegamenti simbolici non vengono mai seguiti: eliminare un
-/// symlink rimuove solo il collegamento, anche se punta a una
-/// directory (esterna, interrotta o circolare).
+/// Permanent recursive deletion. The UI asks for confirmation first.
+/// Symbolic links are never followed: deleting a
+/// symlink removes only the link, even if it points to a
+/// directory (external, broken or circular).
 pub fn delete_recursive(uri: &str) -> Result<(), glib::Error> {
     let file = gio::File::for_uri(uri);
-    // NOFOLLOW_SYMLINKS: un symlink (a file o directory, esistente o
-    // interrotto) ha tipo SymbolicLink e salta la ricorsione; la delete
-    // finale rimuove il solo collegamento. Senza questo flag un symlink
-    // a directory verrebbe attraversato, cancellando i file della
-    // destinazione, e uno circolare ricorserebbe all'infinito.
+    // NOFOLLOW_SYMLINKS: a symlink (to file or directory, existing or
+    // broken) has type SymbolicLink and skips recursion; the final
+    // delete removes only the link. Without this flag a symlink
+    // to a directory would be traversed, deleting the target's
+    // files, and a circular one would recurse forever.
     if file.query_file_type(
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
         gio::Cancellable::NONE,
     ) == gio::FileType::Directory
     {
-        // Enumerazione best-effort: su alcuni backend (cestino) l'elenco
-        // dei figli può fallire; in quel caso si prova subito la delete.
+        // Best-effort enumeration: on some backends (trash) listing
+        // children may fail; then straight to delete.
         if let Ok(children) = file.enumerate_children(
             "standard::name",
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
@@ -105,11 +105,57 @@ pub fn delete_recursive(uri: &str) -> Result<(), glib::Error> {
     file.delete(gio::Cancellable::NONE)
 }
 
-/// URI del cestino (backend GIO, richiede gvfs).
+/// Trash URI (GIO backend, requires gvfs).
 pub const TRASH_URI: &str = "trash:///";
 
-/// Svuota `dir_uri`: elimina ogni voce contenuta. Ritorna
-/// `(voci totali, voci non eliminate)`. Usato dal cestino (`empty_trash`).
+/// Local path of a `file://` URI, decoded via GIO (`%20`, Unicode,
+/// `#`, ...). `None` for non-local URIs (`trash:///`, `network:///`,
+/// ...). Never decodes manually: no double decoding, no mangled
+/// literal `%` sequences.
+pub fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    gio::File::for_uri(uri).path()
+}
+
+/// Readable text for a URI in the path bar and breadcrumbs: the decoded
+/// local path, or the URI as-is when non-local. Non-UTF-8 names are
+/// shown lossy: the exact round-trip is guaranteed by
+/// [`resolve_path_text`], not by the text.
+pub fn uri_to_display(uri: &str) -> String {
+    match uri_to_path(uri) {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => uri.to_string(),
+    }
+}
+
+/// Decoded base name of a URI (breadcrumb labels).
+/// `None` when missing (e.g. the root, which has its own label).
+pub fn uri_file_name(uri: &str) -> Option<String> {
+    gio::File::for_uri(uri)
+        .basename()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Resolves path-bar text into the URI to load:
+/// - text unchanged from what was shown -> the stored URI (exact
+///   round-trip even for lossy-shown non-UTF-8 paths);
+/// - text with `://` -> treated as URI (including non-local ones);
+/// - otherwise -> local path. Empty text -> `None`.
+pub fn resolve_path_text(text: &str, shown_text: &str, shown_uri: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text == shown_text {
+        return Some(shown_uri.to_string());
+    }
+    if text.contains("://") {
+        return Some(text.to_string());
+    }
+    Some(gio::File::for_path(text).uri().to_string())
+}
+
+/// Empties `dir_uri`: deletes every contained entry. Returns
+/// `(total entries, entries not deleted)`. Used by trash (`empty_trash`).
 pub fn empty_dir(dir_uri: &str) -> Result<(usize, usize), glib::Error> {
     let dir = gio::File::for_uri(dir_uri);
     let children = dir.enumerate_children(
@@ -117,8 +163,8 @@ pub fn empty_dir(dir_uri: &str) -> Result<(usize, usize), glib::Error> {
         gio::FileQueryInfoFlags::NONE,
         gio::Cancellable::NONE,
     )?;
-    // Prima l'elenco, poi le eliminazioni: cancellare mentre si itera
-    // sui backend a lettura pigra nasconde le voci rimanenti.
+    // List first, then delete: deleting while iterating
+    // over lazy-read backends hides the remaining entries.
     let mut uris = Vec::new();
     while let Some(info) = children.next_file(gio::Cancellable::NONE)? {
         uris.push(children.child(&info).uri().to_string());
@@ -133,15 +179,15 @@ pub fn empty_dir(dir_uri: &str) -> Result<(usize, usize), glib::Error> {
     Ok((uris.len(), failed))
 }
 
-/// Svuota il cestino: tutte le voci vengono eliminate definitivamente.
+/// Empties the trash: all entries are deleted permanently.
 pub fn empty_trash() -> Result<(usize, usize), glib::Error> {
     empty_dir(TRASH_URI)
 }
 
-/// Riporta una voce del cestino nella sua posizione originale.
-/// Il nome viene dal percorso originale (il basename nel cestino può
-/// differire); se occupato, l'esistente è preservato con un suffisso.
-/// Ritorna l'URI finale. In caso di errore l'elemento resta nel cestino.
+/// Restores a trash entry to its original location.
+/// The name comes from the original path (the trash basename may
+/// differ); if taken, the existing entry is preserved with a suffix.
+/// Returns the final URI. On error the entry stays in the trash.
 pub fn restore(uri: &str) -> Result<String, glib::Error> {
     let file = gio::File::for_uri(uri);
     let info = file.query_info(
@@ -159,10 +205,10 @@ pub fn restore(uri: &str) -> Result<String, glib::Error> {
     .map(|_| dest.uri().into())
 }
 
-/// Legge un attributo byte-string GIO come byte grezzi, senza passare
-/// dal getter gtk-rs (il cui debug assert pretende UTF-8 anche se il
-/// contenuto è opaco: `trash::orig-path` è una byte string). Vale in
-/// debug come in release.
+/// Reads a GIO byte-string attribute as raw bytes, without going
+/// through the gtk-rs getter (whose debug assert demands UTF-8 even if
+/// the content is opaque: `trash::orig-path` is a byte string). Holds in
+/// debug as in release.
 fn file_info_byte_string(info: &gio::FileInfo, attr: &std::ffi::CStr) -> Option<Vec<u8>> {
     unsafe extern "C" {
         fn g_file_info_get_attribute_byte_string(
@@ -178,11 +224,11 @@ fn file_info_byte_string(info: &gio::FileInfo, attr: &std::ffi::CStr) -> Option<
     Some(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes().to_vec())
 }
 
-/// Destinazione di ripristino dai metadati del cestino: directory
-/// originale + nome originale con suffisso se occupato. Il percorso
-/// originale è una byte string (`trash::orig-path`, non
-/// `standard::trash::orig-path`) e va letto come byte per preservare
-/// spazi, caratteri speciali e nomi non UTF-8. Testabile senza backend.
+/// Restore destination from trash metadata: original directory
+/// + original name with suffix if taken. The original
+/// path is a byte string (`trash::orig-path`, not
+/// `standard::trash::orig-path`) and must be read as bytes to preserve
+/// spaces, special chars and non-UTF-8 names. Testable without backend.
 fn restore_destination(info: &gio::FileInfo) -> Result<gio::File, glib::Error> {
     let bytes = file_info_byte_string(info, c"trash::orig-path")
         .filter(|b| !b.is_empty())
@@ -201,8 +247,8 @@ fn restore_destination(info: &gio::FileInfo) -> Result<gio::File, glib::Error> {
     Ok(unique_child(&gio::File::for_path(parent), name))
 }
 
-/// Crea un file vuoto dentro `parent_dir_uri`. Se il nome è già occupato,
-/// aggiunge un suffisso (`name (copy).ext`). Ritorna la nuova URI.
+/// Creates an empty file inside `parent_dir_uri`. If the name is taken,
+/// adds a suffix (`name (copy).ext`). Returns the new URI.
 pub fn create_file(parent_dir_uri: &str, name: &str) -> Result<String, glib::Error> {
     let name = name.trim();
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
@@ -214,19 +260,19 @@ pub fn create_file(parent_dir_uri: &str, name: &str) -> Result<String, glib::Err
     Ok(candidate.uri().into())
 }
 
-/// Metadati per la finestra "Proprietà".
+/// Metadata for the "Properties" window.
 #[derive(Debug, Clone)]
 pub struct Props {
     pub name: String,
     pub uri: String,
     pub is_dir: bool,
     pub size: i64,
-    /// Secondi unix, `None` se sconosciuto.
+    /// Unix seconds, `None` if unknown.
     pub modified: Option<i64>,
     pub content_type: Option<String>,
 }
 
-/// Legge nome, tipo, dimensione, data e contenuto di `uri`.
+/// Reads name, type, size, date and content of `uri`.
 pub fn props(uri: &str) -> Result<Props, glib::Error> {
     let file = gio::File::for_uri(uri);
     let info = file.query_info(
@@ -244,7 +290,7 @@ pub fn props(uri: &str) -> Result<Props, glib::Error> {
     })
 }
 
-/// Rinomina. Ritorna la nuova URI.
+/// Renames. Returns the new URI.
 pub fn rename(uri: &str, new_name: &str) -> Result<String, glib::Error> {
     let new_name = new_name.trim();
     if new_name.is_empty() || new_name.contains('/') {
@@ -254,8 +300,8 @@ pub fn rename(uri: &str, new_name: &str) -> Result<String, glib::Error> {
     Ok(renamed.uri().into())
 }
 
-/// Crea la cartella `name` dentro `parent_dir_uri`. Ritorna la nuova URI.
-/// Errore se il nome è vuoto, contiene `/`, è `.`/`..` o se esiste già.
+/// Creates the `name` folder inside `parent_dir_uri`. Returns the new URI.
+/// Errors if the name is empty, contains `/`, is `.`/`..` or exists.
 pub fn mkdir(parent_dir_uri: &str, name: &str) -> Result<String, glib::Error> {
     let name = name.trim();
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
@@ -266,8 +312,8 @@ pub fn mkdir(parent_dir_uri: &str, name: &str) -> Result<String, glib::Error> {
     Ok(child.uri().into())
 }
 
-/// Divide `name` in (stelo, estensione) a livello di byte: l'ultimo
-/// `.` non iniziale. Versione byte-safe di nomi non UTF-8.
+/// Splits `name` into (stem, extension) at byte level: the last
+/// non-leading `.`. Byte-safe version for non-UTF-8 names.
 fn stem_ext_os(name: &OsStr) -> (&OsStr, &OsStr) {
     let bytes = name.as_bytes();
     match bytes.iter().rposition(|&b| b == b'.') {
@@ -279,8 +325,8 @@ fn stem_ext_os(name: &OsStr) -> (&OsStr, &OsStr) {
     }
 }
 
-/// `dest_dir/name`, oppure `name (copy).ext`, `name (copy 2).ext`...
-/// Opera su `OsStr` per preservare i nomi non UTF-8.
+/// `dest_dir/name`, or `name (copy).ext`, `name (copy 2).ext`...
+/// Works on `OsStr` to preserve non-UTF-8 names.
 fn unique_child(dest_dir: &gio::File, name: &OsStr) -> gio::File {
     let mut candidate = dest_dir.child(name);
     if !candidate.query_exists(gio::Cancellable::NONE) {
@@ -329,14 +375,14 @@ fn copy_recursive(src: &gio::File, dest: &gio::File) -> Result<(), glib::Error> 
     }
 }
 
-/// `true` se `dest_dir` è `src` o un suo discendente: copiarci dentro
-/// una directory creerebbe la destinazione prima di enumerarla, e la
-/// ricorsione la ricopierebbe all'infinito (copie annidate).
+/// `true` if `dest_dir` is `src` or one of its descendants: copying a
+/// directory there would create the destination before enumerating it,
+/// and recursion would copy it forever (nested copies).
 fn dest_inside_src(src: &gio::File, dest_dir: &gio::File) -> bool {
-    // Percorsi locali: identità fisica via canonicalizzazione (risolve
-    // `..`, i symlink nella destinazione stessa e nei componenti
-    // intermedi). Niente prefissi testuali: `Path::starts_with` lavora
-    // per componenti (`/tmp/A2` non è dentro `/tmp/A`).
+    // Local paths: physical identity via canonicalization (resolves
+    // `..`, symlinks in the destination itself and in intermediate
+    // components). No textual prefixes: `Path::starts_with` works
+    // per component (`/tmp/A2` is not inside `/tmp/A`).
     if let (Some(src_path), Some(dest_path)) = (src.path(), dest_dir.path()) {
         if let (Ok(src_canon), Ok(dest_canon)) = (
             std::fs::canonicalize(&src_path),
@@ -344,15 +390,15 @@ fn dest_inside_src(src: &gio::File, dest_dir: &gio::File) -> bool {
         ) {
             return dest_canon.starts_with(&src_canon);
         }
-        // Sorgente o destinazione non canonicalizzabile (mancante): si
-        // lascia fallire la copia con il suo errore naturale.
+        // Source or destination not canonicalizable (missing): let
+        // the copy fail with its natural error.
         return false;
     }
-    // Backend non locali (trash://, network://, ...): nessuna identità
-    // fisica né symlink da risolvere; confronto sulle URI normalizzate
-    // con guardia sul separatore. Limite: alias dello stesso oggetto con
-    // URI diverse (o maiuscole diverse su backend case-insensitive) non
-    // vengono rilevati.
+    // Non-local backends (trash://, network://, ...): no physical
+    // identity nor symlinks to resolve; comparison on normalized URIs
+    // with separator guard. Limitation: aliases of the same object with
+    // different URIs (or different case on case-insensitive backends)
+    // are not detected.
     let norm = |uri: glib::GString| {
         let s = uri.to_string();
         s.trim_end_matches('/').to_string()
@@ -362,9 +408,9 @@ fn dest_inside_src(src: &gio::File, dest_dir: &gio::File) -> bool {
     d == s || d.starts_with(&format!("{s}/"))
 }
 
-/// Copia file o cartella (ricorsiva) dentro `dest_dir_uri`.
-/// Copiare una directory dentro sé stessa o in un suo discendente è
-/// rifiutato prima di creare alcunché.
+/// Copies a file or folder (recursively) into `dest_dir_uri`.
+/// Copying a directory into itself or one of its descendants is
+/// rejected before creating anything.
 pub fn copy_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
     let src = gio::File::for_uri(src_uri);
     let dest_dir = gio::File::for_uri(dest_dir_uri);
@@ -385,8 +431,8 @@ pub fn copy_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
     copy_recursive(&src, &dest)
 }
 
-/// Sposta dentro `dest_dir_uri`. Su filesystem diversi può fallire:
-/// la UI mostra l'errore (fallback copy+delete in arrivo).
+/// Moves into `dest_dir_uri`. May fail across filesystems:
+/// the UI shows the error (copy+delete fallback coming).
 pub fn move_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
     let src = gio::File::for_uri(src_uri);
     let name = src
@@ -419,7 +465,7 @@ mod tests {
         let entries = list_dir(&uri, true).unwrap();
 
         assert_eq!(entries.len(), 3);
-        // Directory prima (ordinate), poi i file.
+        // Directories first (sorted), then files.
         assert!(entries[0].is_dir);
         assert!(entries[1].is_dir);
         assert!(!entries[2].is_dir);
@@ -486,7 +532,7 @@ mod tests {
         assert!(tmp.path().join("Nuova cartella").is_dir());
         assert!(made.ends_with("Nuova%20cartella") || made.ends_with("Nuova cartella"));
 
-        // Esistente, vuoto, con slash, `.` e `..`: tutti errori.
+        // Existing, empty, with slash, `.` and `..`: all errors.
         assert!(mkdir(&parent, "Nuova cartella").is_err());
         assert!(mkdir(&parent, "   ").is_err());
         assert!(mkdir(&parent, "a/b").is_err());
@@ -501,11 +547,11 @@ mod tests {
         std::fs::write(tmp.path().join("cartella").join("f.txt"), b"x").unwrap();
         std::fs::write(tmp.path().join("file.txt"), b"x").unwrap();
 
-        // Ricorsivo: la cartella piena e il file spariscono insieme.
+        // Recursive: the full folder and the file go away together.
         let (total, failed) = empty_dir(&uri(tmp.path())).unwrap();
         assert_eq!((total, failed), (2, 0));
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
-        // Directory già vuota: zero voci, nessun errore.
+        // Already empty directory: zero entries, no error.
         assert_eq!(empty_dir(&uri(tmp.path())).unwrap(), (0, 0));
     }
 
@@ -514,12 +560,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("file.txt"), b"x").unwrap();
 
-        // File normale: senza `trash::orig-path` non si ripristina.
+        // Plain file: without `trash::orig-path` it cannot be restored.
         assert!(restore(&uri(&tmp.path().join("file.txt"))).is_err());
         assert!(tmp.path().join("file.txt").exists());
     }
 
-    /// FileInfo con il solo attributo che conta, come lo dà il backend.
+    /// FileInfo with only the attribute that matters, as the backend gives it.
     fn trash_info(orig_path: &str) -> gio::FileInfo {
         let info = gio::FileInfo::new();
         info.set_attribute_byte_string(gio::FILE_ATTRIBUTE_TRASH_ORIG_PATH.as_str(), orig_path);
@@ -531,7 +577,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let orig = tmp.path().join("my doc (1) [x].txt");
 
-        // Nome preso dal percorso originale, spazi e speciali intatti.
+        // Name from the original path, spaces and specials intact.
         let dest = restore_destination(&trash_info(orig.to_str().unwrap())).unwrap();
         assert_eq!(
             dest.uri().to_string(),
@@ -550,23 +596,23 @@ mod tests {
             dest.uri().to_string().ends_with("report%20(copy).txt")
                 || dest.uri().to_string().ends_with("report (copy).txt")
         );
-        // L'esistente non viene toccato: solo calcolato il nome libero.
+        // The existing entry is untouched: only the free name is computed.
         assert_eq!(std::fs::read(&orig).unwrap(), b"existing");
     }
 
     #[test]
     fn restore_destination_missing_metadata_errors() {
-        // Nessun attributo.
+        // No attributes.
         let err = restore_destination(&gio::FileInfo::new()).unwrap_err();
         assert!(err.to_string().contains("Unknown original location"));
 
-        // Il vecchio nome attributo errato non viene più letto.
+        // The old wrong attribute name is no longer read.
         let info = gio::FileInfo::new();
         info.set_attribute_byte_string("standard::trash::orig-path", "/tmp/x.txt");
         let err = restore_destination(&info).unwrap_err();
         assert!(err.to_string().contains("Unknown original location"));
 
-        // Directory originale sparita.
+        // Original directory gone.
         let missing = trash_info("/tmp/kito-definitely-gone-xyz/f.txt");
         let err = restore_destination(&missing).unwrap_err();
         assert!(err.to_string().contains("no longer available"));
@@ -587,8 +633,8 @@ mod tests {
         assert_eq!(ext.as_bytes(), b"");
     }
 
-    /// Cestina `path` via GIO. Ritorna `None` (skip) se il backend non
-    /// è disponibile in questo ambiente; non tocca altre voci.
+    /// Trashes `path` via GIO. Returns `None` (skip) if the backend is
+    /// unavailable in this environment; never touches other entries.
     fn trash_tempfile(path: &std::path::Path) -> Option<()> {
         if let Err(e) = gio::File::for_path(path).trash(gio::Cancellable::NONE) {
             eprintln!("SKIP trash e2e: backend unavailable ({e})");
@@ -598,10 +644,10 @@ mod tests {
         Some(())
     }
 
-    /// URI `trash:///` della voce la cui origine è `orig`, o panico.
-    /// Confronta i byte grezzi (niente conversioni UTF-8: le altre voci
-    /// del cestino possono avere nomi arbitrari). gvfsd nota le nuove
-    /// voci con un monitor: breve retry prima di arrenderti.
+    /// `trash:///` URI of the entry whose origin is `orig`, or panic.
+    /// Compares raw bytes (no UTF-8 conversions: other trash entries
+    /// may have arbitrary names). gvfsd notices new entries via a
+    /// monitor: brief retry before giving up.
     fn find_trash_entry(orig: &std::path::Path) -> String {
         use std::os::unix::ffi::OsStrExt;
         let want = orig.as_os_str().as_bytes();
@@ -627,8 +673,8 @@ mod tests {
         }
     }
 
-    /// Temp dir sotto la home: /tmp sta su un mount dove il cestino non
-    /// è supportato, la home sì. Solo elementi della prova, mai esistenti.
+    /// Temp dir under home: /tmp lives on a mount where trash is not
+    /// supported, home is. Only test-owned entries, never existing ones.
     fn home_tempdir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("kito-restore-test-")
@@ -638,9 +684,9 @@ mod tests {
 
     #[test]
     fn restore_roundtrip_through_trash() {
-        // Nome voce unico per processo: riusare lo stesso nome in run
-        // ravvicinati confonde il monitor di gvfsd-trash (eventi
-        // coalescenti, la voce poi non appare più).
+        // Unique entry name per process: reusing the same name in close
+        // runs confuses the gvfsd-trash monitor (coalesced events, the
+        // entry then never shows up).
         let unique = format!(
             "round trip (1) {}-{}.txt",
             std::process::id(),
@@ -656,17 +702,17 @@ mod tests {
             return;
         };
 
-        // Un solo ciclo trash->restore: cicli multipli ravvicinati sullo
-        // stesso nome perdono eventi nel monitor di gvfsd-trash (la sua
-        // cache diverge e la voce non appare più; problema del demone,
-        // non del ripristino). La collisione è coperta a livello unit.
+        // Single trash->restore cycle: rapid repeated cycles on the
+        // same name lose events in the gvfsd-trash monitor (its cache
+        // diverges and the entry never shows up; daemon problem, not a
+        // restore one). Collisions are covered at unit level.
         let restored = restore(&find_trash_entry(&path)).unwrap();
         assert_eq!(restored, gio::File::for_path(&path).uri().to_string());
         assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
-    /// Imposta `trash::orig-path` a byte grezzi via C API diretta (il
-    /// setter del binding accetta solo `&str`). Solo per i test.
+    /// Sets `trash::orig-path` to raw bytes via direct C API (the
+    /// binding setter only accepts `&str`). Tests only.
     unsafe fn set_orig_path_raw(info: &gio::FileInfo, raw: &[u8]) {
         unsafe extern "C" {
             fn g_file_info_set_attribute_byte_string(
@@ -727,7 +773,7 @@ mod tests {
 
         delete_recursive(&uri(&link)).unwrap();
 
-        // Sparisce solo il collegamento: destinazione intatta.
+        // Only the link disappears: target intact.
         assert!(std::fs::symlink_metadata(&link).is_err());
         assert_eq!(
             std::fs::read(external.path().join("keep.txt")).unwrap(),
@@ -768,8 +814,8 @@ mod tests {
     fn delete_circular_symlink_does_not_recurse() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("file.txt"), b"x").unwrap();
-        // Collegamento alla directory che lo contiene: seguirlo
-        // ricorserebbe all'infinito.
+        // Link to the directory containing it: following it
+        // would recurse forever.
         std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
 
         delete_recursive(&uri(tmp.path())).unwrap();
@@ -783,7 +829,7 @@ mod tests {
         let nested = tmp.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("deep.txt"), b"deep").unwrap();
-        // Symlink a file dentro l'albero: si elimina col resto.
+        // File symlink inside the tree: goes away with the rest.
         std::os::unix::fs::symlink(
             nested.join("deep.txt"),
             tmp.path().join("a").join("file-link.txt"),
@@ -802,8 +848,8 @@ mod tests {
         );
     }
 
-    /// Nomi ordinati delle voci di `dir`: istantanea per verificare che
-    /// un'operazione rifiutata non crei nulla.
+    /// Sorted entry names of `dir`: snapshot to verify that a rejected
+    /// operation creates nothing.
     fn names(dir: &std::path::Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -830,7 +876,7 @@ mod tests {
 
         assert!(copy_to(&uri(&a), &uri(&a)).is_err());
 
-        // Nulla creato, sorgente intatta.
+        // Nothing created, source intact.
         assert_eq!(names(&a), before);
         assert_eq!(std::fs::read(a.join("f.txt")).unwrap(), b"effe");
         assert_eq!(std::fs::read(a.join("sub").join("g.txt")).unwrap(), b"gi");
@@ -859,7 +905,7 @@ mod tests {
         std::os::unix::fs::symlink(&a, tmp.path().join("link_a")).unwrap();
         std::os::unix::fs::symlink(a.join("sub"), tmp.path().join("link_sub")).unwrap();
 
-        // Destinazione che raggiunge A o un suo discendente via symlink.
+        // Destination reaching A or one of its descendants via symlink.
         assert!(copy_to(&uri(&a), &uri(&tmp.path().join("link_a"))).is_err());
         assert!(copy_to(&uri(&a), &uri(&tmp.path().join("link_sub"))).is_err());
 
@@ -877,12 +923,12 @@ mod tests {
         std::fs::write(a.join("a.txt"), b"a").unwrap();
         std::fs::write(a2.join("b.txt"), b"b").unwrap();
 
-        // `A2` non è dentro `A` nonostante il prefisso: copie valide.
+        // `A2` is not inside `A` despite the prefix: valid copies.
         copy_to(&uri(&a2), &uri(&a)).unwrap();
         assert_eq!(std::fs::read(a.join("A2").join("b.txt")).unwrap(), b"b");
         copy_to(&uri(&a), &uri(&a2)).unwrap();
         assert_eq!(std::fs::read(a2.join("A").join("a.txt")).unwrap(), b"a");
-        // Sorgenti intatte.
+        // Sources intact.
         assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"a");
         assert_eq!(std::fs::read(a2.join("b.txt")).unwrap(), b"b");
     }
@@ -917,7 +963,7 @@ mod tests {
         assert!(made.ends_with("note.txt"));
         assert_eq!(std::fs::read(tmp.path().join("note.txt")).unwrap(), b"");
 
-        // Stesso nome: suffisso, senza sovrascrivere.
+        // Same name: suffix, no overwrite.
         create_file(&parent, "note.txt").unwrap();
         assert!(tmp.path().join("note (copy).txt").exists());
 
@@ -939,5 +985,102 @@ mod tests {
 
         let d = props(&uri(&tmp.path().join("d"))).unwrap();
         assert!(d.is_dir);
+    }
+
+    fn special_dirs() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "My Folder",
+            "café ☃",
+            "100%",
+            "a#b",
+            "%20",
+            "mix %20 # % ünï",
+        ] {
+            std::fs::create_dir(tmp.path().join(name)).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn uri_display_decodes_special_names() {
+        let tmp = special_dirs();
+        for name in [
+            "My Folder",
+            "café ☃",
+            "100%",
+            "a#b",
+            "%20",
+            "mix %20 # % ünï",
+        ] {
+            let path = tmp.path().join(name);
+            let file_uri = gio::File::for_path(&path).uri().to_string();
+            // Readable text, never the raw %XX form...
+            assert_eq!(uri_to_display(&file_uri), path.to_string_lossy());
+            // ...except non-local URIs pass through untouched.
+            assert_eq!(uri_to_display(TRASH_URI), TRASH_URI);
+            // Round-trip back to the same location.
+            assert_eq!(uri_to_path(&file_uri).unwrap(), path);
+            assert_eq!(uri_file_name(&file_uri).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn uri_to_path_rejects_non_local() {
+        assert!(uri_to_path(TRASH_URI).is_none());
+        assert!(uri_to_path("network:///").is_none());
+        assert!(uri_to_path("smb://server/share").is_none());
+    }
+
+    #[test]
+    fn uri_display_non_utf8_is_lossy_but_round_trips() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let raw: Vec<u8> = {
+            let mut v = tmp.path().as_os_str().as_bytes().to_vec();
+            v.extend_from_slice(b"/bad \xff name");
+            v
+        };
+        let path = std::path::PathBuf::from(OsStr::from_bytes(&raw));
+        std::fs::create_dir(&path).unwrap();
+        let file_uri = gio::File::for_path(&path).uri().to_string();
+
+        // gio decodes the bytes; display is lossy...
+        assert_eq!(uri_to_path(&file_uri).unwrap().as_os_str().as_bytes(), &raw);
+        let shown = uri_to_display(&file_uri);
+        assert!(shown.contains('\u{FFFD}'));
+        // ...but Enter unchanged resolves to the exact stored URI.
+        assert_eq!(
+            resolve_path_text(&shown, &shown, &file_uri).unwrap(),
+            file_uri
+        );
+    }
+
+    #[test]
+    fn resolve_path_text_round_trip_and_edits() {
+        let tmp = special_dirs();
+        // Unchanged text (Ctrl+L, Enter): same directory, no re-encoding.
+        for name in ["My Folder", "100%", "a#b", "%20"] {
+            let path = tmp.path().join(name);
+            let file_uri = gio::File::for_path(&path).uri().to_string();
+            let shown = uri_to_display(&file_uri);
+            assert_eq!(
+                resolve_path_text(&shown, &shown, &file_uri).unwrap(),
+                file_uri
+            );
+        }
+        // Typed plain path.
+        let typed = tmp.path().join("My Folder").to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_path_text(&typed, "/elsewhere", "file:///elsewhere").unwrap(),
+            gio::File::for_path(&typed).uri().to_string()
+        );
+        // Typed URI, including non-local ones.
+        assert_eq!(
+            resolve_path_text(TRASH_URI, "/x", "file:///x").unwrap(),
+            TRASH_URI
+        );
+        // Empty text navigates nowhere.
+        assert!(resolve_path_text("   ", "/x", "file:///x").is_none());
     }
 }
