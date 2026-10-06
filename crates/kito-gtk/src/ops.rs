@@ -13,17 +13,134 @@ pub struct Clipboard {
     pub cut: bool,
 }
 
+/// What to paste for freshly-read system clipboard text.
+#[derive(Debug, PartialEq)]
+enum PasteDecision {
+    /// Clipboard changed again while reading: drop the result.
+    Stale,
+    /// System text still matches what Kito published: use the internal
+    /// entries, preserving the copy/cut intent.
+    Internal { uris: Vec<String>, cut: bool },
+    /// Foreign content with usable files: copy them, never move.
+    External { uris: Vec<String> },
+    /// No usable files: explain, never fall back to old URIs.
+    Unsupported,
+}
+
+/// Clipboard tracker: internal entries stay valid only while they match
+/// what Kito published. Ownership changes arrive via the GDK `changed`
+/// notification (not text comparison); paste-time text matching is only
+/// a safety net for missed notifications. GDK-free: fully testable.
+#[derive(Default)]
+pub(crate) struct ClipTracker {
+    entries: Option<Clipboard>,
+    published_text: Option<String>,
+    generation: u64,
+    own_change_pending: bool,
+    /// Provider we published with: pointer identity (not text) proves
+    /// a `changed` notification is ours.
+    our_provider: Option<gdk::ContentProvider>,
+}
+
+impl ClipTracker {
+    /// Internal copy/cut: store the entries, arm the own-change flag and
+    /// return the text to publish. Bumps the generation so in-flight
+    /// async reads go stale.
+    fn publish(&mut self, entries: Clipboard) -> String {
+        let text = entries.uris.join("\n");
+        self.entries = Some(entries);
+        self.published_text = Some(text.clone());
+        self.own_change_pending = true;
+        self.generation += 1;
+        text
+    }
+
+    /// Notification for a change Kito itself published: keep the state.
+    /// Idempotent: late duplicates are harmless.
+    fn on_own_changed(&mut self) {
+        self.own_change_pending = false;
+    }
+
+    /// Notification for a foreign change (plain text and unsupported
+    /// content included): drop the internal state so nothing stale can
+    /// be pasted. Bumps the generation to retire in-flight reads.
+    fn on_external_changed(&mut self) {
+        self.entries = None;
+        self.published_text = None;
+        self.own_change_pending = false;
+        self.generation += 1;
+    }
+
+    /// Consumes the internal cut intent after dispatching the move.
+    fn consume_cut(&mut self) {
+        if self.entries.as_ref().is_some_and(|e| e.cut) {
+            self.entries = None;
+        }
+    }
+
+    fn resolve(&self, text: Option<&str>, read_generation: u64) -> PasteDecision {
+        if read_generation != self.generation {
+            return PasteDecision::Stale;
+        }
+        match (&self.entries, &self.published_text, text) {
+            (Some(entries), Some(published), Some(current)) if current == published => {
+                PasteDecision::Internal {
+                    uris: entries.uris.clone(),
+                    cut: entries.cut,
+                }
+            }
+            (_, _, Some(current)) => {
+                let uris = parse_external_uris(current);
+                if uris.is_empty() {
+                    PasteDecision::Unsupported
+                } else {
+                    PasteDecision::External { uris }
+                }
+            }
+            _ => PasteDecision::Unsupported,
+        }
+    }
+}
+
+/// `file://` lines from foreign clipboard text (interop with other
+/// apps). Anything else is ignored by the caller.
+fn parse_external_uris(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("file://"))
+        .map(String::from)
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct Ctx {
     pub window: adw::ApplicationWindow,
     pub manager: Rc<TabManager>,
     pub toast: adw::ToastOverlay,
-    pub clipboard: Rc<RefCell<Clipboard>>,
+    pub(crate) clipboard: Rc<RefCell<ClipTracker>>,
     /// Shows the path entry (Ctrl+L). Set by main.
     pub focus_path: Rc<dyn Fn()>,
 }
 
 impl Ctx {
+    /// GDK `changed` notification: our own publish keeps the state,
+    /// anything else invalidates it. Ownership is the content provider
+    /// identity (not text equality).
+    pub(crate) fn on_clipboard_changed(&self) {
+        let ours = (|| {
+            let current = gdk::Display::default()?.clipboard().content()?;
+            let owned = self.clipboard.borrow().our_provider.clone()?;
+            Some(current.as_ptr() == owned.as_ptr())
+        })()
+        .unwrap_or(false);
+        let mut tracker = self.clipboard.borrow_mut();
+        if ours {
+            tracker.on_own_changed();
+        } else {
+            tracker.on_external_changed();
+        }
+    }
+
     pub fn toast(&self, msg: &str) {
         self.toast.add_toast(adw::Toast::new(msg));
     }
@@ -91,11 +208,16 @@ impl Ctx {
             self.toast("Nothing selected");
             return;
         }
-        *self.clipboard.borrow_mut() = Clipboard { uris, cut };
+        // Publish internally first, then to the system clipboard (plain
+        // text stays readable by other apps, as before).
+        let text = self.clipboard.borrow_mut().publish(Clipboard { uris, cut });
         if let Some(display) = gdk::Display::default() {
-            display
-                .clipboard()
-                .set_text(&self.clipboard.borrow().uris.join("\n"));
+            let clipboard = display.clipboard();
+            clipboard.set_text(&text);
+            self.clipboard.borrow_mut().our_provider = clipboard.content();
+        } else {
+            // Nothing published to the system: no owned provider.
+            self.clipboard.borrow_mut().our_provider = None;
         }
         self.toast(if cut { "Cut" } else { "Copied" });
     }
@@ -104,17 +226,46 @@ impl Ctx {
         let Some(dest) = self.manager.selected_uri() else {
             return;
         };
-        let (uris, cut) = {
-            let cb = self.clipboard.borrow();
-            (cb.uris.clone(), cb.cut)
-        };
-        if uris.is_empty() {
-            self.paste_from_system(dest);
+        let Some(display) = gdk::Display::default() else {
+            self.toast("Clipboard is empty");
             return;
-        }
-        if cut {
-            self.clipboard.borrow_mut().uris.clear();
-            self.clipboard.borrow_mut().cut = false;
+        };
+        // The system clipboard decides: read it first, then resolve
+        // against the internal state captured now. A change in between
+        // retires this read instead of pasting stale entries.
+        let generation = self.clipboard.borrow().generation;
+        let this = self.clone();
+        display
+            .clipboard()
+            .read_text_async(gio::Cancellable::NONE, move |result| {
+                let text = result.ok().flatten().map(|s| s.to_string());
+                match this.clipboard.borrow().resolve(text.as_deref(), generation) {
+                    PasteDecision::Stale => this.toast("Clipboard changed, try again"),
+                    PasteDecision::Internal { uris, cut } => {
+                        if cut {
+                            this.clipboard.borrow_mut().consume_cut();
+                        }
+                        this.paste_uris(uris, cut, dest);
+                    }
+                    PasteDecision::External { uris } => {
+                        this.paste_uris(uris, false, dest);
+                    }
+                    PasteDecision::Unsupported => {
+                        if text.is_none() {
+                            this.toast("Clipboard is empty");
+                        } else {
+                            this.toast("Clipboard has no files to paste");
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Copies (or moves, for a consumed cut) `uris` into `dest`.
+    fn paste_uris(&self, uris: Vec<String>, cut: bool, dest: String) {
+        if uris.is_empty() {
+            self.toast("Clipboard is empty");
+            return;
         }
         let this = self.clone();
         Self::run_in_thread(
@@ -147,58 +298,6 @@ impl Ctx {
                 }
             },
         );
-    }
-
-    /// Paste from other apps: reads `text/plain` with `file://` lines.
-    /// Copy only, never move.
-    fn paste_from_system(&self, dest: String) {
-        let Some(display) = gdk::Display::default() else {
-            self.toast("Clipboard is empty");
-            return;
-        };
-        let this = self.clone();
-        display
-            .clipboard()
-            .read_text_async(gio::Cancellable::NONE, move |result| match result {
-                Ok(Some(text)) => {
-                    let uris: Vec<String> = text
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| l.starts_with("file://"))
-                        .map(String::from)
-                        .collect();
-                    if uris.is_empty() {
-                        this.toast("Clipboard is empty");
-                        return;
-                    }
-                    Self::run_in_thread(
-                        move || {
-                            let mut failed = 0;
-                            let mut first_error = None;
-                            for uri in &uris {
-                                if let Err(e) = kito_core::copy_to(uri, &dest) {
-                                    failed += 1;
-                                    if first_error.is_none() {
-                                        first_error = Some(e.to_string());
-                                    }
-                                }
-                            }
-                            (uris.len(), failed, first_error)
-                        },
-                        move |(total, failed, first_error): (usize, i32, Option<String>)| {
-                            this.manager.reload_selected();
-                            if failed == 0 {
-                                this.toast(&format!("Pasted {total} item(s)"));
-                            } else if let Some(error) = first_error {
-                                this.error_dialog("Could not paste", error);
-                            } else {
-                                this.toast(&format!("{failed} of {total} item(s) failed"));
-                            }
-                        },
-                    );
-                }
-                _ => this.toast("Clipboard is empty"),
-            });
     }
 
     pub fn trash_selected(&self) {
@@ -700,4 +799,146 @@ fn prop_row(label: &str, value: &str) -> gtk::Box {
             .build(),
     );
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(uris: &[&str], cut: bool) -> Clipboard {
+        Clipboard {
+            uris: uris.iter().map(|s| s.to_string()).collect(),
+            cut,
+        }
+    }
+
+    const A: &str = "file:///tmp/A.txt";
+    const B: &str = "file:///tmp/B.txt";
+
+    #[test]
+    fn external_copy_replaces_internal() {
+        let mut clip = ClipTracker::default();
+        let published_a = clip.publish(entries(&[A], false));
+        clip.on_own_changed();
+        // Another app publishes B afterwards.
+        clip.on_external_changed();
+        let published_b = format!("{B}\n");
+        assert_eq!(
+            clip.resolve(Some(&published_b), clip.generation),
+            PasteDecision::External {
+                uris: vec![B.to_string()]
+            }
+        );
+        // A is gone: never pasted from stale state.
+        assert_ne!(published_a, published_b);
+    }
+
+    #[test]
+    fn external_plain_text_pastes_nothing() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], false));
+        clip.on_own_changed();
+        clip.on_external_changed();
+        assert_eq!(
+            clip.resolve(Some("just some text"), clip.generation),
+            PasteDecision::Unsupported
+        );
+        assert_eq!(
+            clip.resolve(None, clip.generation),
+            PasteDecision::Unsupported
+        );
+    }
+
+    #[test]
+    fn internal_cut_survives_without_external_changes() {
+        let mut clip = ClipTracker::default();
+        let published = clip.publish(entries(&[A], true));
+        clip.on_own_changed();
+        assert_eq!(
+            clip.resolve(Some(&published), clip.generation),
+            PasteDecision::Internal {
+                uris: vec![A.to_string()],
+                cut: true,
+            }
+        );
+        // Consuming the cut drops the move intent afterwards.
+        clip.consume_cut();
+        assert_eq!(
+            clip.resolve(Some(&published), clip.generation),
+            PasteDecision::External {
+                uris: vec![A.to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn external_replace_invalidates_pending_cut() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        clip.on_own_changed();
+        clip.on_external_changed();
+        // Old cut is gone: B pastes as copy, never as move.
+        assert_eq!(
+            clip.resolve(Some(B), clip.generation),
+            PasteDecision::External {
+                uris: vec![B.to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn own_publish_notification_keeps_state_valid() {
+        let mut clip = ClipTracker::default();
+        let published = clip.publish(entries(&[A], false));
+        // Notification caused by our own publish: still valid...
+        clip.on_own_changed();
+        assert_eq!(
+            clip.resolve(Some(&published), clip.generation),
+            PasteDecision::Internal {
+                uris: vec![A.to_string()],
+                cut: false,
+            }
+        );
+        // ...even if delivered twice.
+        clip.on_own_changed();
+        assert_eq!(
+            clip.resolve(Some(&published), clip.generation),
+            PasteDecision::Internal {
+                uris: vec![A.to_string()],
+                cut: false,
+            }
+        );
+    }
+
+    #[test]
+    fn async_read_after_change_is_discarded() {
+        let mut clip = ClipTracker::default();
+        let published = clip.publish(entries(&[A], false));
+        let read_generation = clip.generation;
+        // Clipboard replaced while the async read was in flight.
+        clip.on_external_changed();
+        assert_eq!(
+            clip.resolve(Some(&published), read_generation),
+            PasteDecision::Stale
+        );
+        // A fresh read at the current generation resolves normally.
+        assert_eq!(
+            clip.resolve(Some(B), clip.generation),
+            PasteDecision::External {
+                uris: vec![B.to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn external_uris_filter_file_lines() {
+        assert_eq!(
+            parse_external_uris("  file:///tmp/a.txt\nnot a file\nfile:///tmp/b.txt  "),
+            vec![
+                "file:///tmp/a.txt".to_string(),
+                "file:///tmp/b.txt".to_string()
+            ]
+        );
+        assert!(parse_external_uris("plain text\n").is_empty());
+    }
 }

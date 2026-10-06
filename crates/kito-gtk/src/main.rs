@@ -718,10 +718,21 @@ fn build_window(app: &adw::Application, initial_uris: Vec<String>) {
         window: window.clone(),
         manager: manager.clone(),
         toast: toast_overlay.clone(),
-        clipboard: Rc::new(RefCell::new(ops::Clipboard::default())),
+        clipboard: Rc::new(RefCell::new(ops::ClipTracker::default())),
         focus_path: show_path_entry.clone(),
     });
     register_actions(app, &window, ctx.clone());
+
+    // System clipboard decides what to paste: track ownership changes.
+    // Weak reference: the display outlives the window, no cycle.
+    if let Some(display) = gdk::Display::default() {
+        let weak = Rc::downgrade(&ctx);
+        display.clipboard().connect_changed(move |_| {
+            if let Some(ctx) = weak.upgrade() {
+                ctx.on_clipboard_changed();
+            }
+        });
+    }
 
     // Menu ⋮: hidden check + about.
     hidden_check.connect_toggled({
