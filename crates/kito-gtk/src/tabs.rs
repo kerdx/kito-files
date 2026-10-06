@@ -24,6 +24,7 @@ pub struct FileTab {
     scrolled: gtk::ScrolledWindow,
     /// List or "empty folder" page.
     stack: gtk::Stack,
+    empty_page: adw::StatusPage,
     selection: RefCell<gtk::SingleSelection>,
     mode: Cell<ViewMode>,
     open_items: Cell<OpenItems>,
@@ -217,6 +218,17 @@ impl FileTab {
         self.mode.set(mode);
         rebuild_view(self);
         self.sync_chrome();
+    }
+
+    /// Rebuilds this tab's translated row widgets while preserving its
+    /// current selection, folder, view mode, and navigation history.
+    fn retranslate(self: &Rc<Self>) {
+        let selected_uri = self.selected_objects().first().map(|obj| obj.uri());
+        self.empty_page.set_title(&crate::l10n::tr("empty-folder"));
+        rebuild_view(self);
+        if let Some(uri) = selected_uri {
+            self.select_uri(&uri);
+        }
     }
 
     fn set_open_items(&self, behavior: OpenItems) {
@@ -500,6 +512,16 @@ impl TabManager {
         }
     }
 
+    /// Refreshes translated view cells and the active chrome across tabs.
+    pub fn retranslate(&self) {
+        for tab in self.tabs.borrow().iter() {
+            tab.retranslate();
+        }
+        if let Some(tab) = self.selected() {
+            tab.sync_chrome();
+        }
+    }
+
     pub fn go_back(&self) {
         if let Some(tab) = self.selected() {
             tab.go_back();
@@ -539,6 +561,7 @@ impl TabManager {
             store,
             scrolled,
             stack,
+            empty_page: empty,
             selection: RefCell::new(gtk::SingleSelection::new(Some(gio::ListStore::new::<
                 FileObject,
             >()))),

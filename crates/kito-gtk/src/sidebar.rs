@@ -67,6 +67,14 @@ fn section_header(title: &str) -> gtk::Label {
         .build()
 }
 
+fn row_label(button: &gtk::Button) -> Option<gtk::Label> {
+    button
+        .child()
+        .and_downcast::<gtk::Box>()
+        .and_then(|row| row.last_child())
+        .and_downcast::<gtk::Label>()
+}
+
 /// Bookmark row with right-click to remove it. The sidebar reloads
 /// on its own via monitor on the file (see `build_sidebar`).
 fn bookmark_row(name: &str, uri: &str, load: LoadFn) -> gtk::Button {
@@ -474,6 +482,13 @@ pub struct Sidebar {
     widget: gtk::ScrolledWindow,
     places: Rows,
     other: Rows,
+    places_title: gtk::Label,
+    devices_title: gtk::Label,
+    network_title: gtk::Label,
+    network_label: gtk::Label,
+    refresh_places: Rc<dyn Fn()>,
+    refresh_devices: Rc<dyn Fn()>,
+    active_uri: RefCell<Option<String>>,
 }
 
 impl Sidebar {
@@ -483,6 +498,7 @@ impl Sidebar {
 
     /// Highlights the row matching `uri`, turns the others off.
     pub fn set_active(&self, uri: &str) {
+        *self.active_uri.borrow_mut() = Some(uri.to_string());
         let target = normalize(uri);
         for (key, button) in self
             .places
@@ -491,6 +507,25 @@ impl Sidebar {
             .chain(self.other.borrow().iter())
         {
             set_row_active(button, *key == target);
+        }
+    }
+
+    /// Refreshes translated labels and system rows whose fallback names
+    /// are supplied by the application. Real device/bookmark names remain
+    /// system data.
+    pub fn retranslate(&self) {
+        self.places_title.set_text(&crate::l10n::tr("side-places"));
+        self.devices_title
+            .set_text(&crate::l10n::tr("side-devices"));
+        self.network_title
+            .set_text(&crate::l10n::tr("side-network"));
+        self.network_label
+            .set_text(&crate::l10n::tr("side-browse-network"));
+        (self.refresh_places)();
+        (self.refresh_devices)();
+        let active_uri = self.active_uri.borrow().clone();
+        if let Some(uri) = active_uri {
+            self.set_active(&uri);
         }
     }
 }
@@ -509,7 +544,8 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         .margin_top(4)
         .margin_bottom(8)
         .build();
-    outer.append(&section_header(&crate::l10n::tr("side-places")));
+    let places_title = section_header(&crate::l10n::tr("side-places"));
+    outer.append(&places_title);
     let places = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -552,26 +588,27 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         });
     }
 
-    outer.append(&section_header(&crate::l10n::tr("side-devices")));
+    let devices_title = section_header(&crate::l10n::tr("side-devices"));
+    outer.append(&devices_title);
     let devices = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
         .build();
     outer.append(&devices);
 
-    outer.append(&section_header(&crate::l10n::tr("side-network")));
+    let network_title = section_header(&crate::l10n::tr("side-network"));
+    outer.append(&network_title);
     let network = gio::ThemedIcon::new("network-workgroup");
-    {
-        let network_row = nav_row(
-            &network,
-            &crate::l10n::tr("side-browse-network"),
-            load.clone(),
-            "network:///".to_string(),
-        );
-        add_row(&outer, &other_rows, "network:///", &network_row);
-    }
+    let network_row = nav_row(
+        &network,
+        &crate::l10n::tr("side-browse-network"),
+        load.clone(),
+        "network:///".to_string(),
+    );
+    let network_label = row_label(&network_row).expect("network row has a label");
+    add_row(&outer, &other_rows, "network:///", &network_row);
 
-    let refresh = Rc::new({
+    let refresh: Rc<dyn Fn()> = Rc::new({
         let devices = devices.clone();
         let load = load.clone();
         let window = window.clone();
@@ -616,6 +653,13 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
             .build(),
         places: places_rows,
         other: other_rows,
+        places_title,
+        devices_title,
+        network_title,
+        network_label,
+        refresh_places,
+        refresh_devices: refresh,
+        active_uri: RefCell::new(None),
     }
 }
 

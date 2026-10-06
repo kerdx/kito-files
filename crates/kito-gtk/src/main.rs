@@ -58,6 +58,18 @@ fn view_row(names: &[&str], label: &str) -> gtk::ToggleButton {
     button
 }
 
+fn set_view_row_label(button: &gtk::ToggleButton, text: &str) {
+    if let Some(row) = button.child().and_downcast::<gtk::Box>() {
+        if let Some(label) = row
+            .first_child()
+            .and_then(|icon| icon.next_sibling())
+            .and_downcast::<gtk::Label>()
+        {
+            label.set_text(text);
+        }
+    }
+}
+
 /// One `win.*` action entry: name + function on the context.
 type ActionDef = (&'static str, fn(&ops::Ctx));
 
@@ -67,7 +79,7 @@ fn register_actions(
     window: &adw::ApplicationWindow,
     ctx: Rc<ops::Ctx>,
     preferences: Rc<PreferenceStore>,
-    preferences_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
+    preferences_dialog: preferences_dialog::SharedDialog,
 ) {
     let group = gio::SimpleActionGroup::new();
     let defs: [ActionDef; 22] = [
@@ -387,6 +399,7 @@ fn main() -> glib::ExitCode {
         preferences.snapshot().language,
         kito_i18n::detect_system(),
     ));
+    preferences.subscribe_language(Rc::new(l10n::set_language));
     let app = adw::Application::builder()
         .application_id("it.kito.KitoFiles")
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
@@ -432,7 +445,7 @@ fn build_window(
         .default_width(900)
         .default_height(600)
         .build();
-    let preferences_dialog = Rc::new(RefCell::new(None));
+    let preferences_dialog: preferences_dialog::SharedDialog = Rc::new(RefCell::new(None));
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -551,13 +564,12 @@ fn build_window(
     ]));
     about_icon.set_pixel_size(18);
     about_row.append(&about_icon);
-    about_row.append(
-        &gtk::Label::builder()
-            .label(tr("menu-about"))
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .build(),
-    );
+    let about_label = gtk::Label::builder()
+        .label(tr("menu-about"))
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    about_row.append(&about_label);
     about_button.set_child(Some(&about_row));
     overflow_list.append(&about_button);
     let prefs_button = gtk::Button::builder().has_frame(false).build();
@@ -575,13 +587,12 @@ fn build_window(
     ]));
     prefs_icon.set_pixel_size(18);
     prefs_row.append(&prefs_icon);
-    prefs_row.append(
-        &gtk::Label::builder()
-            .label(tr("menu-preferences"))
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .build(),
-    );
+    let preferences_label = gtk::Label::builder()
+        .label(tr("menu-preferences"))
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    prefs_row.append(&preferences_label);
     prefs_button.set_child(Some(&prefs_row));
     overflow_list.append(&prefs_button);
     overflow.set_child(Some(&overflow_list));
@@ -868,6 +879,80 @@ fn build_window(
     paned.set_start_child(Some(sidebar.widget()));
     paned.set_position(170);
     *sidebar_slot.borrow_mut() = Some(sidebar);
+
+    // Preferences are shared process-wide. Each window keeps only weak
+    // references here so closing a window also releases its widgets.
+    preferences.subscribe_language({
+        let manager = Rc::downgrade(&manager);
+        let sidebar_slot = Rc::downgrade(&sidebar_slot);
+        let preferences_dialog = Rc::downgrade(&preferences_dialog);
+        let preferences = Rc::downgrade(&preferences);
+        let back_button = back_button.downgrade();
+        let forward_button = forward_button.downgrade();
+        let up_button = up_button.downgrade();
+        let path_entry = path_entry.downgrade();
+        let menu_button = menu_button.downgrade();
+        let new_tab_button = new_tab_button.downgrade();
+        let icons_btn = icons_btn.downgrade();
+        let compact_btn = compact_btn.downgrade();
+        let details_btn = details_btn.downgrade();
+        let hidden_check = hidden_check.downgrade();
+        let about_label = about_label.downgrade();
+        let preferences_label = preferences_label.downgrade();
+        Rc::new(move |_| {
+            if let Some(button) = back_button.upgrade() {
+                button.set_tooltip_text(Some(&tr("nav-back")));
+            }
+            if let Some(button) = forward_button.upgrade() {
+                button.set_tooltip_text(Some(&tr("nav-forward")));
+            }
+            if let Some(button) = up_button.upgrade() {
+                button.set_tooltip_text(Some(&tr("nav-up")));
+            }
+            if let Some(entry) = path_entry.upgrade() {
+                entry.set_placeholder_text(Some(&tr("path-placeholder")));
+            }
+            if let Some(button) = menu_button.upgrade() {
+                button.set_tooltip_text(Some(&tr("menu-view-settings")));
+            }
+            if let Some(button) = new_tab_button.upgrade() {
+                button.set_tooltip_text(Some(&tr("nav-new-tab")));
+            }
+            if let Some(button) = icons_btn.upgrade() {
+                set_view_row_label(&button, &tr("view-icons"));
+            }
+            if let Some(button) = compact_btn.upgrade() {
+                set_view_row_label(&button, &tr("view-compact"));
+            }
+            if let Some(button) = details_btn.upgrade() {
+                set_view_row_label(&button, &tr("view-details"));
+            }
+            if let Some(check) = hidden_check.upgrade() {
+                check.set_label(Some(&tr("view-hidden")));
+            }
+            if let Some(label) = about_label.upgrade() {
+                label.set_text(&tr("menu-about"));
+            }
+            if let Some(label) = preferences_label.upgrade() {
+                label.set_text(&tr("menu-preferences"));
+            }
+            if let Some(slot) = sidebar_slot.upgrade() {
+                if let Some(sidebar) = slot.borrow().as_ref() {
+                    sidebar.retranslate();
+                }
+            }
+            if let Some(state) = preferences_dialog.upgrade() {
+                if let Some(preferences) = preferences.upgrade() {
+                    if let Some(dialog) = state.borrow().as_ref() {
+                        preferences_dialog::retranslate(dialog, &preferences);
+                    }
+                }
+            }
+            if let Some(manager) = manager.upgrade() {
+                manager.retranslate();
+            }
+        })
+    });
 
     back_button.connect_clicked({
         let manager = manager.clone();

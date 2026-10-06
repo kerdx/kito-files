@@ -86,14 +86,14 @@ for Wayland or X11. Development testing is done on Wayland.
   all open windows; a default-view change affects only tabs opened afterward.
 - Choose **System language**, **English**, or **Italiano**. By default, Kito Files follows
   the system message locale (including regional variants); unsupported or unavailable
-  locales use English. A manual choice overrides system detection and is applied on the
-  next launch. Returning to **System language** resumes automatic detection.
+  locales use English. A manual choice overrides system detection and is applied
+  immediately to open windows; returning to **System language** resumes automatic
+  detection. Standard GTK/libadwaita controls continue to follow the system locale.
 - Preferences are stored atomically in `~/.config/kito-files/settings.conf`, honoring
   an absolute `XDG_CONFIG_HOME` when set. This does not require dconf or GSettings.
 - The app interface is translated into English and Italian using embedded Fluent
-  catalogs. App translations are selected independently; standard GTK/libadwaita
-  strings continue to follow the system locale. The language choice currently needs a
-  restart because the interface is built once at startup.
+  catalogs. App translations are selected independently from GTK/libadwaita's built-in
+  strings, which continue to follow the system locale.
 
 To add a translation, add a Fluent catalog under `crates/kito-i18n/locales/`, register
 it in `crates/kito-i18n/src/lib.rs`, extend the language choice and locale resolution,
