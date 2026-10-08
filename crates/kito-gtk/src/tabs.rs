@@ -144,10 +144,6 @@ impl NavHistory {
         self.current.borrow().clone()
     }
 
-    fn shared_current(&self) -> Rc<RefCell<String>> {
-        self.current.clone()
-    }
-
     fn can_go_back(&self) -> bool {
         !self.back.borrow().is_empty()
     }
@@ -512,6 +508,9 @@ pub struct TabManager {
     show_hidden: Rc<Cell<bool>>,
     preferences: Rc<RefCell<Preferences>>,
     tabs: RefCell<Vec<Rc<FileTab>>>,
+    /// Open background menu, if any: closed on tab switch and navigation so
+    /// actions can never land on the wrong folder.
+    bg_menu: RefCell<Option<gtk::PopoverMenu>>,
 }
 
 impl TabManager {
@@ -534,6 +533,7 @@ impl TabManager {
             show_hidden,
             preferences,
             tabs: RefCell::new(Vec::new()),
+            bg_menu: RefCell::new(None),
         });
         {
             let manager = manager.clone();
@@ -580,6 +580,31 @@ impl TabManager {
 
     pub fn selected_uri(&self) -> Option<String> {
         self.selected().map(|t| t.history.current_uri())
+    }
+
+    /// Tracks the open background menu so tab switches and navigations can
+    /// close it before its captured folder goes stale.
+    pub fn track_bg_menu(&self, menu: &gtk::PopoverMenu) {
+        *self.bg_menu.borrow_mut() = Some(menu.clone());
+    }
+
+    /// Closes the tracked background menu, if still open.
+    pub fn close_bg_menu(&self) {
+        if let Some(menu) = self.bg_menu.borrow().as_ref() {
+            menu.popdown();
+        }
+    }
+
+    /// Forgets a closed background menu, unless a newer one replaced it.
+    pub fn forget_bg_menu(&self, menu: &gtk::PopoverMenu) {
+        let same = self
+            .bg_menu
+            .borrow()
+            .as_ref()
+            .is_some_and(|tracked| tracked == menu);
+        if same {
+            *self.bg_menu.borrow_mut() = None;
+        }
     }
 
     /// Loads `uri` into the selected tab (used by sidebar and up arrow).
@@ -650,7 +675,7 @@ impl TabManager {
     }
 
     /// Opens `uri` in a new tab and selects it.
-    pub fn open_tab(self: &Rc<Self>, uri: &str) {
+    pub fn open_tab(self: &Rc<Self>, uri: &str, ctx: &Rc<crate::ops::Ctx>) {
         let preferences = self.preferences.borrow().clone();
         let (scrolled, store) = file_list::build_file_view();
         // Placeholder page when the folder has no visible entries.
@@ -710,20 +735,29 @@ impl TabManager {
 
         // Right-click on the background (or the "empty folder" page):
         // rows claim the sequence, so only the empty part arrives here.
-        // Menu with "New Folder…", in trash "Empty Trash…".
+        // The menu captures this tab's folder: folder properties ignore
+        // selected files, and every action carries its own destination.
+        // In trash the menu is the dedicated empty action instead.
         let background = gtk::GestureClick::builder().button(3).build();
         background.connect_pressed({
-            let window = self.window.clone();
-            let current = tab.history.shared_current();
+            let ctx = Rc::downgrade(ctx);
+            let manager = Rc::downgrade(self);
+            let tab = Rc::downgrade(&tab);
             move |gesture, _, x, y| {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 let Some(anchor) = gesture.widget() else {
                     return;
                 };
-                if is_trash_uri(&current.borrow()) {
-                    crate::context_menu::show_trash_background(&anchor, x, y, &window);
+                let (Some(ctx), Some(manager), Some(tab)) =
+                    (ctx.upgrade(), manager.upgrade(), tab.upgrade())
+                else {
+                    return;
+                };
+                let dest = tab.history.current_uri();
+                if dest.starts_with("trash:") {
+                    crate::context_menu::show_trash_background_for(&anchor, x, y, &manager);
                 } else {
-                    crate::context_menu::show_background(&anchor, x, y, &window);
+                    crate::context_menu::show_background_for(&anchor, x, y, &ctx, &dest, &manager);
                 }
             }
         });

@@ -123,6 +123,16 @@ impl ClipTracker {
         CutFinish::Partial
     }
 
+    /// Synchronous paste hint for menu enablement: true only while internal
+    /// entries are still valid (never stale: external changes clear them).
+    /// Foreign-app content needs a format peek by the caller. No I/O here,
+    /// never blocks.
+    pub(crate) fn has_usable_entries(&self) -> bool {
+        self.entries
+            .as_ref()
+            .is_some_and(|entries| !entries.uris.is_empty())
+    }
+
     fn resolve(&self, text: Option<&str>, read_generation: u64) -> PasteDecision {
         if read_generation != self.generation {
             return PasteDecision::Stale;
@@ -274,6 +284,14 @@ impl Ctx {
         let Some(dest) = self.manager.selected_uri() else {
             return;
         };
+        self.paste_at(&dest);
+    }
+
+    /// Pastes into an explicit folder: same guards as [`Self::paste`], but
+    /// the destination is fixed (background menu) instead of following the
+    /// selected tab.
+    pub fn paste_at(&self, dest: &str) {
+        let dest = dest.to_string();
         let Some(display) = gdk::Display::default() else {
             self.toast(&crate::l10n::tr("clip-empty"));
             return;
@@ -682,11 +700,11 @@ impl Ctx {
         );
     }
 
-    /// New folder in the current folder (background menu, Ctrl+Shift+N).
-    pub fn new_folder(&self) {
-        let Some(dest) = self.manager.selected_uri() else {
-            return;
-        };
+    /// New folder with an explicit destination (background menu).
+    /// [`Self::new_folder`] keeps the selected-tab behavior for the shared
+    /// action and shortcuts.
+    pub fn new_folder_at(&self, dest: &str) {
+        let dest = dest.to_string();
         let this = self.clone();
         self.name_dialog(
             &crate::l10n::tr("new-folder-title"),
@@ -703,12 +721,18 @@ impl Ctx {
         );
     }
 
-    /// New file: the type chosen from the "Create" menu is only the initial
-    /// suggested name, the real name is always written by the user.
-    pub fn new_file(&self, template: String) {
+    /// New folder in the current folder (shared action, Ctrl+Shift+N).
+    pub fn new_folder(&self) {
         let Some(dest) = self.manager.selected_uri() else {
             return;
         };
+        self.new_folder_at(&dest);
+    }
+
+    /// New file with an explicit destination (background menu).
+    /// [`Self::new_file`] keeps the selected-tab behavior for the shared
+    /// action.
+    pub fn new_file_at(&self, dest: &str, template: String) {
         if !dest.starts_with("file://") {
             self.error_dialog(
                 &crate::l10n::tr("term-cannot-here"),
@@ -716,6 +740,7 @@ impl Ctx {
             );
             return;
         }
+        let dest = dest.to_string();
         let this = self.clone();
         self.name_dialog(
             &crate::l10n::tr("new-file-title"),
@@ -732,6 +757,15 @@ impl Ctx {
         );
     }
 
+    /// New file: the chosen type is only the initial suggested name, the
+    /// real name is always written by the user.
+    pub fn new_file(&self, template: String) {
+        let Some(dest) = self.manager.selected_uri() else {
+            return;
+        };
+        self.new_file_at(&dest, template);
+    }
+
     /// Opens the system terminal in the current folder.
     pub fn open_terminal(&self) {
         self.launch_terminal(false);
@@ -742,13 +776,13 @@ impl Ctx {
         self.launch_terminal(true);
     }
 
-    fn launch_terminal(&self, root: bool) {
-        let Some(uri) = self.manager.selected_uri() else {
-            return;
-        };
+    /// Terminal in an explicit folder (background menu). Same guards as
+    /// [`Self::launch_terminal`]: local paths only, configured emulator,
+    /// errors reported at operation time.
+    pub fn open_terminal_at(&self, dest_uri: &str, root: bool) {
         // Real local path via GIO (decoded: spaces, Unicode, `%`, `#`...).
         // `None` on non-local locations: refuse with a clear message.
-        let Some(path) = kito_core::uri_to_path(&uri) else {
+        let Some(path) = kito_core::uri_to_path(dest_uri) else {
             self.error_dialog(
                 &crate::l10n::tr("term-cannot-here"),
                 crate::l10n::tr("term-local-only"),
@@ -766,6 +800,13 @@ impl Ctx {
         }
     }
 
+    fn launch_terminal(&self, root: bool) {
+        let Some(uri) = self.manager.selected_uri() else {
+            return;
+        };
+        self.open_terminal_at(&uri, root);
+    }
+
     /// Properties: the selected entry (if just one) or the folder.
     pub fn show_properties(&self) {
         let selected = self.manager.selected_objects();
@@ -777,7 +818,20 @@ impl Ctx {
         if uri.is_empty() {
             return;
         }
-        let info = match kito_core::props(&uri) {
+        self.show_properties_for(&uri);
+    }
+
+    /// Properties of an explicit folder URI (background menu): ignores any
+    /// selected file without clearing the selection.
+    pub fn show_folder_properties(&self, dest_uri: &str) {
+        if dest_uri.is_empty() {
+            return;
+        }
+        self.show_properties_for(dest_uri);
+    }
+
+    fn show_properties_for(&self, uri: &str) {
+        let info = match kito_core::props(uri) {
             Ok(info) => info,
             Err(e) => {
                 self.error_dialog(&crate::l10n::tr("error-props"), e.to_string());
@@ -855,7 +909,7 @@ impl Ctx {
         grid.append(&prop_row(&crate::l10n::tr("props-type"), &type_label));
         let size = if info.is_dir {
             // Best-effort count: big folders don't block.
-            kito_core::list_dir(&uri, true)
+            kito_core::list_dir(uri, true)
                 .map(|entries| crate::l10n::tr_num("props-size-items", entries.len() as u64))
                 .unwrap_or_else(|_| "—".to_string())
         } else {
@@ -921,7 +975,6 @@ fn prop_row(label: &str, value: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// Delivery through the channel future. One test (not two) so parallel
     /// test threads never contend for default-context ownership.

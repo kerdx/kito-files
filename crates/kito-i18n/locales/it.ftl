@@ -19,6 +19,9 @@ menu-new-html = Pagina HTML
 menu-open-terminal = Apri terminale
 menu-open-terminal-root = Apri terminale come root
 menu-empty-trash = Svuota cestino…
+bg-new-folder = Nuova cartella…
+bg-new-file = Nuovo file…
+bg-folder-properties = Proprietà della cartella
 
 ## Barra superiore
 nav-back = Indietro

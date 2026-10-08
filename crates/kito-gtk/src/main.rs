@@ -842,7 +842,13 @@ fn build_window(
         let path_completion_invalidator = path_completion_invalidator.clone();
         let crumbs_scroll = crumbs_scroll.clone();
         let set_status = set_status.clone();
+        let manager_slot = manager_slot.clone();
         move |uri: &str, n: usize, mode: ViewMode| {
+            // A completed navigation (or tab switch) retires any open
+            // background menu: its captured folder may no longer apply.
+            if let Some(manager) = manager_slot.borrow().as_ref() {
+                manager.close_bg_menu();
+            }
             if let Some(invalidate) = path_completion_invalidator.borrow().as_ref() {
                 invalidate();
             }
@@ -1176,11 +1182,12 @@ fn build_window(
 
     new_tab_button.connect_clicked({
         let manager = manager.clone();
+        let ctx = ctx.clone();
         move |_| {
             let uri = manager
                 .selected_uri()
                 .unwrap_or_else(|| format!("file://{}", glib::home_dir().display()));
-            manager.open_tab(&uri);
+            manager.open_tab(&uri, &ctx);
         }
     });
 
@@ -1191,10 +1198,10 @@ fn build_window(
 
     if initial_uris.is_empty() {
         let home = glib::home_dir();
-        manager.open_tab(&format!("file://{}", home.display()));
+        manager.open_tab(&format!("file://{}", home.display()), &ctx);
     } else {
         for uri in &initial_uris {
-            manager.open_tab(uri);
+            manager.open_tab(uri, &ctx);
         }
     }
 }

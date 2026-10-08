@@ -19,6 +19,9 @@ menu-new-html = HTML Page
 menu-open-terminal = Open Terminal
 menu-open-terminal-root = Open Terminal as Root
 menu-empty-trash = Empty Trash…
+bg-new-folder = New Folder…
+bg-new-file = New File…
+bg-folder-properties = Folder Properties
 
 ## Header bar
 nav-back = Back

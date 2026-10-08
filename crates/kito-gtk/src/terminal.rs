@@ -219,6 +219,40 @@ pub fn display_name(program: &str) -> String {
     format!("{pretty} ({program})")
 }
 
+/// Whether `open(dir, root, choice)` could succeed with `available`
+/// programs installed, without spawning anything. Mirrors the selection
+/// logic for menu enablement: a missing preferred emulator falls back to
+/// automatic detection, an unknown one never works.
+pub fn can_open(root: bool, choice: &TerminalChoice, available: &[String]) -> bool {
+    fn known_with_root(program: &str, root: bool) -> bool {
+        TERMINALS
+            .iter()
+            .find(|terminal| terminal.prog == program)
+            .is_some_and(|terminal| !root || terminal.root.is_some())
+    }
+    match choice {
+        TerminalChoice::Automatic => {
+            if root {
+                TERMINALS
+                    .iter()
+                    .any(|t| t.root.is_some() && available.iter().any(|a| a == t.prog))
+            } else {
+                !available.is_empty()
+            }
+        }
+        TerminalChoice::Emulator(program) => {
+            if available.iter().any(|name| name == program) {
+                known_with_root(program, root)
+            } else if root {
+                TERMINALS
+                    .iter()
+                    .any(|t| t.root.is_some() && available.iter().any(|a| a == t.prog))
+            } else {
+                !available.is_empty()
+            }
+        }
+    }
+}
 /// Picks the first available terminal and builds `(program, args)`,
 /// without spawning anything. Testable with a fake table.
 /// A normal launch may validly have zero arguments (the workdir is set
@@ -456,5 +490,36 @@ mod tests {
             spawn_command("/bin/does-not-exist-kito", &[], &tmp),
             Err(TerminalError::Launch(_))
         ));
+    }
+
+    fn available_of(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn can_open_matches_selection_logic() {
+        let auto = TerminalChoice::Automatic;
+        assert!(!can_open(false, &auto, &[]));
+        assert!(!can_open(true, &auto, &[]));
+        // Only foot (no root support) installed.
+        let foot = available_of(&["foot"]);
+        assert!(can_open(false, &auto, &foot));
+        assert!(!can_open(true, &auto, &foot));
+        // Kitty supports root.
+        let kitty = available_of(&["kitty"]);
+        assert!(can_open(false, &auto, &kitty));
+        assert!(can_open(true, &auto, &kitty));
+
+        // Preferred emulator present and known.
+        let pref_foot = TerminalChoice::Emulator("foot".to_string());
+        assert!(can_open(false, &pref_foot, &foot));
+        assert!(!can_open(true, &pref_foot, &foot));
+        // Preferred emulator unknown to the table: never works directly.
+        let pref_odd = TerminalChoice::Emulator("odd-term".to_string());
+        assert!(!can_open(false, &pref_odd, &available_of(&["odd-term"])));
+        // Missing preferred emulator falls back to automatic detection.
+        assert!(can_open(false, &pref_foot, &kitty));
+        assert!(can_open(true, &pref_foot, &kitty));
+        assert!(!can_open(false, &pref_foot, &[]));
     }
 }
