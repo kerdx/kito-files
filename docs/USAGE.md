@@ -83,7 +83,7 @@ supports one item at a time.
 - Properties dialog with name, location, type, size and modification time
 - Context menus for files, empty space, and the Trash
 - The empty-space menu uses compact icon rows without a scrollbar, matching
-  file menus; **New File** opens a native submenu
+  file menus; **New File** opens a separate submenu with icons for each file type
 - The empty-space menu uses the folder and tab where it was opened. Folder
   Properties there ignore any existing file selection without clearing it.
 

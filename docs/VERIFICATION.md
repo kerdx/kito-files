@@ -11,7 +11,7 @@ a missing feature or unmet roadmap requirement is not a pass.
 The automated run used the workspace checkout on Linux with Rust 1.98.1,
 GTK 4.22.5 and libadwaita 1.9.4. `cargo fmt --all --check`,
 `./scripts/check.sh` and `cargo build --workspace --locked` were run; the check
-script passed 36 `kito-core`, 92 `kito-gtk` and 11 `kito-i18n` tests plus
+script passed 36 `kito-core`, 91 `kito-gtk` and 11 `kito-i18n` tests plus
 Clippy. It filtered out the session-Trash integration test. No GTK interaction
 was observed. The host exposed `WAYLAND_DISPLAY=wayland-0`, `DISPLAY=:0` and
 `GDK_BACKEND=x11`, but those variables do not establish which backend the app
@@ -23,7 +23,7 @@ files, real Trash contents or real clipboard were used.
 | ID | Requisito e risultato atteso | Tipo | Ambiente/backend effettivo | Esito | Evidenza, limiti e lavoro residuo |
 |---|---|---|---|---|---|
 | B01-1 | Menu sullo sfondo con icone e senza barra di scorrimento, con e senza selezione; Proprietà descrive la cartella e lascia intatta la selezione. | Automatica, sorgenti, grafica | Test headless Linux; backend GUI non osservato | NON ESEGUITO | Struttura del modello e codici azione coperti dai test; layout custom ispezionato nei sorgenti. Controllare entrambi i casi e la selezione in GUI. |
-| B01-2 | Sottomenu Nuovo file, clic fuori, Escape, navigazione da tastiera e aperture ripetute senza chiusure errate o callback residue. | Automatica, grafica | Test headless Linux; backend GUI non osservato | NON ESEGUITO | Il sottomenu resta un `PopoverMenu` nativo; le interazioni GTK non sono state esercitate. |
+| B01-2 | Sottomenu Nuovo file con icone per ciascun tipo, clic fuori, Escape, navigazione da tastiera e aperture ripetute senza chiusure errate o callback residue. | Automatica, grafica | Test headless Linux; backend GUI non osservato | NON ESEGUITO | Azioni e icone (file vuoto, testo, HTML) coperte dai test; interazioni GTK non esercitate. |
 | B01-3 | Il menu del cestino mantiene le azioni dedicate e le conferme distruttive. | Automatica, sorgenti, grafica | Test headless Linux; test Trash reale escluso | NON ESEGUITO | Test modello menu passato; non è stato aperto né svuotato il cestino. Eseguire in sessione isolata. |
 | B02-1 | Sotto 200 ms non compare l’indicatore; dopo 200 ms compare overlay piccolo con spinner, testo e Interrompi; nessuna durata minima. | Automatica, grafica | Logica unit test headless Linux; backend GUI non osservato | SUPERATO (logica) | Testa generazione e soglia della logica; tempi di rendering e risposta visiva non misurati. |
 | B02-2 | Navigazioni rapide/out-of-order applicano solo la destinazione più recente; cronologia e vista restano coerenti. | Automatica, sorgenti, grafica | Test headless Linux; backend GUI non osservato | SUPERATO (stato) | Test di generazioni, risultati fuori ordine, errore e cronologia passati; manca prova di navigazione interattiva. |

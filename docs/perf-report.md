@@ -169,7 +169,7 @@ and the `sortbench` binaries built under each profile.
 
 ## Regression tests
 
-The Phase 0 run passed `./scripts/check.sh`: 36 `kito-core`, 92 `kito-gtk`
+The Phase 0 run passed `./scripts/check.sh`: 36 `kito-core`, 91 `kito-gtk`
 and 11 `kito-i18n` tests, plus Clippy. `cargo fmt --all --check` and
 `cargo build --workspace --locked` also passed. The script excludes the
 session-Trash integration test; GTK menu/overlay/dialog interaction tests were

@@ -1,9 +1,9 @@
 //! Context menus.
 //!
 //! File and background menus use compact custom popovers with icon + label
-//! rows. The New File submenu uses a native `gio::Menu` in a
-//! `gtk::PopoverMenu`, so GTK owns its keyboard traversal and dismissal.
-//! No timers or pointer grabs are used.
+//! rows. New File uses a second icon-row popover attached to a GTK menu button,
+//! so dismissing it leaves the main menu open. No timers or pointer grabs are
+//! used.
 
 use crate::{ops, tabs::TabManager};
 use adw::prelude::*;
@@ -204,7 +204,7 @@ pub fn show_trash(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::Applicatio
 
 // ---------------------------------------------------------------------------
 // Background menu: compact custom popover with icon + label rows, matching
-// file menus. Its New File submenu is a native PopoverMenu. Actions live in a
+// file menus. New File has its own icon-row popover. Actions live in a
 // transient `bg` group bound to the captured folder; shared `win.*` actions
 // keep their availability.
 // ---------------------------------------------------------------------------
@@ -479,27 +479,6 @@ fn vertical_side(anchor: &gtk::Widget, y: f64, natural_h: i32) -> gtk::PositionT
     }
 }
 
-fn append_bg_row(menu: &gio::Menu, row: &BgRow) {
-    let label = crate::l10n::tr(row.label);
-    let action = if row.sub.is_some() {
-        // The action only controls whether the submenu can be opened. Its
-        // children each have their own operation-time action.
-        Some("bg.can-create-file")
-    } else {
-        Some(row.action)
-    };
-    let item = gio::MenuItem::new(Some(&label), action);
-    item.set_icon(&gio::ThemedIcon::from_names(row.icons));
-    if let Some(children) = row.sub {
-        let submenu = gio::Menu::new();
-        for child in children {
-            append_bg_row(&submenu, child);
-        }
-        item.set_submenu(Some(&submenu));
-    }
-    menu.append_item(&item);
-}
-
 fn bg_row_content(row: &BgRow, submenu: bool) -> gtk::Box {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -548,15 +527,44 @@ fn append_bg_widget(
             }
         });
 
-        let model = gio::Menu::new();
-        for child in children {
-            append_bg_row(&model, child);
-        }
-        let submenu = gtk::PopoverMenu::from_model(Some(&model));
+        let submenu = gtk::Popover::new();
         submenu.insert_action_group("bg", Some(group));
         submenu.set_has_arrow(false);
         submenu.add_css_class("ctx-menu");
         submenu.set_position(gtk::PositionType::Right);
+        let submenu_list = menu_box();
+        for child in children {
+            let child_button = gtk::Button::builder().has_frame(false).build();
+            child_button.add_css_class("ctx-row");
+            child_button.set_hexpand(true);
+            child_button.set_child(Some(&bg_row_content(child, false)));
+            let action_name = child
+                .action
+                .strip_prefix("bg.")
+                .expect("submenu actions use the captured bg group");
+            let action = group
+                .lookup_action(action_name)
+                .and_downcast::<gio::SimpleAction>()
+                .expect("submenu action is registered");
+            child_button.set_sensitive(action.is_enabled());
+            let weak_button = child_button.downgrade();
+            action.connect_notify_local(Some("enabled"), move |action, _| {
+                if let Some(button) = weak_button.upgrade() {
+                    button.set_sensitive(action.is_enabled());
+                }
+            });
+            let weak_submenu = submenu.downgrade();
+            let group = group.clone();
+            let action_name = action_name.to_string();
+            child_button.connect_clicked(move |_| {
+                if let Some(submenu) = weak_submenu.upgrade() {
+                    submenu.popdown();
+                }
+                group.activate_action(&action_name, None);
+            });
+            submenu_list.append(&child_button);
+        }
+        submenu.set_child(Some(&submenu_list));
         button.set_popover(Some(&submenu));
         list.append(&button);
     } else {
@@ -584,8 +592,8 @@ fn append_bg_widget(
 }
 
 /// Builds the same compact, icon-row layout as the file menu. The main
-/// popover contains no scrolled window. GTK owns the native child submenu's
-/// focus, keyboard traversal, Escape and outside-click dismissal.
+/// popover contains no scrolled window. The child popover has separate icon
+/// rows and can be dismissed independently with Escape or an outside click.
 fn popup_bg(
     anchor: &gtk::Widget,
     x: f64,
@@ -829,7 +837,10 @@ mod tests {
             sub.iter().map(|row| row.action).collect::<Vec<_>>(),
             vec!["bg.new-empty-file", "bg.new-text-file", "bg.new-html-page"]
         );
-        assert!(sub.iter().all(|row| !row.icons.is_empty()));
+        assert_eq!(
+            sub.iter().map(|row| row.icons[0]).collect::<Vec<_>>(),
+            vec!["document-new", "text-x-generic", "text-html"]
+        );
         // No Word/Spreadsheet placeholders anywhere, submenu included.
         for section in bg_sections(true) {
             for row in section.iter() {
@@ -904,30 +915,5 @@ mod tests {
             writability_update("file:///a", Some("file:///a"), Ok(false)),
             Some(false)
         );
-    }
-
-    /// The menu model carries submenu structure and each child action.
-    #[test]
-    fn background_menu_uses_native_submenu_model() {
-        let menu = gio::Menu::new();
-        append_bg_row(&menu, &BG_CREATE_ROWS[1]);
-        assert_eq!(menu.n_items(), 1);
-        let submenu = menu
-            .item_link(0, gio::MENU_LINK_SUBMENU)
-            .expect("New File has a native submenu");
-        assert_eq!(submenu.n_items(), 3);
-        for index in 0..submenu.n_items() {
-            assert!(submenu
-                .item_attribute_value(index, gio::MENU_ATTRIBUTE_ACTION, None)
-                .and_then(|value| value.get::<String>())
-                .is_some_and(|action| action.starts_with("bg.new-")));
-        }
-
-        let _ = gtk::init();
-        let Some(_) = gdk::Display::default() else {
-            return;
-        };
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        assert!(!popover.has_arrow());
     }
 }
