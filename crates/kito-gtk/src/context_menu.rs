@@ -440,6 +440,11 @@ fn vertical_side(anchor: &gtk::Widget, y: f64, natural_h: i32) -> gtk::PositionT
 /// Opens a native background menu for `dest` and tracks it for
 /// tab-switch/navigation invalidation. The popover unparents itself on
 /// close; repeated openings accumulate nothing.
+///
+/// Presentation is deferred by one idle (like `GtkMenuButton` does): the
+/// menu tracker's build idles run first, so measuring and popup use final
+/// content instead of growing after mapping, which would force a
+/// scrollbar. No nested loop pumping inside the input handler.
 fn popup_native(
     anchor: &gtk::Widget,
     x: f64,
@@ -447,6 +452,7 @@ fn popup_native(
     model: &gio::Menu,
     group: Option<(&str, &gio::SimpleActionGroup)>,
     manager: &Rc<TabManager>,
+    dest: &str,
 ) -> gtk::PopoverMenu {
     // NESTED (not the from_model SLIDING default): traditional side
     // submenus with the `>` indicator. GTK builds nested submenu popovers
@@ -454,33 +460,42 @@ fn popup_native(
     // gtkmenusectionbox.c), so one call here covers every level.
     let popover = gtk::PopoverMenu::from_model_full(model, gtk::PopoverMenuFlags::NESTED);
     popover.set_has_arrow(false);
-    // Flush the menu tracker's build idles (rows, nested submenus,
-    // separators) before presenting, so the popover measures final content
-    // instead of growing after mapping, which would force a scrollbar.
-    // Bounded: drains only already-queued work, never waits or sleeps.
-    let context = glib::MainContext::default();
-    for _ in 0..100 {
-        if !context.iteration(false) {
-            break;
-        }
-    }
     if let Some((name, group)) = group {
         popover.insert_action_group(name, Some(group));
     }
-    popover.set_parent(anchor);
-    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    let (_, natural_h, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
-    popover.set_position(vertical_side(anchor, y, natural_h));
-    manager.track_bg_menu(&popover);
-    let tracked = popover.clone();
+    let anchor_weak = anchor.downgrade();
     let manager_weak = Rc::downgrade(manager);
-    popover.connect_closed(move |popover| {
-        popover.unparent();
-        if let Some(manager) = manager_weak.upgrade() {
-            manager.forget_bg_menu(&tracked);
+    let dest = dest.to_string();
+    let popup = popover.clone();
+    glib::idle_add_local_once(move || {
+        let (Some(anchor), Some(manager)) = (anchor_weak.upgrade(), manager_weak.upgrade()) else {
+            return;
+        };
+        // Stale press (navigated or switched tabs meanwhile): the tracked
+        // close on navigation covers the rest.
+        let fresh = manager
+            .selected_uri()
+            .as_deref()
+            .is_some_and(|current| current == dest);
+        if !fresh {
+            return;
         }
+        let popover = popup;
+        popover.set_parent(&anchor);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let (_, natural_h, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
+        popover.set_position(vertical_side(&anchor, y, natural_h));
+        manager.track_bg_menu(&popover);
+        let tracked = popover.clone();
+        let manager_weak = Rc::downgrade(&manager);
+        popover.connect_closed(move |popover| {
+            popover.unparent();
+            if let Some(manager) = manager_weak.upgrade() {
+                manager.forget_bg_menu(&tracked);
+            }
+        });
+        popover.popup();
     });
-    popover.popup();
     popover
 }
 
@@ -560,7 +575,7 @@ pub fn show_background_for(
         dest,
         ops::Ctx::show_folder_properties,
     );
-    let popover = popup_native(anchor, x, y, &model, Some(("bg", &group)), manager);
+    let popover = popup_native(anchor, x, y, &model, Some(("bg", &group)), manager, dest);
     refine_writability(
         dest,
         manager,
@@ -572,9 +587,15 @@ pub fn show_background_for(
 
 /// Right-click on the trash background: the dedicated empty action with
 /// its destructive confirmation.
-pub fn show_trash_background_for(anchor: &gtk::Widget, x: f64, y: f64, manager: &Rc<TabManager>) {
+pub fn show_trash_background_for(
+    anchor: &gtk::Widget,
+    x: f64,
+    y: f64,
+    dest: &str,
+    manager: &Rc<TabManager>,
+) {
     let model = trash_bg_menu_model();
-    popup_native(anchor, x, y, &model, None, manager);
+    popup_native(anchor, x, y, &model, None, manager, dest);
 }
 
 #[cfg(test)]

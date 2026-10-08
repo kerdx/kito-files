@@ -755,7 +755,7 @@ impl TabManager {
                 };
                 let dest = tab.history.current_uri();
                 if dest.starts_with("trash:") {
-                    crate::context_menu::show_trash_background_for(&anchor, x, y, &manager);
+                    crate::context_menu::show_trash_background_for(&anchor, x, y, &dest, &manager);
                 } else {
                     crate::context_menu::show_background_for(&anchor, x, y, &ctx, &dest, &manager);
                 }
