@@ -64,33 +64,42 @@ Worker wakeup: the old `run_in_thread` polls `try_recv` from an idle
 callback. During a 1 s job the probe counted **≈850k–1.1M idle
 invocations/s** — the main loop never sleeps.
 
-## 1. Async directory loading — implemented
+## 1. Async directory loading — implemented; GUI timing not remeasured
 
-`FileTab::navigate` now resolves the target, bumps a per-tab generation id
-(`LoadGen`), shows a discreet loading page (spinner + `loading-folder`,
-distinct from the empty-folder page) and enumerates+sorts in a worker
-thread. Results travel via a bounded `async-channel` (wakes the loop once)
-and are applied only if the tab is alive and the id is still current.
-History commits only on success, so failed loads leave URI, stacks, store
-and previous content untouched; store and current URI always move together
-in `apply_loaded`, and chunked inserts check the id on every turn.
+`FileTab::navigate` bumps a per-tab generation id (`LoadGen`), starts
+cancellable GIO enumeration and sorting in a worker thread, and schedules the
+loading overlay for 200 ms later. A fast result never displays the overlay;
+there is no minimum duration. The existing listing and path stay together
+while a new target loads. Once listing succeeds, rows are prepared in bounded
+500-row chunks in a staging store, then swapped in one operation with the new
+path/history. A failed or cancelled request keeps the previous folder. A
+successful empty listing alone selects the empty-folder page.
 
-Effect: UI-thread blocking per navigation goes from ~475 ms (50k) to ~0
-plus ≤500-row main-thread chunks (sub-ms each). Total wall time unchanged
-(worker still enumerates), but the interface stays responsive with explicit
-loading state. Cancellation = newer id discards older results; tab close =
-weak upgrade fails; partial loads can only reference the single new folder.
+The delayed indicator, worker results and each chunk check the request
+generation. Tab destruction cancels the GIO request and drops staged work.
+Enumeration observes `gio::Cancellable`; sorting is a blocking standard Rust
+sort that cannot be interrupted mid-sort, so cancellation during that phase
+is honored after sorting. Results travel through a bounded `async-channel`
+without main-loop polling.
+
+Each load logs enumeration time, sorting time and, separately, model build / UI
+application wall time. The latter includes scheduling the idle chunks and is
+not a pure CPU measurement. These logs make phase comparison possible, but no
+new GUI timing or visual responsiveness measurements were captured for this
+change. Earlier measurements below are historical results from the prior
+implementation; they do not verify the new 200 ms indicator or establish a
+current end-to-end speedup. Moving the read/sort off the GTK thread changes
+responsiveness, not the total amount of filesystem work.
 
 ## 2. Bulk model update — implemented
 
-`file_list::reload` and the async path use one `splice` per batch instead
-of per-row `append`: ~3× faster at 50k (15.0 → 5.1 ms) and 1001 → 1 model
-notifications per 1000 rows. Large loads stream in `LOAD_CHUNK = 500`
-splices so no single main-loop turn grows with folder size
-(chunked ≈ single-splice total time). `FileObject` creation stays on the
-main thread but is likewise bounded per turn. Selection restore
-(`select_uri`), counts, view mode and per-tab state are preserved; empty
-vs list page logic unchanged.
+`file_list::reload` and the async path use `splice` instead of per-row
+`append`, and the async path stages entries in `LOAD_CHUNK = 500` batches.
+`FileObject` creation stays on the main thread and is bounded per turn; the
+staging store is committed atomically at the end. Existing benchmark numbers
+below describe the earlier model path and should not be read as timings for the
+current staged swap. Same-folder refresh preserves selection; navigation to a
+different folder clears it. View mode and hidden-file preference remain per-tab.
 
 ## 3. Cached sort keys — implemented
 
@@ -128,8 +137,8 @@ either a second full enumeration (2× I/O, 2 round-trips on remote
 backends) or per-file `query_info` (N round-trips — unacceptable on
 `smb`/`sftp`), plus visible-row tracking, concurrency caps and
 cancellation for the fill-in phase. With §1 the full cost already runs
-off-thread behind a loading indicator, placeholders already exist in the
-factories, and Details view needs sizes anyway. Verdict: keep the single
+off-thread behind the optional delayed loading overlay, placeholders already
+exist in the factories, and Details view needs sizes anyway. Verdict: keep the single
 full enumeration (one round-trip, remote-safe); the async move captures
 the responsiveness win without the N+1 risk.
 
@@ -158,39 +167,35 @@ Verdict: `3` buys nothing measurable here and costs +31% size, so
 then `/usr/bin/time -f "elapsed=%e maxrss=%M KB" ./target/release/kito-files --help`
 and the `sortbench` binaries built under each profile.
 
-## Regression tests (all headless, temp dirs only)
+## Regression tests
 
-- `kito-core`: dirs-first/case-insensitive/Unicode/equal-key order;
-  icon strings parse via `Icon::for_string`.
-- `kito-gtk file_list`: single-notification `replace_all`, chunked ==
-  single-shot content/order, empty-chunk no-op.
-- `kito-gtk ops`: `run_in_thread` delivers values and errors on the loop.
-- `kito-gtk tabs`: `LoadGen` supersede chains; out-of-order + failed
-  results never commit (history/stacks intact); `settled_child` keeps
-  loading/empty/list distinct incl. failed-first-load legacy look;
-  closed-tab weak-drop contract.
-- Existing history/hidden/selection suites unchanged and passing.
+The Phase 0 run passed `./scripts/check.sh`: 36 `kito-core`, 92 `kito-gtk`
+and 11 `kito-i18n` tests, plus Clippy. `cargo fmt --all --check` and
+`cargo build --workspace --locked` also passed. The script excludes the
+session-Trash integration test; GTK menu/overlay/dialog interaction tests were
+not run because no controllable graphical surface was available.
 
-`cargo test --workspace` (35 + 78 + 11), `cargo check --workspace`,
-`cargo fmt --check` green. `cargo clippy -- -D warnings` still fails only
-on pre-existing lints in untouched code (`kito-core` doc indentation,
-`kito-i18n` `question_mark`); no new lints from this work.
-One new test initially raced two threads for default-context ownership and
-was merged into a single sequential delivery test (stable over repeats).
+Relevant coverage includes GIO cancellation, symlink-safe deletion and
+copy-into-self rejection (including symlink destinations), restore collision
+and non-UTF-8 metadata, context menu action/model structure, delayed indicator
+generation, cancellation invalidation, out-of-order navigation state, and
+clipboard generation / failed-only cut retries. These are unit and source
+contract checks; they do not replace graphical verification.
 
 ## Limits / not covered
 
 - No `perf`/flamegraphs (tool unavailable); CPU claims rest on idle-count
   probes and wall-time splits, not sampled profiles.
-- Graphical check on Wayland only, no pixel capture: a private-bus instance
-  with a 3000-entry folder stayed alive with no app errors (only sandbox
-  a11y warnings from the isolated bus); spinner position and chunk
-  smoothness were not captured frame-by-frame. X11 not tested. No cold-cache
-  system-wide numbers (caches of other apps never cleared by design).
+- Earlier historical notes about a Wayland private-bus launch are not evidence
+  for the Phase 0 changes. For Phase 0, no interactive GUI result or actual
+  GTK backend was observed; Wayland and X11 remain unverified. No cold-cache
+  system-wide numbers were collected (caches of other apps were not cleared).
 - One worker thread per navigation: rapid retargeting can briefly run two
   enumerations concurrently; stale ones exit after delivery without
   touching the UI. No thread pool / unbounded parallelism added.
-- Folder size counting in Properties still enumerates synchronously;
-  single-file trash stays synchronous (fast path, unchanged behavior).
+- Properties folder-size enumeration and remaining operation completion paths
+  still need manual responsiveness review on large/remote folders.
+- The 200 ms threshold, visible overlay behavior, keyboard cancellation and
+  rendering smoothness have not been measured in a real GUI session.
 - Deferred metadata (§5) not implemented by measurement-backed decision;
   `opt-level` (§6) kept at `z` by measurement.

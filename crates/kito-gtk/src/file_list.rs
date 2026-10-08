@@ -331,6 +331,8 @@ pub fn build_view(
     open_items: OpenItems,
 ) -> (gtk::Widget, gtk::SingleSelection) {
     let selection = gtk::SingleSelection::new(Some(store.clone()));
+    selection.set_autoselect(false);
+    selection.set_can_unselect(true);
     let widget: gtk::Widget = match mode {
         ViewMode::Icons => build_icons(selection.clone(), on_secondary).upcast(),
         ViewMode::Compact => build_compact(selection.clone(), on_secondary).upcast(),
@@ -370,6 +372,7 @@ pub const LOAD_CHUNK: usize = 500;
 
 /// Replaces the whole store content with `entries` in a single `splice`:
 /// one model notification instead of one per row.
+#[cfg(test)]
 pub fn replace_all(store: &gio::ListStore, entries: &[kito_core::Entry]) {
     let objs: Vec<FileObject> = entries.iter().map(FileObject::new).collect();
     store.splice(0, store.n_items(), &objs);

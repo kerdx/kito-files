@@ -22,10 +22,12 @@ pub struct FileTab {
     page: adw::TabPage,
     store: gio::ListStore,
     scrolled: gtk::ScrolledWindow,
-    /// List, "empty folder" or loading page.
+    /// List or confirmed empty-folder page. Loading is a transient overlay.
     stack: gtk::Stack,
     empty_page: adw::StatusPage,
     loading_label: gtk::Label,
+    loading_panel: gtk::Box,
+    loading_stop: gtk::Button,
     selection: RefCell<gtk::SingleSelection>,
     mode: Cell<ViewMode>,
     open_items: Cell<OpenItems>,
@@ -34,11 +36,14 @@ pub struct FileTab {
     /// worker result may touch history, store and chrome. Older results are
     /// discarded, so a slow folder can never overwrite a newer one.
     load_gen: LoadGen,
+    load_cancel: RefCell<Option<gio::Cancellable>>,
+    load_active: Cell<Option<u64>>,
     /// Hidden-view sync: the view is fresh only for the global value it
     /// was last successfully filled with.
     hidden_sync: HiddenSync,
     show_hidden: Rc<Cell<bool>>,
     window: adw::ApplicationWindow,
+    manager: std::rc::Weak<TabManager>,
     on_navigate: OnNavigate,
     on_history: OnHistory,
     on_status: OnStatus,
@@ -55,6 +60,11 @@ struct LoadGen {
     current: Cell<u64>,
 }
 
+struct ListedFolder {
+    entries: Vec<kito_core::Entry>,
+    timings: kito_core::ListTimings,
+}
+
 impl LoadGen {
     /// Starts a load: invalidates every previous one and returns the new id.
     fn start(&self) -> u64 {
@@ -68,6 +78,17 @@ impl LoadGen {
     fn is_current(&self, id: u64) -> bool {
         self.current.get() == id
     }
+
+    /// Invalidates `id` without starting a replacement navigation.
+    fn invalidate(&self, id: u64) -> bool {
+        if !self.is_current(id) {
+            return false;
+        }
+        let next = self.next.get().wrapping_add(1);
+        self.next.set(next);
+        self.current.set(next);
+        true
+    }
 }
 
 /// Visible stack child after a load settles. Success shows the empty page
@@ -79,6 +100,13 @@ fn settled_child(item_count: usize, ever_loaded: bool) -> &'static str {
     } else {
         "list"
     }
+}
+
+/// The delayed timeout is allowed to reveal the overlay only while its
+/// generation is still active. A completed fast load and an obsolete timer
+/// therefore never flash over the view.
+fn loading_indicator_due(current_id: u64, active_id: Option<u64>, id: u64) -> bool {
+    current_id == id && active_id == Some(id)
 }
 
 /// How the target was chosen: drives the history update on success.
@@ -222,18 +250,23 @@ fn rebuild_view(tab: &Rc<FileTab>) {
             }
         }
     });
-    let (widget, selection) = file_list::build_view(
-        tab.mode.get(),
-        &tab.store,
-        &on_secondary,
-        tab.open_items.get(),
-    );
+    let store = tab.store.clone();
+    let (widget, selection) =
+        file_list::build_view(tab.mode.get(), &store, &on_secondary, tab.open_items.get());
     wire_activate(tab, &widget);
     // Selection -> status bar (selected items).
     {
         let on_status = tab.on_status.clone();
-        let store = tab.store.clone();
+        let store = store.clone();
+        let manager = tab.manager.clone();
+        let page = tab.page.clone();
         selection.connect_notify_local(Some("selected-item"), move |selection, _| {
+            if !manager
+                .upgrade()
+                .is_some_and(|manager| manager.is_active_page(&page))
+            {
+                return;
+            }
             let selected = usize::from(selection.selected_item().is_some());
             on_status(store.n_items() as usize, selected);
         });
@@ -268,6 +301,8 @@ impl FileTab {
         self.empty_page.set_title(&crate::l10n::tr("empty-folder"));
         self.loading_label
             .set_text(&crate::l10n::tr("loading-folder"));
+        self.loading_stop
+            .set_label(&crate::l10n::tr("loading-interrupt"));
         rebuild_view(self);
         if let Some(uri) = selected_uri {
             self.select_uri(&uri);
@@ -285,29 +320,61 @@ impl FileTab {
         self.navigate(NavKind::Visit, uri);
     }
 
-    /// Single navigation path: resolves the target, then enumerates and
-    /// sorts it off the UI thread. History is committed only when the latest
-    /// worker result succeeds; a failed load leaves current URI, view
-    /// content and both stacks untouched and shows a dialog instead.
-    /// Store and current URI always move together, so path, selection and
-    /// file actions never refer to different folders, not even mid-load:
-    /// stale results (newer navigation, closed tab) are discarded.
+    fn cancel_current_load(&self) {
+        let Some(id) = self.load_active.get() else {
+            return;
+        };
+        self.cancel_load(id);
+    }
+
+    fn cancel_load(&self, id: u64) {
+        if !self.load_gen.invalidate(id) {
+            return;
+        }
+        if let Some(cancellable) = self.load_cancel.borrow_mut().take() {
+            cancellable.cancel();
+        }
+        self.load_active.set(None);
+        self.loading_panel.set_visible(false);
+    }
+
+    /// Single navigation path: resolves, enumerates and sorts off the UI
+    /// thread. Existing content remains visible until the complete new model
+    /// has been built in bounded chunks; only then do path, history, content
+    /// and selection change together.
     fn navigate(self: &Rc<Self>, kind: NavKind, uri: &str) {
         let Some(target) = self.history.target(kind, uri) else {
             return;
         };
         let previous = self.history.current_uri();
         let id = self.load_gen.start();
+        if let Some(cancellable) = self.load_cancel.borrow_mut().take() {
+            cancellable.cancel();
+        }
+        let cancellable = gio::Cancellable::new();
+        *self.load_cancel.borrow_mut() = Some(cancellable.clone());
+        self.load_active.set(Some(id));
+        self.loading_panel.set_visible(false);
+        if let Some(manager) = self.manager.upgrade() {
+            manager.close_bg_menu();
+        }
         let show_hidden = self.show_hidden.get();
-        // Discreet loading state, distinct from the "empty folder" page.
-        // The store keeps the previous folder until the new one succeeds.
-        self.stack.set_visible_child_name("loading");
+        let weak_for_timer = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            if let Some(tab) = weak_for_timer.upgrade() {
+                if loading_indicator_due(tab.load_gen.current.get(), tab.load_active.get(), id) {
+                    tab.loading_panel.set_visible(true);
+                }
+            }
+        });
         let weak = Rc::downgrade(self);
-        let (tx, rx) = async_channel::bounded::<Result<Vec<kito_core::Entry>, String>>(1);
+        let (tx, rx) = async_channel::bounded::<Result<ListedFolder, String>>(1);
         let worker_target = target.clone();
         std::thread::spawn(move || {
             let result =
-                kito_core::list_dir(&worker_target, show_hidden).map_err(|e| e.to_string());
+                kito_core::list_dir_with_cancellable(&worker_target, show_hidden, &cancellable)
+                    .map(|(entries, timings)| ListedFolder { entries, timings })
+                    .map_err(|e| e.to_string());
             let _ = tx.send_blocking(result);
         });
         glib::spawn_future_local(async move {
@@ -321,8 +388,11 @@ impl FileTab {
                 return;
             }
             match result {
-                Ok(entries) => tab.apply_loaded(id, kind, &previous, &target, entries, show_hidden),
-                Err(message) => tab.apply_load_error(message),
+                Ok(loaded) => tab.apply_loaded(id, kind, &previous, &target, loaded, show_hidden),
+                Err(message) => {
+                    tab.finish_loading(id);
+                    tab.apply_load_error(message);
+                }
             }
         });
     }
@@ -334,31 +404,28 @@ impl FileTab {
         kind: NavKind,
         previous: &str,
         target: &str,
-        entries: Vec<kito_core::Entry>,
+        loaded: ListedFolder,
         show_hidden: bool,
     ) {
-        self.history.commit(kind, previous, target);
-        self.emit_history();
-        self.page.set_title(&Self::title_for(target));
-        // The previous folder's selection is restored only if still listed
-        // (refresh of the same folder); navigating elsewhere clears it.
-        let keep = self.selected_objects().first().map(|obj| obj.uri());
-        if entries.is_empty() {
-            self.store.remove_all();
-            self.finish_loaded(target, keep, show_hidden, 0);
-            return;
-        }
-        // Small folders skip the idle round-trip: one bulk replace.
-        if entries.len() <= file_list::LOAD_CHUNK {
-            file_list::replace_all(&self.store, &entries);
-            self.finish_loaded(target, keep, show_hidden, entries.len());
-            return;
-        }
-        self.store.remove_all();
+        let ListedFolder { entries, timings } = loaded;
+        eprintln!(
+            "directory load: enumerate={:.3}ms sort={:.3}ms entries={}",
+            timings.enumeration.as_secs_f64() * 1000.0,
+            timings.sorting.as_secs_f64() * 1000.0,
+            entries.len()
+        );
+        let keep = if previous == target {
+            self.selected_objects().first().map(|obj| obj.uri())
+        } else {
+            None
+        };
+        let staging = gio::ListStore::new::<FileObject>();
+        let apply_started = std::time::Instant::now();
         let entries = Rc::new(entries);
         let offset = Rc::new(Cell::new(0usize));
         let weak = Rc::downgrade(self);
         let target = target.to_string();
+        let previous = previous.to_string();
         glib::idle_add_local(move || {
             let Some(tab) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -369,11 +436,24 @@ impl FileTab {
             let start = offset.get();
             let end = (start + file_list::LOAD_CHUNK).min(entries.len());
             if start < end {
-                file_list::append_chunk(&tab.store, &entries[start..end]);
+                file_list::append_chunk(&staging, &entries[start..end]);
                 offset.set(end);
             }
             if end >= entries.len() {
+                let objects: Vec<FileObject> = (0..staging.n_items())
+                    .filter_map(|index| staging.item(index).and_downcast::<FileObject>())
+                    .collect();
+                tab.selection.borrow().unselect_all();
+                tab.store.splice(0, tab.store.n_items(), &objects);
+                tab.history.commit(kind, &previous, &target);
+                tab.page.set_title(&Self::title_for(&target));
+                tab.finish_loading(id);
                 tab.finish_loaded(&target, keep.clone(), show_hidden, entries.len());
+                eprintln!(
+                    "directory model: build+apply={:.3}ms entries={}",
+                    apply_started.elapsed().as_secs_f64() * 1000.0,
+                    entries.len()
+                );
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
@@ -389,18 +469,31 @@ impl FileTab {
         }
         self.hidden_sync.mark_refreshed(show_hidden);
         self.stack.set_visible_child_name(settled_child(n, true));
-        (self.on_navigate)(target, n, self.mode.get());
-        let selected = usize::from(self.selection.borrow().selected_item().is_some());
-        (self.on_status)(n, selected);
+        if self
+            .manager
+            .upgrade()
+            .is_some_and(|manager| manager.is_active_page(&self.page))
+        {
+            (self.on_navigate)(target, n, self.mode.get());
+            let selected = usize::from(self.selection.borrow().selected_item().is_some());
+            (self.on_status)(n, selected);
+            self.emit_history();
+        }
+    }
+
+    fn finish_loading(&self, id: u64) {
+        if !self.load_gen.is_current(id) {
+            return;
+        }
+        self.load_active.set(None);
+        self.loading_panel.set_visible(false);
+        self.load_cancel.borrow_mut().take();
     }
 
     /// Failed load: history, current URI and store are untouched (the store
     /// still shows the previous folder); only the loading page is reverted
     /// and the error is reported.
     fn apply_load_error(&self, message: String) {
-        let ever_loaded = !self.history.current_uri().is_empty();
-        self.stack
-            .set_visible_child_name(settled_child(self.store.n_items() as usize, ever_loaded));
         let dialog = adw::AlertDialog::builder()
             .heading(crate::l10n::tr("error-open-folder"))
             .body(message)
@@ -499,6 +592,30 @@ impl FileTab {
     }
 }
 
+impl Drop for FileTab {
+    fn drop(&mut self) {
+        if let Some(cancellable) = self.load_cancel.get_mut().take() {
+            cancellable.cancel();
+        }
+    }
+}
+
+impl Drop for TabManager {
+    fn drop(&mut self) {
+        if let Some(menu) = self
+            .bg_menu
+            .get_mut()
+            .take()
+            .and_then(|menu| menu.upgrade())
+        {
+            menu.popdown();
+        }
+        for tab in self.tabs.get_mut().iter() {
+            tab.cancel_current_load();
+        }
+    }
+}
+
 pub struct TabManager {
     tab_view: adw::TabView,
     window: adw::ApplicationWindow,
@@ -510,7 +627,7 @@ pub struct TabManager {
     tabs: RefCell<Vec<Rc<FileTab>>>,
     /// Open background menu, if any: closed on tab switch and navigation so
     /// actions can never land on the wrong folder.
-    bg_menu: RefCell<Option<gtk::Popover>>,
+    bg_menu: RefCell<Option<glib::WeakRef<gtk::Popover>>>,
 }
 
 impl TabManager {
@@ -536,17 +653,19 @@ impl TabManager {
             bg_menu: RefCell::new(None),
         });
         {
-            let manager = manager.clone();
-            let window = manager.window.clone();
+            let manager_weak = Rc::downgrade(&manager);
             let tab_view = manager.tab_view.clone();
             tab_view.connect_close_page(move |view, page| {
+                let Some(manager) = manager_weak.upgrade() else {
+                    return glib::Propagation::Stop;
+                };
                 let mut tabs = manager.tabs.borrow_mut();
                 if let Some(pos) = tabs.iter().position(|t| t.page == *page) {
                     tabs.remove(pos);
                 }
                 drop(tabs);
                 if manager.tabs.borrow().is_empty() {
-                    window.close();
+                    manager.window.close();
                 } else {
                     view.close_page_finish(page, true);
                 }
@@ -554,9 +673,12 @@ impl TabManager {
             });
         }
         {
-            let manager = manager.clone();
+            let manager_weak = Rc::downgrade(&manager);
             let tab_view = manager.tab_view.clone();
             tab_view.connect_selected_page_notify(move |_| {
+                let Some(manager) = manager_weak.upgrade() else {
+                    return;
+                };
                 if let Some(tab) = manager.selected() {
                     // Inactive tabs apply a pending show_hidden change
                     // first, then the active chrome is re-synced over any
@@ -578,6 +700,12 @@ impl TabManager {
             .cloned()
     }
 
+    fn is_active_page(&self, page: &adw::TabPage) -> bool {
+        self.tab_view
+            .selected_page()
+            .is_some_and(|selected| selected == *page)
+    }
+
     pub fn selected_uri(&self) -> Option<String> {
         self.selected().map(|t| t.history.current_uri())
     }
@@ -585,12 +713,19 @@ impl TabManager {
     /// Tracks the open background menu so tab switches and navigations can
     /// close it before its captured folder goes stale.
     pub fn track_bg_menu(&self, menu: &gtk::Popover) {
-        *self.bg_menu.borrow_mut() = Some(menu.clone());
+        let weak = glib::WeakRef::new();
+        weak.set(Some(menu));
+        *self.bg_menu.borrow_mut() = Some(weak);
     }
 
     /// Closes the tracked background menu, if still open.
     pub fn close_bg_menu(&self) {
-        if let Some(menu) = self.bg_menu.borrow().as_ref() {
+        let menu = self
+            .bg_menu
+            .borrow()
+            .as_ref()
+            .and_then(glib::WeakRef::upgrade);
+        if let Some(menu) = menu {
             menu.popdown();
         }
     }
@@ -601,7 +736,8 @@ impl TabManager {
             .bg_menu
             .borrow()
             .as_ref()
-            .is_some_and(|tracked| tracked == menu);
+            .and_then(glib::WeakRef::upgrade)
+            .is_some_and(|tracked| tracked == *menu);
         if same {
             *self.bg_menu.borrow_mut() = None;
         }
@@ -617,6 +753,19 @@ impl TabManager {
     /// Reloads the selected tab (after a file operation).
     pub fn reload_selected(&self) {
         if let Some(tab) = self.selected() {
+            tab.reload();
+        }
+    }
+
+    /// Refreshes the tab still showing a captured destination. This is used
+    /// by asynchronous operations so their completion cannot refresh a tab
+    /// the user selected later.
+    pub fn reload_if_current(&self, uri: &str) {
+        let tabs = self.tabs.borrow().clone();
+        for tab in tabs
+            .into_iter()
+            .filter(|tab| tab.history.current_uri() == uri)
+        {
             tab.reload();
         }
     }
@@ -683,32 +832,40 @@ impl TabManager {
             .icon_name("folder")
             .title(crate::l10n::tr("empty-folder"))
             .build();
-        // Discreet loading page, distinct from the empty-folder page.
-        let spinner = gtk::Spinner::builder()
-            .spinning(true)
-            .width_request(48)
-            .height_request(48)
-            .halign(gtk::Align::Center)
-            .build();
+        // Loading is a small, delayed overlay so a fast directory never
+        // flashes a full-page placeholder over the existing view.
+        let spinner = gtk::Spinner::builder().spinning(true).build();
         let loading_label = gtk::Label::builder()
             .label(crate::l10n::tr("loading-folder"))
-            .halign(gtk::Align::Center)
             .css_classes(["dim-label"])
             .build();
-        let loading_page = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
+        let loading_stop = gtk::Button::builder()
+            .label(crate::l10n::tr("loading-interrupt"))
             .build();
-        loading_page.append(&spinner);
-        loading_page.append(&loading_label);
+        let loading_panel = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(10)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Start)
+            .margin_top(12)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(12)
+            .css_classes(["card", "toolbar"])
+            .build();
+        loading_panel.append(&spinner);
+        loading_panel.append(&loading_label);
+        loading_panel.append(&loading_stop);
+        loading_panel.set_visible(false);
         let stack = gtk::Stack::new();
         stack.add_named(&scrolled, Some("list"));
         stack.add_named(&empty, Some("empty"));
-        stack.add_named(&loading_page, Some("loading"));
         stack.set_visible_child_name("list");
-        let page = self.tab_view.append(&stack);
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&stack));
+        overlay.add_overlay(&loading_panel);
+        overlay.set_measure_overlay(&loading_panel, false);
+        let page = self.tab_view.append(&overlay);
         // Dummy selection: replaced by rebuild_view.
         let tab = Rc::new(FileTab {
             page: page.clone(),
@@ -717,6 +874,8 @@ impl TabManager {
             stack,
             empty_page: empty,
             loading_label,
+            loading_panel,
+            loading_stop,
             selection: RefCell::new(gtk::SingleSelection::new(Some(gio::ListStore::new::<
                 FileObject,
             >()))),
@@ -724,14 +883,25 @@ impl TabManager {
             open_items: Cell::new(preferences.open_items),
             history: NavHistory::default(),
             load_gen: LoadGen::default(),
+            load_cancel: RefCell::new(None),
+            load_active: Cell::new(None),
             hidden_sync: HiddenSync::new(self.show_hidden.get()),
             show_hidden: self.show_hidden.clone(),
             window: self.window.clone(),
+            manager: Rc::downgrade(self),
             on_navigate: self.on_navigate.clone(),
             on_history: self.on_history.clone(),
             on_status: self.on_status.clone(),
         });
         self.tabs.borrow_mut().push(tab.clone());
+        tab.loading_stop.connect_clicked({
+            let tab = Rc::downgrade(&tab);
+            move |_| {
+                if let Some(tab) = tab.upgrade() {
+                    tab.cancel_current_load();
+                }
+            }
+        });
 
         // Right-click on the background (or the "empty folder" page):
         // rows claim the sequence, so only the empty part arrives here.
@@ -938,6 +1108,31 @@ mod tests {
         let third = gen.start();
         assert!(!gen.is_current(second));
         assert!(gen.is_current(third));
+    }
+
+    #[test]
+    fn delayed_indicator_only_appears_for_an_active_generation() {
+        let gen = LoadGen::default();
+        let fast = gen.start();
+        // The load settled before the 200 ms timeout fired.
+        assert!(!loading_indicator_due(gen.current.get(), None, fast));
+
+        let slow = gen.start();
+        assert!(loading_indicator_due(gen.current.get(), Some(slow), slow));
+        let newer = gen.start();
+        // The old timeout cannot reveal an indicator for a newer request.
+        assert!(!loading_indicator_due(gen.current.get(), Some(newer), slow));
+        assert!(!gen.is_current(slow));
+    }
+
+    #[test]
+    fn cancelling_load_invalidates_its_timeout_and_result() {
+        let gen = LoadGen::default();
+        let id = gen.start();
+        assert!(gen.invalidate(id));
+        assert!(!gen.is_current(id));
+        assert!(!loading_indicator_due(gen.current.get(), Some(id), id));
+        assert!(!gen.invalidate(id));
     }
 
     /// Async mirror of the failure tests above: a Back load is superseded

@@ -58,7 +58,7 @@ sudo pacman -S gtk4 libadwaita glib2 gdk-pixbuf2 pkgconf gcc
 | libadwaita | >= 1.9 | widget library only — no gnome-shell/mutter dragged in |
 | GLib / GIO | >= 2.88 | |
 | gdk-pixbuf | compatible system version | Pulled in by GTK4 |
-| Graphical session | Wayland or X11 | Tested on Wayland |
+| Graphical session | Wayland or X11 | GTK chooses automatically; see the verification matrix for current coverage |
 | **gvfs** | recommended | required for Trash (`trash:///`) and network backends |
 | Terminal emulator / `sudo` | optional | For terminal actions / root shells |
 
@@ -133,12 +133,12 @@ Design rules:
   without a display server via `cargo test -p kito-core`.
 - **`kito-gtk` owns the UI and integration** — it calls `kito-core` for file operations
   and also handles configuration-directory setup and terminal executable detection.
-  Copy/move during paste, permanent deletion, restore and emptying the Trash
-  run in background threads, with results delivered to the main loop through a
-  bounded async channel (no polling). Directory listing also runs in a worker
-  thread with generation-guarded, chunked insertion into the view; only the
-  newest navigation touches history and widgets. Moving items to the Trash and
-  some smaller operations still run synchronously on the UI thread.
+  Copy/move during paste, Trash, permanent deletion, restore, emptying the Trash,
+  rename, creation and Properties reads run in background threads, with results
+  delivered to the main loop through a bounded async channel (no polling).
+  Directory listing also runs in a worker thread with generation-guarded,
+  chunked staging and atomic view updates; only the newest navigation touches
+  history and widgets. Small bookmark/configuration updates remain synchronous.
   The sidebar checks Trash contents asynchronously.
 - **No GNOME desktop coupling** — libadwaita is used as a widget library only: no
   GSettings/dconf, no libpanel, no Tracker, no desktop portals required.
@@ -156,13 +156,31 @@ selector, and add detection, fallback, plural and parameterized-message tests.
 
 ## Performance
 
-Folder loading never blocks the interface: enumeration and sorting run in a
-worker thread, rows stream into the view in bounded chunks (500 per main-loop
-turn) behind a loading indicator, and only the latest navigation applies
-(stale results are discarded, failed loads keep folder, history and content).
+Folder enumeration and sorting run in a worker thread. GIO enumeration uses a
+cancellable; sorting is synchronous and can only be stopped at its boundary,
+so cancellation during sorting discards the result after the sort finishes.
+After 200 ms, an active request may show a small, cancellable overlay; a fast
+request shows no indicator. The current path and listing remain paired until
+the complete next model is built in 500-row chunks on the GTK main thread and
+swapped in one `ListStore::splice`. History, path and content commit together
+only after success. Generation checks protect each delayed indicator, worker
+result and chunk from superseded navigation; closing a tab cancels its worker.
+The empty page appears only after a successful listing with no visible items.
+
+The app logs worker enumeration and sorting durations separately, followed by
+model build/application wall time. The last figure includes chunk scheduling
+and main-loop delays; it is not a pure CPU measurement. These figures separate
+phases but do not establish a shorter total load or a user-perceived speedup.
 Sorting precomputes one lowercase key per entry (5–8× faster on unsorted
 folders, identical order); the model updates in bulk `splice` calls
 (1001 → 1 notifications per 1000 rows). Worker results wake the main loop
 once through a channel instead of polling it. The release profile stays at
 `opt-level = "z"` (measured: `3` adds 31% size with no speedup here).
+
+File operations return per-item operation/source/destination/status/error
+records from workers. The main thread presents one localized summary and
+expandable details; retries receive only failed or cancelled items. Cut
+retries remain moves and are guarded by the original clipboard generation, so
+a newer clipboard is not overwritten. Completion refreshes tabs showing the
+captured destination rather than acting on whichever tab happens to be active.
 Details and reproduction commands: [performance report](perf-report.md).

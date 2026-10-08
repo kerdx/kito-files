@@ -41,6 +41,72 @@ enum PasteDecision {
     Unsupported,
 }
 
+#[derive(Clone, Debug)]
+enum ItemState {
+    Succeeded,
+    Failed(String),
+    Cancelled(String),
+}
+
+/// Per-item result retained for a concise summary, detail view and precise
+/// retries. `operation` is a Fluent key; source/destination remain URIs so
+/// non-local and special-character paths are not lost.
+#[derive(Clone, Debug)]
+struct OperationItemResult {
+    operation: &'static str,
+    source: String,
+    destination: Option<String>,
+    state: ItemState,
+}
+
+type RetryHandler = Rc<dyn Fn(Vec<OperationItemResult>)>;
+
+impl OperationItemResult {
+    fn from_result(
+        operation: &'static str,
+        source: String,
+        destination: Option<String>,
+        result: Result<(), glib::Error>,
+    ) -> Self {
+        let state = match result {
+            Ok(()) => ItemState::Succeeded,
+            Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => {
+                ItemState::Cancelled(error.to_string())
+            }
+            Err(error) => ItemState::Failed(error.to_string()),
+        };
+        Self {
+            operation,
+            source,
+            destination,
+            state,
+        }
+    }
+
+    fn from_destination_result(
+        operation: &'static str,
+        source: String,
+        destination_on_error: String,
+        result: Result<String, glib::Error>,
+    ) -> Self {
+        match result {
+            Ok(destination) => Self {
+                operation,
+                source,
+                destination: Some(destination),
+                state: ItemState::Succeeded,
+            },
+            Err(error) => {
+                Self::from_result(operation, source, Some(destination_on_error), Err(error))
+            }
+        }
+    }
+
+    fn needs_retry(&self) -> bool {
+        matches!(self.state, ItemState::Failed(_) | ItemState::Cancelled(_))
+    }
+}
+
 /// Clipboard tracker: internal entries stay valid only while they match
 /// what Kito published. Ownership changes arrive via the GDK `changed`
 /// notification (not text comparison); paste-time text matching is only
@@ -94,11 +160,21 @@ impl ClipTracker {
     /// pastes cannot duplicate it. Returns the operation generation, or
     /// `None` when a move for the current state is already running.
     fn begin_cut(&mut self) -> Option<u64> {
-        if self.cut_in_flight == Some(self.generation) {
+        self.begin_cut_for(self.generation)
+    }
+
+    /// Starts a retry only while the internal clipboard still belongs to
+    /// the same cut generation. A newer clipboard can never be moved by an
+    /// old operation's completion dialog.
+    fn begin_cut_for(&mut self, generation: u64) -> Option<u64> {
+        if self.generation != generation
+            || !self.entries.as_ref().is_some_and(|entries| entries.cut)
+            || self.cut_in_flight == Some(generation)
+        {
             return None;
         }
-        self.cut_in_flight = Some(self.generation);
-        Some(self.generation)
+        self.cut_in_flight = Some(generation);
+        Some(generation)
     }
 
     /// Applies a finished cut move. Always retires a matching in-flight
@@ -212,6 +288,166 @@ impl Ctx {
             .body(body)
             .build();
         dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
+        dialog.present(Some(&self.window));
+    }
+
+    /// Reports one batch once, with expandable per-item details. A retry
+    /// receives only failed entries; successful entries are never replayed.
+    fn report_operation(
+        &self,
+        operation: &'static str,
+        results: Vec<OperationItemResult>,
+        retry: Option<RetryHandler>,
+    ) {
+        if results.is_empty() {
+            return;
+        }
+        let succeeded = results
+            .iter()
+            .filter(|result| matches!(result.state, ItemState::Succeeded))
+            .count();
+        let failed = results
+            .iter()
+            .filter(|result| matches!(result.state, ItemState::Failed(_)))
+            .count();
+        let cancelled = results
+            .iter()
+            .filter(|result| matches!(result.state, ItemState::Cancelled(_)))
+            .count();
+        let total = results.len();
+        let mut args = kito_i18n::FluentArgs::new();
+        args.set("operation", crate::l10n::tr(operation));
+        args.set("succeeded", succeeded as u64);
+        args.set("failed", failed as u64);
+        args.set("cancelled", cancelled as u64);
+        args.set("total", total as u64);
+        let summary_key = if failed == 0 && cancelled == 0 {
+            "operation-result-success"
+        } else if succeeded == 0 && cancelled == 0 {
+            "operation-result-failed"
+        } else if cancelled > 0 {
+            "operation-result-cancelled"
+        } else {
+            "operation-result-partial"
+        };
+        let summary = crate::l10n::tr_with(summary_key, &args);
+        if failed == 0 && cancelled == 0 {
+            self.toast(&summary);
+            return;
+        }
+
+        let details = results
+            .iter()
+            .map(|result| {
+                let mut lines = vec![crate::l10n::tr_with_one(
+                    "operation-detail-operation",
+                    "operation",
+                    &crate::l10n::tr(result.operation),
+                )];
+                lines.push(crate::l10n::tr_with_one(
+                    "operation-detail-source",
+                    "source",
+                    &kito_core::uri_to_display(&result.source),
+                ));
+                if let Some(destination) = &result.destination {
+                    lines.push(crate::l10n::tr_with_one(
+                        "operation-detail-destination",
+                        "destination",
+                        &kito_core::uri_to_display(destination),
+                    ));
+                }
+                match &result.state {
+                    ItemState::Succeeded => lines.push(crate::l10n::tr("operation-item-succeeded")),
+                    ItemState::Failed(error) => lines.push(crate::l10n::tr_with_one(
+                        "operation-item-failed",
+                        "error",
+                        error,
+                    )),
+                    ItemState::Cancelled(error) => lines.push(crate::l10n::tr_with_one(
+                        "operation-item-cancelled",
+                        "error",
+                        error,
+                    )),
+                }
+                lines.join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let dialog = adw::Dialog::builder()
+            .title(crate::l10n::tr("operation-result-title"))
+            .content_width(560)
+            .build();
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_start(20)
+            .margin_end(20)
+            .margin_top(20)
+            .margin_bottom(20)
+            .build();
+        content.append(
+            &gtk::Label::builder()
+                .label(summary)
+                .halign(gtk::Align::Start)
+                .wrap(true)
+                .build(),
+        );
+        let details_label = gtk::Label::builder()
+            .label(details)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .selectable(true)
+            .wrap(true)
+            .build();
+        let details_scroll = gtk::ScrolledWindow::builder()
+            .min_content_height(120)
+            .max_content_height(280)
+            .child(&details_label)
+            .build();
+        let expander = gtk::Expander::builder()
+            .label(crate::l10n::tr("operation-details"))
+            .child(&details_scroll)
+            .build();
+        content.append(&expander);
+
+        let buttons = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk::Align::End)
+            .build();
+        let close = gtk::Button::builder()
+            .label(crate::l10n::tr("operation-close"))
+            .build();
+        buttons.append(&close);
+        if let Some(retry) = retry {
+            let failed_items: Vec<_> = results
+                .into_iter()
+                .filter(OperationItemResult::needs_retry)
+                .collect();
+            if !failed_items.is_empty() {
+                let retry_button = gtk::Button::builder()
+                    .label(crate::l10n::tr("operation-retry-failed"))
+                    .css_classes(["suggested-action"])
+                    .build();
+                retry_button.connect_clicked({
+                    let dialog = dialog.clone();
+                    move |_| {
+                        dialog.close();
+                        retry(failed_items.clone());
+                    }
+                });
+                buttons.append(&retry_button);
+            }
+        }
+        content.append(&buttons);
+        close.connect_clicked({
+            let dialog = dialog.clone();
+            move |_| {
+                dialog.close();
+            }
+        });
+        dialog.set_child(Some(&content));
         dialog.present(Some(&self.window));
     }
 
@@ -345,57 +581,70 @@ impl Ctx {
             return;
         }
         let this = self.clone();
+        let result_operation = if cut {
+            "operation-move"
+        } else {
+            "operation-copy"
+        };
+        let retry_dest = dest.clone();
         Self::run_in_thread(
             move || {
-                let mut failed = 0;
-                let mut failed_uris = Vec::new();
-                let mut first_error = None;
+                let mut results = Vec::with_capacity(uris.len());
                 for uri in &uris {
                     let r = if cut {
                         kito_core::move_to(uri, &dest)
                     } else {
                         kito_core::copy_to(uri, &dest)
                     };
-                    if let Err(e) = r {
-                        failed += 1;
-                        if cut {
-                            failed_uris.push(uri.clone());
-                        }
-                        if first_error.is_none() {
-                            first_error = Some(e.to_string());
-                        }
-                    }
-                }
-                (uris.len(), failed, failed_uris, first_error)
-            },
-            move |(total, failed, failed_uris, first_error): (
-                usize,
-                i32,
-                Vec<String>,
-                Option<String>,
-            )| {
-                if let Some(op_generation) = cut_op {
-                    match this
-                        .clipboard
-                        .borrow_mut()
-                        .finish_cut(op_generation, &failed_uris)
-                    {
-                        CutFinish::Consumed => this.clear_system_clipboard(),
-                        CutFinish::Partial | CutFinish::Untouched => {}
-                    }
-                }
-                this.manager.reload_selected();
-                if failed == 0 {
-                    this.toast(&crate::l10n::tr_num("pasted-items", total as u64));
-                } else if let Some(error) = first_error {
-                    this.error_dialog(&crate::l10n::tr("error-paste"), error);
-                } else {
-                    this.toast(&crate::l10n::tr_with_two_counts(
-                        "paste-failed",
-                        failed as u64,
-                        total as u64,
+                    results.push(OperationItemResult::from_result(
+                        result_operation,
+                        uri.clone(),
+                        Some(dest.clone()),
+                        r,
                     ));
                 }
+                results
+            },
+            move |results: Vec<OperationItemResult>| {
+                let cut_finish = cut_op.map(|op_generation| {
+                    let failed_uris: Vec<String> = results
+                        .iter()
+                        .filter(|result| result.needs_retry())
+                        .map(|result| result.source.clone())
+                        .collect();
+                    this.clipboard
+                        .borrow_mut()
+                        .finish_cut(op_generation, &failed_uris)
+                });
+                if cut_finish == Some(CutFinish::Consumed) {
+                    this.clear_system_clipboard();
+                }
+                this.manager.reload_if_current(&retry_dest);
+                let retry: Option<RetryHandler> = if cut {
+                    match (cut_op, cut_finish) {
+                        (Some(op_generation), Some(CutFinish::Partial)) => {
+                            let this = this.clone();
+                            Some(Rc::new(move |failed: Vec<OperationItemResult>| {
+                                let uris = failed.into_iter().map(|item| item.source).collect();
+                                let next_op =
+                                    this.clipboard.borrow_mut().begin_cut_for(op_generation);
+                                if let Some(next_op) = next_op {
+                                    this.paste_uris(uris, true, retry_dest.clone(), Some(next_op));
+                                } else {
+                                    this.toast(&crate::l10n::tr("clip-changed"));
+                                }
+                            }))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    let this = this.clone();
+                    Some(Rc::new(move |failed: Vec<OperationItemResult>| {
+                        let uris = failed.into_iter().map(|item| item.source).collect();
+                        this.paste_uris(uris, false, retry_dest.clone(), None);
+                    }))
+                };
+                this.report_operation(result_operation, results, retry);
             },
         );
     }
@@ -422,22 +671,36 @@ impl Ctx {
             self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         }
-        let mut failed = 0;
-        for uri in &uris {
-            if kito_core::trash(uri).is_err() {
-                failed += 1;
-            }
-        }
-        self.manager.reload_selected();
-        if failed == 0 {
-            self.toast(&crate::l10n::tr_num("moved-trash", uris.len() as u64));
-        } else {
-            self.toast(&crate::l10n::tr_with_two_counts(
-                "moved-trash-failed",
-                failed as u64,
-                uris.len() as u64,
-            ));
-        }
+        let folder = self.manager.selected_uri().unwrap_or_default();
+        self.trash_uris(uris, folder);
+    }
+
+    fn trash_uris(&self, uris: Vec<String>, folder: String) {
+        let this = self.clone();
+        let retry_folder = folder.clone();
+        Self::run_in_thread(
+            move || {
+                uris.into_iter()
+                    .map(|uri| {
+                        OperationItemResult::from_result(
+                            "operation-trash",
+                            uri.clone(),
+                            Some(kito_core::TRASH_URI.to_string()),
+                            kito_core::trash(&uri),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            move |results| {
+                this.manager.reload_if_current(&folder);
+                let retry_this = this.clone();
+                let retry: RetryHandler = Rc::new(move |failed| {
+                    let uris = failed.into_iter().map(|item| item.source).collect();
+                    retry_this.trash_uris(uris, retry_folder.clone());
+                });
+                this.report_operation("operation-trash", results, Some(retry));
+            },
+        );
     }
 
     /// From the trash: restores the selected entries to the original location.
@@ -452,34 +715,40 @@ impl Ctx {
             self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         }
+        let trash_uri = self.manager.selected_uri().unwrap_or_default();
+        self.restore_uris(uris, trash_uri);
+    }
+
+    fn restore_uris(&self, uris: Vec<String>, trash_uri: String) {
         let this = self.clone();
+        let retry_trash_uri = trash_uri.clone();
         Self::run_in_thread(
             move || {
-                let mut failed = 0;
-                let mut first_error = None;
-                for uri in &uris {
-                    if let Err(e) = kito_core::restore(uri) {
-                        failed += 1;
-                        if first_error.is_none() {
-                            first_error = Some(e.to_string());
-                        }
-                    }
-                }
-                (uris.len(), failed, first_error)
+                uris.into_iter()
+                    .map(|uri| match kito_core::restore(&uri) {
+                        Ok(destination) => OperationItemResult {
+                            operation: "operation-restore",
+                            source: uri,
+                            destination: Some(destination),
+                            state: ItemState::Succeeded,
+                        },
+                        Err(error) => OperationItemResult::from_result(
+                            "operation-restore",
+                            uri,
+                            None,
+                            Err(error),
+                        ),
+                    })
+                    .collect::<Vec<_>>()
             },
-            move |(total, failed, first_error): (usize, i32, Option<String>)| {
-                this.manager.reload_selected();
-                if failed == 0 {
-                    this.toast(&crate::l10n::tr_num("restored-items", total as u64));
-                } else if let Some(error) = first_error {
-                    this.error_dialog(&crate::l10n::tr("error-restore"), error);
-                } else {
-                    this.toast(&crate::l10n::tr_with_two_counts(
-                        "restored-failed",
-                        failed as u64,
-                        total as u64,
-                    ));
-                }
+            move |results| {
+                this.manager.reload_if_current(&trash_uri);
+                let retry_this = this.clone();
+                let retry: RetryHandler = Rc::new(move |failed| {
+                    let uris = failed.into_iter().map(|item| item.source).collect();
+                    retry_this.restore_uris(uris, retry_trash_uri.clone());
+                });
+                this.report_operation("operation-restore", results, Some(retry));
             },
         );
     }
@@ -502,22 +771,31 @@ impl Ctx {
             }
             let this = this.clone();
             Self::run_in_thread(
-                move || match kito_core::empty_trash() {
-                    Ok((total, failed)) => (total, failed, None),
-                    Err(e) => (0, 0, Some(e.to_string())),
+                move || match kito_core::empty_trash_detailed() {
+                    Ok(items) => items
+                        .into_iter()
+                        .map(|item| {
+                            OperationItemResult::from_result(
+                                "operation-empty-trash",
+                                item.uri,
+                                None,
+                                item.error.map_or(Ok(()), Err),
+                            )
+                        })
+                        .collect(),
+                    Err(error) => vec![OperationItemResult::from_result(
+                        "operation-empty-trash",
+                        kito_core::TRASH_URI.to_string(),
+                        None,
+                        Err(error),
+                    )],
                 },
-                move |(total, failed, error)| {
-                    this.manager.reload_selected();
-                    if let Some(error) = error {
-                        this.error_dialog(&crate::l10n::tr("error-trash"), error);
-                    } else if failed == 0 {
-                        this.toast(&crate::l10n::tr_num("trash-removed", total as u64));
+                move |results| {
+                    this.manager.reload_if_current(kito_core::TRASH_URI);
+                    if results.is_empty() {
+                        this.toast(&crate::l10n::tr("trash-already-empty"));
                     } else {
-                        this.toast(&crate::l10n::tr_with_two_counts(
-                            "trash-remove-failed",
-                            failed as u64,
-                            total as u64,
-                        ));
+                        this.report_operation("operation-empty-trash", results, None);
                     }
                 },
             );
@@ -537,6 +815,11 @@ impl Ctx {
             self.toast(&crate::l10n::tr("toast-nothing"));
             return;
         }
+        let folder = self.manager.selected_uri().unwrap_or_default();
+        self.confirm_delete(uris, folder);
+    }
+
+    fn confirm_delete(&self, uris: Vec<String>, folder: String) {
         let dialog = adw::AlertDialog::builder()
             .heading(crate::l10n::tr("delete-title"))
             .body(crate::l10n::tr_num("delete-body", uris.len() as u64))
@@ -553,27 +836,29 @@ impl Ctx {
             }
             let uris = uris.clone();
             let this = this.clone();
+            let retry_folder = folder.clone();
+            let completion_folder = folder.clone();
             Self::run_in_thread(
                 move || {
-                    let mut failed = 0;
-                    for uri in &uris {
-                        if kito_core::delete_recursive(uri).is_err() {
-                            failed += 1;
-                        }
-                    }
-                    (uris.len(), failed)
+                    uris.into_iter()
+                        .map(|uri| {
+                            OperationItemResult::from_result(
+                                "operation-delete",
+                                uri.clone(),
+                                None,
+                                kito_core::delete_recursive(&uri),
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 },
-                move |(total, failed)| {
-                    this.manager.reload_selected();
-                    if failed == 0 {
-                        this.toast(&crate::l10n::tr_num("deleted-items", total as u64));
-                    } else {
-                        this.toast(&crate::l10n::tr_with_two_counts(
-                            "delete-failed-items",
-                            failed as u64,
-                            total as u64,
-                        ));
-                    }
+                move |results| {
+                    this.manager.reload_if_current(&completion_folder);
+                    let retry_this = this.clone();
+                    let retry: RetryHandler = Rc::new(move |failed| {
+                        let uris = failed.into_iter().map(|item| item.source).collect();
+                        retry_this.confirm_delete(uris, retry_folder.clone());
+                    });
+                    this.report_operation("operation-delete", results, Some(retry));
                 },
             );
         });
@@ -684,18 +969,34 @@ impl Ctx {
         }
         let uri = objs[0].uri();
         let name = objs[0].name();
+        let parent = uri
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_default();
         let this = self.clone();
         self.name_dialog(
             &crate::l10n::tr("rename-title"),
             &crate::l10n::tr("rename-placeholder"),
             &name,
             &crate::l10n::tr("rename-confirm"),
-            move |text| match kito_core::rename(&uri, &text) {
-                Ok(_) => {
-                    this.manager.reload_selected();
-                    this.toast(&crate::l10n::tr("renamed-ok"));
-                }
-                Err(e) => this.error_dialog(&crate::l10n::tr("error-rename"), e.to_string()),
+            move |text| {
+                let source = uri.clone();
+                let operation_uri = uri.clone();
+                let destination_parent = parent.clone();
+                let this = this.clone();
+                Self::run_in_thread(
+                    move || kito_core::rename(&operation_uri, &text),
+                    move |result| {
+                        this.manager.reload_if_current(&destination_parent);
+                        let item = OperationItemResult::from_destination_result(
+                            "operation-rename",
+                            source,
+                            destination_parent,
+                            result,
+                        );
+                        this.report_operation("operation-rename", vec![item], None);
+                    },
+                );
             },
         );
     }
@@ -711,12 +1012,24 @@ impl Ctx {
             &crate::l10n::tr("new-folder-placeholder"),
             &crate::l10n::tr("new-folder-initial"),
             &crate::l10n::tr("new-folder-confirm"),
-            move |text| match kito_core::mkdir(&dest, &text) {
-                Ok(_) => {
-                    this.manager.reload_selected();
-                    this.toast(&crate::l10n::tr("folder-created"));
-                }
-                Err(e) => this.error_dialog(&crate::l10n::tr("error-create-folder"), e.to_string()),
+            move |text| {
+                let destination = dest.clone();
+                let parent = dest.clone();
+                let operation_dest = dest.clone();
+                let this = this.clone();
+                Self::run_in_thread(
+                    move || kito_core::mkdir(&operation_dest, &text),
+                    move |result| {
+                        this.manager.reload_if_current(&parent);
+                        let item = OperationItemResult::from_destination_result(
+                            "operation-create-folder",
+                            destination,
+                            parent,
+                            result,
+                        );
+                        this.report_operation("operation-create-folder", vec![item], None);
+                    },
+                );
             },
         );
     }
@@ -747,12 +1060,24 @@ impl Ctx {
             &crate::l10n::tr("new-file-placeholder"),
             &template,
             &crate::l10n::tr("new-file-confirm"),
-            move |text| match kito_core::create_file(&dest, &text) {
-                Ok(_) => {
-                    this.manager.reload_selected();
-                    this.toast(&crate::l10n::tr_with_one("created-file", "name", &text));
-                }
-                Err(e) => this.error_dialog(&crate::l10n::tr("error-create-file"), e.to_string()),
+            move |text| {
+                let destination = dest.clone();
+                let parent = dest.clone();
+                let operation_dest = dest.clone();
+                let this = this.clone();
+                Self::run_in_thread(
+                    move || kito_core::create_file(&operation_dest, &text),
+                    move |result| {
+                        this.manager.reload_if_current(&parent);
+                        let item = OperationItemResult::from_destination_result(
+                            "operation-create-file",
+                            destination,
+                            parent,
+                            result,
+                        );
+                        this.report_operation("operation-create-file", vec![item], None);
+                    },
+                );
             },
         );
     }
@@ -831,14 +1156,29 @@ impl Ctx {
     }
 
     fn show_properties_for(&self, uri: &str) {
-        let info = match kito_core::props(uri) {
-            Ok(info) => info,
-            Err(e) => {
-                self.error_dialog(&crate::l10n::tr("error-props"), e.to_string());
-                return;
-            }
-        };
+        let uri = uri.to_string();
+        let this = self.clone();
+        Self::run_in_thread(
+            move || {
+                let info = kito_core::props(&uri).map_err(|error| error.to_string())?;
+                let child_count = info
+                    .is_dir
+                    .then(|| {
+                        kito_core::list_dir(&uri, true)
+                            .ok()
+                            .map(|entries| entries.len())
+                    })
+                    .flatten();
+                Ok::<_, String>((info, child_count))
+            },
+            move |result| match result {
+                Ok((info, child_count)) => this.present_properties(info, child_count),
+                Err(error) => this.error_dialog(&crate::l10n::tr("error-props"), error),
+            },
+        );
+    }
 
+    fn present_properties(&self, info: kito_core::Props, child_count: Option<usize>) {
         let dialog = adw::Dialog::builder()
             .title(crate::l10n::tr("props-title"))
             .content_width(420)
@@ -908,10 +1248,9 @@ impl Ctx {
         };
         grid.append(&prop_row(&crate::l10n::tr("props-type"), &type_label));
         let size = if info.is_dir {
-            // Best-effort count: big folders don't block.
-            kito_core::list_dir(uri, true)
-                .map(|entries| crate::l10n::tr_num("props-size-items", entries.len() as u64))
-                .unwrap_or_else(|_| "—".to_string())
+            child_count
+                .map(|count| crate::l10n::tr_num("props-size-items", count as u64))
+                .unwrap_or_else(|| "—".to_string())
         } else {
             crate::file_list::human_size(info.size)
         };
@@ -1107,6 +1446,65 @@ mod tests {
                 cut: true,
             }
         );
+        // The explicit retry stays a move and is bound to the same clipboard
+        // generation. A clipboard replacement retires it.
+        assert_eq!(clip.begin_cut_for(op), Some(op));
+        assert_eq!(clip.finish_cut(op, &[B.to_string()]), CutFinish::Partial);
+        clip.on_external_changed();
+        assert_eq!(clip.begin_cut_for(op), None);
+    }
+
+    #[test]
+    fn operation_retry_candidates_exclude_successes() {
+        let items = [
+            OperationItemResult::from_result(
+                "operation-copy",
+                A.to_string(),
+                Some("file:///tmp/dest".into()),
+                Ok(()),
+            ),
+            OperationItemResult::from_result(
+                "operation-copy",
+                B.to_string(),
+                Some("file:///tmp/dest".into()),
+                Err(glib::Error::new(
+                    gio::IOErrorEnum::PermissionDenied,
+                    "permission denied",
+                )),
+            ),
+        ];
+        let retry: Vec<_> = items
+            .iter()
+            .filter(|item| item.needs_retry())
+            .map(|item| item.source.as_str())
+            .collect();
+        assert_eq!(retry, vec![B]);
+    }
+
+    #[test]
+    fn operation_cancellation_uses_the_gio_error_code() {
+        let cancelled = OperationItemResult::from_result(
+            "operation-copy",
+            A.to_string(),
+            Some("file:///tmp/dest".into()),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::Cancelled,
+                "localized message does not determine the result",
+            )),
+        );
+        assert!(matches!(cancelled.state, ItemState::Cancelled(_)));
+        assert!(cancelled.needs_retry());
+
+        let failed = OperationItemResult::from_result(
+            "operation-copy",
+            B.to_string(),
+            Some("file:///tmp/dest".into()),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "cancel was mentioned in the technical detail only",
+            )),
+        );
+        assert!(matches!(failed.state, ItemState::Failed(_)));
     }
 
     #[test]

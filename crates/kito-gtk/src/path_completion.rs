@@ -1039,33 +1039,38 @@ mod tests {
 
         let results = Rc::new(RefCell::new(None));
         let results_for_callback = results.clone();
-        let main_loop = glib::MainLoop::new(None, false);
+        let context = glib::MainContext::new();
+        let main_loop = glib::MainLoop::new(Some(&context), false);
         let loop_for_callback = main_loop.clone();
-        gio::File::for_path(temp.path()).enumerate_children_async(
-            "standard::name,standard::type",
-            gio::FileQueryInfoFlags::NONE,
-            glib::Priority::DEFAULT,
-            None::<&gio::Cancellable>,
-            move |result| match result {
-                Ok(enumerator) => enumerator.next_files_async(
-                    64,
+        context
+            .with_thread_default(|| {
+                gio::File::for_path(temp.path()).enumerate_children_async(
+                    "standard::name,standard::type",
+                    gio::FileQueryInfoFlags::NONE,
                     glib::Priority::DEFAULT,
                     None::<&gio::Cancellable>,
-                    move |result| {
-                        let candidates =
-                            result.unwrap().into_iter().map(|info| DirectoryCandidate {
-                                name: info.name().to_string_lossy().into_owned(),
-                                is_directory: info.file_type() == gio::FileType::Directory,
-                            });
-                        *results_for_callback.borrow_mut() =
-                            Some(filter_directories(candidates, "linked", false));
-                        loop_for_callback.quit();
+                    move |result| match result {
+                        Ok(enumerator) => enumerator.next_files_async(
+                            64,
+                            glib::Priority::DEFAULT,
+                            None::<&gio::Cancellable>,
+                            move |result| {
+                                let candidates =
+                                    result.unwrap().into_iter().map(|info| DirectoryCandidate {
+                                        name: info.name().to_string_lossy().into_owned(),
+                                        is_directory: info.file_type() == gio::FileType::Directory,
+                                    });
+                                *results_for_callback.borrow_mut() =
+                                    Some(filter_directories(candidates, "linked", false));
+                                loop_for_callback.quit();
+                            },
+                        ),
+                        Err(error) => panic!("directory enumeration failed: {error}"),
                     },
-                ),
-                Err(error) => panic!("directory enumeration failed: {error}"),
-            },
-        );
-        main_loop.run();
+                );
+                main_loop.run();
+            })
+            .unwrap();
         assert_eq!(
             results.borrow().as_ref().unwrap(),
             &["linked directory".to_string()]

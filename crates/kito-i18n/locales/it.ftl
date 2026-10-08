@@ -88,6 +88,7 @@ error-open-folder = Impossibile aprire la cartella
 error-invalid-path = Inserisci un percorso locale o un URI da aprire.
 empty-folder = Questa cartella è vuota
 loading-folder = Caricamento…
+loading-interrupt = Interrompi
 error-open-file = Impossibile aprire il file
 error-open-file-detail = Kito Files non è riuscito ad avviare l’applicazione predefinita: { $error }
 
@@ -156,6 +157,35 @@ rename-select = Seleziona un solo elemento da rinominare
 renamed-ok = Rinominato
 folder-created = Cartella creata
 created-file = File creato: { $name }
+
+## Risultati delle operazioni
+operation-copy = Copia
+operation-move = Spostamento
+operation-trash = Spostamento nel cestino
+operation-restore = Ripristino
+operation-delete = Eliminazione definitiva
+operation-empty-trash = Svuotamento del cestino
+operation-rename = Rinomina
+operation-create-folder = Creazione cartella
+operation-create-file = Creazione file
+operation-result-title = Risultato dell’operazione
+operation-result-success = { $operation }: { $count ->
+    [one] completato un elemento.
+   *[other] completati { $count } elementi.
+}
+operation-result-failed = { $operation }: tutti i { $total } elementi non sono riusciti.
+operation-result-partial = { $operation }: { $succeeded } su { $total } riusciti; { $failed } non riusciti.
+operation-result-cancelled = { $operation }: { $succeeded } riusciti, { $failed } non riusciti e { $cancelled } annullati su { $total }.
+operation-details = Dettagli
+operation-detail-operation = Operazione: { $operation }
+operation-detail-source = Origine: { $source }
+operation-detail-destination = Destinazione: { $destination }
+operation-item-succeeded = Completato
+operation-item-failed = Non riuscito: { $error }
+operation-item-cancelled = Annullato: { $error }
+operation-retry-failed = Riprova gli elementi non riusciti
+operation-close = Chiudi
+trash-already-empty = Il cestino è già vuoto.
 
 ## Finestre di dialogo
 dialog-ok = OK

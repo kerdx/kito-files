@@ -1,16 +1,14 @@
 //! Context menus.
 //!
-//! File menus stay a compact custom popover with icon + label rows.
-//! The background (and trash background) menus are native instead:
-//! a `gio::Menu` model in a `gtk::PopoverMenu` with `has_arrow(false)`,
-//! so the toolkit owns placement, hover between item and submenu,
-//! keyboard navigation, dismissal and accessibility. No timers, no grab
-//! handling, no `autohide` tricks.
+//! File and background menus use compact custom popovers with icon + label
+//! rows. The New File submenu uses a native `gio::Menu` in a
+//! `gtk::PopoverMenu`, so GTK owns its keyboard traversal and dismissal.
+//! No timers or pointer grabs are used.
 
 use crate::{ops, tabs::TabManager};
 use adw::prelude::*;
 use gtk::{gdk, gio};
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
 
 /// One menu row: icons, message id for the label, `win.*` action
 /// and destructive flag.
@@ -139,9 +137,11 @@ fn build(
         let button = row_button(r);
         let window = window.clone();
         let action = r.action.to_string();
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         button.connect_clicked(move |_| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             let _ =
                 gtk::prelude::WidgetExt::activate_action(&window, &format!("win.{action}"), None);
         });
@@ -167,10 +167,7 @@ fn popup(
     separators_after: &[usize],
 ) {
     let popover = build(anchor, rows, separators_after, window);
-    popover.connect_closed({
-        let popover = popover.clone();
-        move |_| popover.unparent()
-    });
+    popover.connect_closed(|popover| popover.unparent());
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
     popover.set_position(side_for(anchor, x));
     popover.popup();
@@ -206,18 +203,10 @@ pub fn show_trash(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::Applicatio
 }
 
 // ---------------------------------------------------------------------------
-// Background menu: compact custom popover with icon + label rows.
-//
-// Native `GtkPopoverMenu` model buttons deliberately hide their icon when
-// they carry text (see `update_visibility` in gtkmodelbutton.c), so rows
-// with an icon on every entry are plain buttons instead — the same rows
-// the file menu uses. The "New File" submenu is a second popover beside
-// the first one. No timers: it opens on hover or click and closes when
-// another row is hovered, when an action runs, or through the toolkit's
-// own outside-click/Escape dismissal. Closing only the submenu never
-// closes the main menu, except through that native dismissal. No
-// `autohide` juggling. Actions live in a transient `bg` group bound to
-// the captured folder, so shared `win.*` actions keep their availability.
+// Background menu: compact custom popover with icon + label rows, matching
+// file menus. Its New File submenu is a native PopoverMenu. Actions live in a
+// transient `bg` group bound to the captured folder; shared `win.*` actions
+// keep their availability.
 // ---------------------------------------------------------------------------
 
 /// `true` for destinations the menu treats as optimistically writable
@@ -265,7 +254,6 @@ pub(crate) struct BgRow {
     icons: &'static [&'static str],
     label: &'static str,
     action: &'static str,
-    danger: bool,
     sub: Option<&'static [BgRow]>,
 }
 
@@ -275,21 +263,18 @@ const BG_NEW_FILE_ROWS: [BgRow; 3] = [
         icons: &["document-new"],
         label: "menu-new-empty-file",
         action: "bg.new-empty-file",
-        danger: false,
         sub: None,
     },
     BgRow {
         icons: &["text-x-generic"],
         label: "menu-new-text-file",
         action: "bg.new-text-file",
-        danger: false,
         sub: None,
     },
     BgRow {
         icons: &["text-html"],
         label: "menu-new-html",
         action: "bg.new-html-page",
-        danger: false,
         sub: None,
     },
 ];
@@ -299,14 +284,12 @@ const BG_CREATE_ROWS: [BgRow; 2] = [
         icons: &["folder-new", "folder-new-symbolic"],
         label: "bg-new-folder",
         action: "bg.new-folder",
-        danger: false,
         sub: None,
     },
     BgRow {
         icons: &["document-new", "document-new-symbolic"],
         label: "bg-new-file",
         action: "",
-        danger: false,
         sub: Some(&BG_NEW_FILE_ROWS),
     },
 ];
@@ -315,7 +298,6 @@ const BG_PASTE_ROWS: [BgRow; 1] = [BgRow {
     icons: &["edit-paste"],
     label: "menu-paste",
     action: "bg.paste",
-    danger: false,
     sub: None,
 }];
 
@@ -324,14 +306,12 @@ const BG_TERM_ROWS: [BgRow; 2] = [
         icons: &["utilities-terminal", "terminal"],
         label: "menu-open-terminal",
         action: "bg.open-terminal",
-        danger: false,
         sub: None,
     },
     BgRow {
         icons: &["utilities-terminal", "terminal"],
         label: "menu-open-terminal-root",
         action: "bg.open-terminal-root",
-        danger: false,
         sub: None,
     },
 ];
@@ -340,7 +320,6 @@ const BG_PROPS_ROWS: [BgRow; 1] = [BgRow {
     icons: &["dialog-information", "help-about"],
     label: "bg-folder-properties",
     action: "bg.folder-properties",
-    danger: false,
     sub: None,
 }];
 
@@ -348,7 +327,6 @@ const BG_TRASH_ROWS: [BgRow; 1] = [BgRow {
     icons: &["user-trash-full", "user-trash"],
     label: "menu-empty-trash",
     action: "win.empty-trash",
-    danger: true,
     sub: None,
 }];
 
@@ -370,15 +348,24 @@ fn bg_action(
     group: &gio::SimpleActionGroup,
     name: &'static str,
     enabled: bool,
-    ctx: &ops::Ctx,
+    ctx: &Rc<ops::Ctx>,
     dest: &str,
+    manager: &Rc<TabManager>,
     run: fn(&ops::Ctx, &str),
 ) -> gio::SimpleAction {
     let action = gio::SimpleAction::new(name, None);
     action.set_enabled(enabled);
-    let ctx = ctx.clone();
+    let ctx = Rc::downgrade(ctx);
     let dest = dest.to_string();
-    action.connect_activate(move |_, _| run(&ctx, &dest));
+    let manager = Rc::downgrade(manager);
+    action.connect_activate(move |_, _| {
+        if let Some(manager) = manager.upgrade() {
+            manager.close_bg_menu();
+        }
+        if let Some(ctx) = ctx.upgrade() {
+            run(&ctx, &dest);
+        }
+    });
     group.add_action(&action);
     action
 }
@@ -397,6 +384,10 @@ pub(crate) fn writability_update(
     answer.ok()
 }
 
+fn action_available(writable: bool, other_requirement: bool) -> bool {
+    writable && other_requirement
+}
+
 /// Refines creation/paste availability once `access::can-write` answers,
 /// without ever blocking the UI for it. Unknown backends keep the opening
 /// assumption; errors at operation time are still reported by the actions.
@@ -405,7 +396,7 @@ fn refine_writability(
     dest: &str,
     manager: &Rc<TabManager>,
     popover: &gtk::Popover,
-    actions: &[gio::SimpleAction],
+    actions: &[(gio::SimpleAction, bool)],
 ) {
     use gio::prelude::FileExt as _;
     let file = gio::File::for_uri(dest);
@@ -432,21 +423,50 @@ fn refine_writability(
             let Some(writable) = writability_update(&dest, current.as_deref(), answer) else {
                 return;
             };
-            for action in &actions {
-                action.set_enabled(writable);
+            for (action, other_requirement) in &actions {
+                action.set_enabled(action_available(writable, *other_requirement));
             }
         },
     );
 }
 
-/// Vertical placement for the native menu: below the click when the
-/// menu's natural height fits there, above it otherwise, so GTK rarely
-/// needs to shrink it (shrinking is what draws the scrollbar). The window
-/// area is the only geometry known on Wayland; the compositor still keeps
-/// the menu inside the work area. The classic row popovers keep their own
-/// left/right logic below.
+/// Detects terminals off the GTK thread. Until the cheap filesystem probe
+/// completes, terminal rows remain disabled; operation-time launch errors
+/// are still reported by the action itself.
+fn refine_terminal_actions(
+    dest: &str,
+    manager: &Rc<TabManager>,
+    popover: &gtk::Popover,
+    choice: crate::preferences::model::TerminalChoice,
+    actions: &[(gio::SimpleAction, bool)],
+) {
+    let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(crate::terminal::available_terminal_programs());
+    });
+    let dest = dest.to_string();
+    let manager = Rc::downgrade(manager);
+    let popover = popover.downgrade();
+    let actions = actions.to_vec();
+    glib::spawn_future_local(async move {
+        let Ok(available) = rx.recv().await else {
+            return;
+        };
+        let (Some(manager), Some(popover)) = (manager.upgrade(), popover.upgrade()) else {
+            return;
+        };
+        if !popover.is_visible() || manager.selected_uri().as_deref() != Some(&dest) {
+            return;
+        }
+        for (action, root) in actions {
+            action.set_enabled(crate::terminal::can_open(root, &choice, &available));
+        }
+    });
+}
+
+/// Vertical placement for the native menu: below the click when its natural
+/// height fits there, above it otherwise.
 fn vertical_side(anchor: &gtk::Widget, y: f64, natural_h: i32) -> gtk::PositionType {
-    // Without a measurement fall back to the roomier half.
     let fits_below = if natural_h > 0 {
         anchor.height() as f64 - y >= natural_h as f64
     } else {
@@ -459,10 +479,28 @@ fn vertical_side(anchor: &gtk::Widget, y: f64, natural_h: i32) -> gtk::PositionT
     }
 }
 
-/// Icon + label row; a submenu adds the lateral `›` indicator.
-fn bg_row_button(row: &BgRow) -> gtk::Button {
-    let button = gtk::Button::builder().has_frame(false).build();
-    button.add_css_class("ctx-row");
+fn append_bg_row(menu: &gio::Menu, row: &BgRow) {
+    let label = crate::l10n::tr(row.label);
+    let action = if row.sub.is_some() {
+        // The action only controls whether the submenu can be opened. Its
+        // children each have their own operation-time action.
+        Some("bg.can-create-file")
+    } else {
+        Some(row.action)
+    };
+    let item = gio::MenuItem::new(Some(&label), action);
+    item.set_icon(&gio::ThemedIcon::from_names(row.icons));
+    if let Some(children) = row.sub {
+        let submenu = gio::Menu::new();
+        for child in children {
+            append_bg_row(&submenu, child);
+        }
+        item.set_submenu(Some(&submenu));
+    }
+    menu.append_item(&item);
+}
+
+fn bg_row_content(row: &BgRow, submenu: bool) -> gtk::Box {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(10)
@@ -479,281 +517,127 @@ fn bg_row_button(row: &BgRow) -> gtk::Button {
         .halign(gtk::Align::Start)
         .hexpand(true)
         .build();
-    if row.danger {
-        text.add_css_class("error");
-    }
     content.append(&text);
-    if row.sub.is_some() {
-        content.append(
-            &gtk::Label::builder()
-                .label("›")
-                .css_classes(["dim-label"])
-                .build(),
-        );
+    if submenu {
+        let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
+        arrow.add_css_class("dim-label");
+        content.append(&arrow);
     }
-    button.set_child(Some(&content));
-    button
+    content
 }
 
-/// Short `bg` action name behind a detailed one, if any.
-fn bg_short(detailed: &str) -> Option<&str> {
-    detailed.strip_prefix("bg.")
-}
+fn append_bg_widget(
+    list: &gtk::Box,
+    row: &BgRow,
+    group: &gio::SimpleActionGroup,
+    create_file_action: &gio::SimpleAction,
+    manager: &Rc<TabManager>,
+    window: &adw::ApplicationWindow,
+) {
+    if let Some(children) = row.sub {
+        let button = gtk::MenuButton::new();
+        button.set_has_frame(false);
+        button.set_hexpand(true);
+        button.add_css_class("ctx-row");
+        button.set_child(Some(&bg_row_content(row, true)));
+        button.set_sensitive(create_file_action.is_enabled());
+        let weak_button = button.downgrade();
+        create_file_action.connect_notify_local(Some("enabled"), move |action, _| {
+            if let Some(button) = weak_button.upgrade() {
+                button.set_sensitive(action.is_enabled());
+            }
+        });
 
-/// Follows the action's enabled state on the button, live (the
-/// writability check updates it after opening).
-fn follow_enabled(button: &gtk::Button, group: &gio::SimpleActionGroup, short: &str) {
-    let Some(action) = group
-        .lookup_action(short)
-        .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
-    else {
-        button.set_sensitive(false);
-        return;
-    };
-    button.set_sensitive(action.is_enabled());
-    let weak = button.downgrade();
-    action.connect_notify_local(Some("enabled"), move |action, _| {
-        if let Some(button) = weak.upgrade() {
-            button.set_sensitive(action.is_enabled());
+        let model = gio::Menu::new();
+        for child in children {
+            append_bg_row(&model, child);
         }
-    });
-}
-
-/// Closes the open submenu, if any. Takes it out before popping down so a
-/// reentrant `closed` emission cannot borrow twice.
-fn close_bg_sub(open: &Rc<RefCell<Option<gtk::Popover>>>) {
-    let sub = open.borrow_mut().take();
-    if let Some(sub) = sub {
-        sub.popdown();
+        let submenu = gtk::PopoverMenu::from_model(Some(&model));
+        submenu.insert_action_group("bg", Some(group));
+        submenu.set_has_arrow(false);
+        submenu.add_css_class("ctx-menu");
+        submenu.set_position(gtk::PositionType::Right);
+        button.set_popover(Some(&submenu));
+        list.append(&button);
+    } else {
+        let button = gtk::Button::builder().has_frame(false).build();
+        button.add_css_class("ctx-row");
+        button.set_hexpand(true);
+        button.set_child(Some(&bg_row_content(row, false)));
+        if row.action.starts_with("bg.") {
+            button.set_action_name(Some(row.action));
+        } else {
+            let action = row.action.to_string();
+            let manager = Rc::downgrade(manager);
+            let window = window.downgrade();
+            button.connect_clicked(move |_| {
+                if let Some(manager) = manager.upgrade() {
+                    manager.close_bg_menu();
+                }
+                if let Some(window) = window.upgrade() {
+                    let _ = gtk::prelude::WidgetExt::activate_action(&window, &action, None);
+                }
+            });
+        }
+        list.append(&button);
     }
 }
 
-/// Builds and opens the background popover for ready-made sections.
-/// Separators fall between sections only. Rows activate their detailed
-/// action on the popover (`bg.*`) or the window (`win.*`); sensitivity
-/// follows the action live. The popover unparents itself on close;
-/// repeated openings accumulate nothing.
-#[allow(clippy::too_many_arguments)]
+/// Builds the same compact, icon-row layout as the file menu. The main
+/// popover contains no scrolled window. GTK owns the native child submenu's
+/// focus, keyboard traversal, Escape and outside-click dismissal.
 fn popup_bg(
     anchor: &gtk::Widget,
     x: f64,
     y: f64,
     sections: &[&[BgRow]],
     group: &gio::SimpleActionGroup,
-    window: &adw::ApplicationWindow,
     manager: &Rc<TabManager>,
+    window: &adw::ApplicationWindow,
 ) -> gtk::Popover {
-    let popover = gtk::Popover::new();
-    popover.set_has_arrow(false);
-    popover.add_css_class("ctx-menu");
-    popover.insert_action_group("bg", Some(group));
+    let menu = gtk::Popover::new();
+    menu.set_has_arrow(false);
+    menu.add_css_class("ctx-menu");
+    menu.insert_action_group("bg", Some(group));
     let list = menu_box();
-    let open_sub: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+    let create_file_action = group
+        .lookup_action("can-create-file")
+        .and_downcast::<gio::SimpleAction>()
+        .expect("background group has can-create-file action");
     for (index, section) in sections.iter().enumerate() {
-        for row in section.iter() {
-            let button = bg_row_button(row);
-            if let Some(sub_rows) = row.sub {
-                wire_submenu_parent(&button, sub_rows, &popover, group, window, &open_sub);
-            } else {
-                wire_bg_button(&button, row, group, window, &popover, &open_sub);
-                // Hovering any plain row closes a stray submenu.
-                let open_sub = open_sub.clone();
-                let motion = gtk::EventControllerMotion::new();
-                motion.connect_enter(move |_, _, _| close_bg_sub(&open_sub));
-                button.add_controller(motion);
-            }
-            list.append(&button);
-        }
-        if index + 1 < sections.len() {
+        if index > 0 {
             list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         }
+        for row in *section {
+            append_bg_widget(&list, row, group, &create_file_action, manager, window);
+        }
     }
-    popover.set_child(Some(&list));
-    popover.set_parent(anchor);
-    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    let (_, natural_h, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
-    popover.set_position(vertical_side(anchor, y, natural_h));
+    menu.set_child(Some(&list));
+    menu.set_parent(anchor);
+    menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let (_, natural_h, _, _) = menu.measure(gtk::Orientation::Vertical, -1);
+    menu.set_position(vertical_side(anchor, y, natural_h));
+    let popover: gtk::Popover = menu.clone().upcast();
     manager.track_bg_menu(&popover);
-    let tracked = popover.clone();
+    let tracked = popover.downgrade();
     let manager_weak = Rc::downgrade(manager);
-    let open_sub_close = open_sub.clone();
-    popover.connect_closed(move |popover| {
-        close_bg_sub(&open_sub_close);
-        popover.unparent();
-        if let Some(manager) = manager_weak.upgrade() {
+    menu.connect_closed(move |menu| {
+        menu.unparent();
+        if let (Some(manager), Some(tracked)) = (manager_weak.upgrade(), tracked.upgrade()) {
             manager.forget_bg_menu(&tracked);
         }
     });
-    popover.popup();
+    menu.popup();
     popover
 }
 
-/// Sensitivity of a submenu parent: any entry enabled, kept current.
-fn watch_submenu_parent(
-    button: &gtk::Button,
-    sub_rows: &'static [BgRow],
-    group: &gio::SimpleActionGroup,
-) {
-    let actions: Vec<gio::SimpleAction> = sub_rows
-        .iter()
-        .filter_map(|entry| bg_short(entry.action))
-        .filter_map(|short| {
-            group
-                .lookup_action(short)
-                .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
-        })
-        .collect();
-    let update = Rc::new({
-        let button = button.clone();
-        let actions = actions.clone();
-        move || {
-            button.set_sensitive(actions.iter().any(|action| action.is_enabled()));
-        }
-    });
-    update();
-    for action in actions {
-        let update = update.clone();
-        action.connect_notify_local(Some("enabled"), move |_, _| update());
-    }
-}
-
-/// Opens the submenu beside its parent row, on the roomier side. At most
-/// one is ever open; reopening the same row is a no-op.
-fn open_bg_sub(
-    parent_row: &gtk::Button,
-    main: &gtk::Popover,
-    rows: &'static [BgRow],
-    group: &gio::SimpleActionGroup,
-    window: &adw::ApplicationWindow,
-    open_sub: &Rc<RefCell<Option<gtk::Popover>>>,
-) {
-    if open_sub.borrow().is_some() {
-        return;
-    }
-    let sub = gtk::Popover::new();
-    sub.set_has_arrow(false);
-    sub.add_css_class("ctx-menu");
-    let list = menu_box();
-    for row in rows {
-        let button = bg_row_button(row);
-        wire_bg_button(&button, row, group, window, main, open_sub);
-        list.append(&button);
-    }
-    sub.set_child(Some(&list));
-    sub.set_parent(parent_row.upcast_ref::<gtk::Widget>());
-    let side = side_for(
-        parent_row.upcast_ref::<gtk::Widget>(),
-        parent_row.width() as f64,
-    );
-    sub.set_position(side);
-    let edge = if matches!(side, gtk::PositionType::Left) {
-        0
-    } else {
-        parent_row.width()
-    };
-    sub.set_pointing_to(Some(&gdk::Rectangle::new(edge, 0, 1, 1)));
-    sub.set_margin_start(6);
-    sub.set_margin_end(6);
-    sub.set_margin_top(6);
-    sub.set_margin_bottom(6);
-    *open_sub.borrow_mut() = Some(sub.clone());
-    sub.popup();
-}
-
-/// Moves keyboard focus to the first row of the open submenu, so a menu
-/// opened from the keyboard stays operable without the pointer.
-fn focus_first_sub_row(open_sub: &Rc<RefCell<Option<gtk::Popover>>>) {
-    let first = open_sub.borrow().as_ref().and_then(|sub| {
-        sub.child()
-            .and_downcast::<gtk::Box>()
-            .and_then(|list| list.first_child())
-            .and_downcast::<gtk::Button>()
-    });
-    if let Some(button) = first {
-        button.grab_focus();
-    }
-}
-
-/// Wires one row: sensitivity follows its action, activation pops both
-/// menus down and runs the detailed action.
-fn wire_bg_button(
-    button: &gtk::Button,
-    row: &BgRow,
-    group: &gio::SimpleActionGroup,
-    window: &adw::ApplicationWindow,
-    main: &gtk::Popover,
-    open_sub: &Rc<RefCell<Option<gtk::Popover>>>,
-) {
-    // Rows without their own action only open the submenu; their
-    // sensitivity is the OR of their entries, kept current below.
-    if row.sub.is_none() {
-        if let Some(short) = bg_short(row.action) {
-            follow_enabled(button, group, short);
-        }
-        let main = main.clone();
-        let open_sub = open_sub.clone();
-        let window = window.clone();
-        let detailed = row.action.to_string();
-        button.connect_clicked(move |_| {
-            main.popdown();
-            close_bg_sub(&open_sub);
-            let _ = if detailed.starts_with("bg.") {
-                gtk::prelude::WidgetExt::activate_action(&main, &detailed, None)
-            } else {
-                gtk::prelude::WidgetExt::activate_action(&window, &detailed, None)
-            };
-        });
-    }
-}
-
-/// Wires a submenu parent row: hover or activation opens the submenu
-/// (activation also moves keyboard focus into it); sensitivity is the OR
-/// of its entries.
-fn wire_submenu_parent(
-    button: &gtk::Button,
-    sub_rows: &'static [BgRow],
-    main: &gtk::Popover,
-    group: &gio::SimpleActionGroup,
-    window: &adw::ApplicationWindow,
-    open_sub: &Rc<RefCell<Option<gtk::Popover>>>,
-) {
-    watch_submenu_parent(button, sub_rows, group);
-    let motion = gtk::EventControllerMotion::new();
-    {
-        let open_sub = open_sub.clone();
-        let main = main.clone();
-        let group = group.clone();
-        let window = window.clone();
-        let button_weak = button.downgrade();
-        motion.connect_enter(move |_, _, _| {
-            if let Some(button) = button_weak.upgrade() {
-                open_bg_sub(&button, &main, sub_rows, &group, &window, &open_sub);
-            }
-        });
-    }
-    button.add_controller(motion);
-    {
-        let open_sub = open_sub.clone();
-        let main = main.clone();
-        let group = group.clone();
-        let window = window.clone();
-        let button_weak = button.downgrade();
-        button.connect_clicked(move |_| {
-            if let Some(button) = button_weak.upgrade() {
-                open_bg_sub(&button, &main, sub_rows, &group, &window, &open_sub);
-                focus_first_sub_row(&open_sub);
-            }
-        });
-    }
-}
-
-/// Right-click on the background: native menu for the tab folder captured
-/// at open time. Returns the open popover and its `bg` action group.
+/// Right-click on the background: compact icon-row menu for the tab folder
+/// captured at open time. Returns the popover and its `bg` action group.
 pub fn show_background_for(
     anchor: &gtk::Widget,
     x: f64,
     y: f64,
-    ctx: &ops::Ctx,
+    ctx: &Rc<ops::Ctx>,
     dest: &str,
     manager: &Rc<TabManager>,
 ) -> (gtk::Popover, gio::SimpleActionGroup) {
@@ -761,12 +645,16 @@ pub fn show_background_for(
     let group = gio::SimpleActionGroup::new();
     let writable = writable_initial(dest);
     let paste = clipboard_hint(ctx);
+    let can_create_file = gio::SimpleAction::new("can-create-file", None);
+    can_create_file.set_enabled(writable);
+    group.add_action(&can_create_file);
     let new_folder = bg_action(
         &group,
         "new-folder",
         writable,
         ctx,
         dest,
+        manager,
         ops::Ctx::new_folder_at,
     );
     let new_empty = bg_action(
@@ -775,44 +663,67 @@ pub fn show_background_for(
         writable,
         ctx,
         dest,
+        manager,
         |ctx, dest| ctx.new_file_at(dest, crate::l10n::tr("suggest-empty-file")),
     );
-    let new_text = bg_action(&group, "new-text-file", writable, ctx, dest, |ctx, dest| {
-        ctx.new_file_at(
-            dest,
-            format!("{}.txt", crate::l10n::tr("suggest-text-file")),
-        )
-    });
-    let new_html = bg_action(&group, "new-html-page", writable, ctx, dest, |ctx, dest| {
-        ctx.new_file_at(dest, format!("{}.html", crate::l10n::tr("suggest-html")))
-    });
+    let new_text = bg_action(
+        &group,
+        "new-text-file",
+        writable,
+        ctx,
+        dest,
+        manager,
+        |ctx, dest| {
+            ctx.new_file_at(
+                dest,
+                format!("{}.txt", crate::l10n::tr("suggest-text-file")),
+            )
+        },
+    );
+    let new_html = bg_action(
+        &group,
+        "new-html-page",
+        writable,
+        ctx,
+        dest,
+        manager,
+        |ctx, dest| ctx.new_file_at(dest, format!("{}.html", crate::l10n::tr("suggest-html"))),
+    );
     let paste_action = bg_action(
         &group,
         "paste",
         writable && paste,
         ctx,
         dest,
+        manager,
         |ctx, dest| ctx.paste_at(dest),
     );
+    let mut terminal_actions = Vec::new();
     if local {
-        let available = crate::terminal::available_terminal_programs();
-        let choice = ctx.preferences.snapshot().terminal;
-        bg_action(
-            &group,
-            "open-terminal",
-            crate::terminal::can_open(false, &choice, &available),
-            ctx,
-            dest,
-            |ctx, dest| ctx.open_terminal_at(dest, false),
-        );
-        bg_action(
-            &group,
-            "open-terminal-root",
-            crate::terminal::can_open(true, &choice, &available),
-            ctx,
-            dest,
-            |ctx, dest| ctx.open_terminal_at(dest, true),
-        );
+        terminal_actions.push((
+            bg_action(
+                &group,
+                "open-terminal",
+                false,
+                ctx,
+                dest,
+                manager,
+                |ctx, dest| ctx.open_terminal_at(dest, false),
+            ),
+            false,
+        ));
+        terminal_actions.push((
+            bg_action(
+                &group,
+                "open-terminal-root",
+                false,
+                ctx,
+                dest,
+                manager,
+                |ctx, dest| ctx.open_terminal_at(dest, true),
+            ),
+            true,
+        ));
     }
     bg_action(
         &group,
@@ -820,16 +731,33 @@ pub fn show_background_for(
         true,
         ctx,
         dest,
+        manager,
         ops::Ctx::show_folder_properties,
     );
     let sections = bg_sections(local);
-    let popover = popup_bg(anchor, x, y, &sections, &group, &ctx.window, manager);
+    let popover = popup_bg(anchor, x, y, &sections, &group, manager, &ctx.window);
     refine_writability(
         dest,
         manager,
         &popover,
-        &[new_folder, new_empty, new_text, new_html, paste_action],
+        &[
+            (new_folder, true),
+            (new_empty, true),
+            (new_text, true),
+            (new_html, true),
+            (paste_action, paste),
+            (can_create_file, true),
+        ],
     );
+    if local {
+        refine_terminal_actions(
+            dest,
+            manager,
+            &popover,
+            ctx.preferences.snapshot().terminal,
+            &terminal_actions,
+        );
+    }
     (popover, group)
 }
 
@@ -839,19 +767,13 @@ pub fn show_trash_background_for(
     anchor: &gtk::Widget,
     x: f64,
     y: f64,
-    ctx: &ops::Ctx,
+    ctx: &Rc<ops::Ctx>,
     manager: &Rc<TabManager>,
 ) {
     let sections = [&BG_TRASH_ROWS[..]];
-    popup_bg(
-        anchor,
-        x,
-        y,
-        &sections,
-        &gio::SimpleActionGroup::new(),
-        &ctx.window,
-        manager,
-    );
+    let group = gio::SimpleActionGroup::new();
+    group.add_action(&gio::SimpleAction::new("can-create-file", None));
+    popup_bg(anchor, x, y, &sections, &group, manager, &ctx.window);
 }
 
 #[cfg(test)]
@@ -902,10 +824,12 @@ mod tests {
         let parent = &sections[0][1];
         // Second create entry is the New File submenu (no action of its own).
         let sub = parent.sub.expect("new-file submenu");
+        assert!(!parent.icons.is_empty());
         assert_eq!(
             sub.iter().map(|row| row.action).collect::<Vec<_>>(),
             vec!["bg.new-empty-file", "bg.new-text-file", "bg.new-html-page"]
         );
+        assert!(sub.iter().all(|row| !row.icons.is_empty()));
         // No Word/Spreadsheet placeholders anywhere, submenu included.
         for section in bg_sections(true) {
             for row in section.iter() {
@@ -922,11 +846,18 @@ mod tests {
     }
 
     #[test]
+    fn paste_requires_both_a_writable_folder_and_clipboard_content() {
+        assert!(action_available(true, true));
+        assert!(!action_available(false, true));
+        assert!(!action_available(true, false));
+        assert!(!action_available(false, false));
+    }
+
+    #[test]
     fn trash_background_holds_only_empty_trash() {
         assert_eq!(BG_TRASH_ROWS.len(), 1);
         let row = &BG_TRASH_ROWS[0];
         assert_eq!(row.action, "win.empty-trash");
-        assert!(row.danger);
         assert!(row.sub.is_none());
     }
 
@@ -975,164 +906,28 @@ mod tests {
         );
     }
 
-    /// The custom background menu: icon+label rows in spec order with the
-    /// submenu indicator, separators only between sections, working
-    /// submenu open, and no leftover popovers after closing. Needs a
-    /// display; skipped headless. Label values are not asserted: parallel
-    /// localization tests share the global catalog.
+    /// The menu model carries submenu structure and each child action.
     #[test]
-    fn bg_menu_opens_with_icons_and_a_working_submenu() {
+    fn background_menu_uses_native_submenu_model() {
+        let menu = gio::Menu::new();
+        append_bg_row(&menu, &BG_CREATE_ROWS[1]);
+        assert_eq!(menu.n_items(), 1);
+        let submenu = menu
+            .item_link(0, gio::MENU_LINK_SUBMENU)
+            .expect("New File has a native submenu");
+        assert_eq!(submenu.n_items(), 3);
+        for index in 0..submenu.n_items() {
+            assert!(submenu
+                .item_attribute_value(index, gio::MENU_ATTRIBUTE_ACTION, None)
+                .and_then(|value| value.get::<String>())
+                .is_some_and(|action| action.starts_with("bg.new-")));
+        }
+
         let _ = gtk::init();
-        let _display = gdk::Display::default()
-            .or_else(|| gdk::Display::open(std::env::var("WAYLAND_DISPLAY").ok().as_deref()));
         let Some(_) = gdk::Display::default() else {
             return;
         };
-        /// Direct row buttons of a menu box, in order.
-        fn row_buttons(list: &gtk::Box) -> Vec<gtk::Button> {
-            let mut out = Vec::new();
-            let mut child = list.first_child();
-            while let Some(widget) = child {
-                if let Ok(button) = widget.clone().downcast::<gtk::Button>() {
-                    out.push(button);
-                }
-                child = widget.next_sibling();
-            }
-            out
-        }
-        /// (main label text, has icon, has submenu indicator) per row.
-        fn row_shape(button: &gtk::Button) -> (String, bool, bool) {
-            let content = button
-                .child()
-                .and_downcast::<gtk::Box>()
-                .expect("row content");
-            let mut text = String::new();
-            let mut icon = false;
-            let mut sub = false;
-            let mut child = content.first_child();
-            while let Some(widget) = child {
-                if widget.clone().downcast::<gtk::Image>().is_ok() {
-                    icon = true;
-                }
-                if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
-                    let label_text = label.text().to_string();
-                    if label_text == "›" {
-                        sub = true;
-                    } else if text.is_empty() {
-                        text = label_text;
-                    }
-                }
-                child = widget.next_sibling();
-            }
-            (text, icon, sub)
-        }
-        fn popovers_under(widget: &gtk::Widget, out: &mut Vec<gtk::Popover>) {
-            if let Ok(popover) = widget.clone().downcast::<gtk::Popover>() {
-                out.push(popover);
-            }
-            let children = widget.observe_children();
-            for i in 0..children.n_items() {
-                if let Some(child) = children.item(i).and_downcast::<gtk::Widget>() {
-                    popovers_under(&child, out);
-                }
-            }
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = format!("file://{}", tmp.path().display());
-        // No application loop: the custom menu builds synchronously, so the
-        // whole open/close cycle is exercised without contending for the
-        // default main context with other tests.
-        let app = adw::Application::builder()
-            .application_id("it.kito.BgMenuTest")
-            .build();
-        let window: adw::ApplicationWindow =
-            adw::ApplicationWindow::builder().application(&app).build();
-        let tab_view = adw::TabView::new();
-        let store = crate::preferences::PreferenceStore::load();
-        let manager = crate::tabs::TabManager::new(
-            tab_view,
-            window.clone(),
-            Rc::new(|_, _, _| {}),
-            Rc::new(|_, _| {}),
-            Rc::new(|_, _| {}),
-            Rc::new(std::cell::Cell::new(false)),
-            store.shared(),
-        );
-        let ctx = Rc::new(ops::Ctx {
-            window: window.clone(),
-            manager: manager.clone(),
-            toast: adw::ToastOverlay::new(),
-            clipboard: Rc::new(std::cell::RefCell::new(ops::ClipTracker::default())),
-            preferences: store.clone(),
-            focus_path: Rc::new(|| {}),
-        });
-        let (popover, group) =
-            show_background_for(window.upcast_ref(), 10.0, 10.0, &ctx, &dest, &manager);
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
         assert!(!popover.has_arrow());
-        // Actions behind the rows resolve and start enabled.
-        for name in ["new-folder", "new-empty-file", "folder-properties"] {
-            let action = group
-                .lookup_action(name)
-                .unwrap_or_else(|| panic!("missing bg action {name}"))
-                .downcast::<gio::SimpleAction>()
-                .expect("bg actions are simple actions");
-            assert!(action.is_enabled(), "bg action {name} starts enabled");
-        }
-        // Six icon+label rows, exactly one submenu indicator, three
-        // separators between the four sections.
-        let list = popover
-            .child()
-            .and_downcast::<gtk::Box>()
-            .expect("menu list");
-        let rows = row_buttons(&list);
-        assert_eq!(rows.len(), 6);
-        let mut separators = 0;
-        let mut child = list.first_child();
-        while let Some(widget) = child {
-            if widget.clone().downcast::<gtk::Separator>().is_ok() {
-                separators += 1;
-            }
-            child = widget.next_sibling();
-        }
-        assert_eq!(separators, 3);
-        let mut sub_index = None;
-        for (index, button) in rows.iter().enumerate() {
-            let (text, icon, sub) = row_shape(button);
-            assert!(!text.is_empty(), "row {index} labelled");
-            assert!(icon, "row {index} has an icon");
-            if sub {
-                assert_eq!(sub_index, None, "single submenu parent");
-                sub_index = Some(index);
-            }
-        }
-        assert_eq!(sub_index, Some(1), "New File is the second row");
-        // Opening the submenu yields three rows, then everything closes
-        // without leftovers.
-        rows[sub_index.unwrap()].emit_clicked();
-        let anchor = popover.parent().expect("menu anchored");
-        let mut found = Vec::new();
-        popovers_under(&anchor, &mut found);
-        assert_eq!(found.len(), 2, "main plus submenu");
-        let sub = found
-            .into_iter()
-            .find(|menu| menu != &popover)
-            .expect("submenu popover");
-        assert!(!sub.has_arrow());
-        let sub_list = sub
-            .child()
-            .and_downcast::<gtk::Box>()
-            .expect("submenu list");
-        let sub_rows = row_buttons(&sub_list);
-        assert_eq!(sub_rows.len(), 3);
-        for (index, button) in sub_rows.iter().enumerate() {
-            let (text, icon, sub) = row_shape(button);
-            assert!(!text.is_empty(), "sub row {index} labelled");
-            assert!(icon, "sub row {index} has an icon");
-            assert!(!sub, "no nested sub-submenu");
-        }
-        popover.popdown();
-        let mut leftovers = Vec::new();
-        popovers_under(&anchor, &mut leftovers);
-        assert!(leftovers.is_empty(), "no popover accumulates");
     }
 }

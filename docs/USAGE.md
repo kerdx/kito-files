@@ -45,7 +45,10 @@ supports one item at a time.
   characters without double-encoding; failed navigation leaves location and history unchanged
 - Show / hide hidden files (dotfiles) through the view popover; the active tab
   updates immediately and other tabs apply the setting when selected
-- Empty-folder page when there are no visible items
+- Empty-folder page only after a successful load with no visible items
+- Folder changes keep the current listing and its path/actions together until
+  the next folder is ready; after 200 ms, a small overlay offers **Stop**
+  (Interrompi in Italian). Fast loads do not show it
 - Status bar with item and selection counters
 
 **Sidebar**
@@ -61,7 +64,8 @@ supports one item at a time.
 **File operations**
 
 - Copy and cut prepare the clipboard; paste performs copying or moving in a
-  background thread, with the result reported through a toast
+  background thread. Failures open one summary with expandable per-item
+  operation, path and cause details; successful batches use a toast
 - Paste follows the current system clipboard rather than an outdated internal
   selection. Failed cut operations retain the failed items for another move attempt;
   repeated paste cannot dispatch the same cut concurrently
@@ -78,6 +82,10 @@ supports one item at a time.
 - Open folders in the current tab and files with the system default application (`gio::AppInfo`)
 - Properties dialog with name, location, type, size and modification time
 - Context menus for files, empty space, and the Trash
+- The empty-space menu uses compact icon rows without a scrollbar, matching
+  file menus; **New File** opens a native submenu
+- The empty-space menu uses the folder and tab where it was opened. Folder
+  Properties there ignore any existing file selection without clearing it.
 
 **Integration**
 

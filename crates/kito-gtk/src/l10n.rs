@@ -57,14 +57,6 @@ pub(crate) fn tr_with_one(id: &str, name: &str, value: &str) -> String {
     tr_with(id, &args)
 }
 
-/// Pluralized message with both `$failed` and `$total` parameters.
-pub(crate) fn tr_with_two_counts(id: &str, failed: u64, total: u64) -> String {
-    let mut args = kito_i18n::FluentArgs::new();
-    args.set("failed", failed);
-    args.set("total", total);
-    tr_with(id, &args)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

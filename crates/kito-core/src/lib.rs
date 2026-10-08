@@ -28,19 +28,49 @@ pub struct Entry {
     pub icon: Option<String>,
 }
 
+/// Timings for the two independent stages of directory listing. These are
+/// useful for separating backend enumeration from in-memory ordering; they
+/// say nothing about how quickly a particular display paints the result.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListTimings {
+    pub enumeration: std::time::Duration,
+    pub sorting: std::time::Duration,
+}
+
+/// One entry considered while emptying a directory. A missing error means
+/// deletion succeeded; failed URIs and backend causes remain paired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteResult {
+    pub uri: String,
+    pub error: Option<glib::Error>,
+}
+
 /// Lists the contents of `dir_uri` (e.g. `file:///home/user`).
 /// Returns sorted entries: directories first, then files, by name.
 /// With `show_hidden = false` skips files starting with `.`.
 pub fn list_dir(dir_uri: &str, show_hidden: bool) -> Result<Vec<Entry>, glib::Error> {
+    let cancellable = gio::Cancellable::new();
+    list_dir_with_cancellable(dir_uri, show_hidden, &cancellable).map(|(entries, _)| entries)
+}
+
+/// Cancellable directory listing for worker threads. GIO enumeration checks
+/// the cancellable between backend reads; sorting itself is a single stable
+/// sort and can only be cancelled immediately after it finishes.
+pub fn list_dir_with_cancellable(
+    dir_uri: &str,
+    show_hidden: bool,
+    cancellable: &gio::Cancellable,
+) -> Result<(Vec<Entry>, ListTimings), glib::Error> {
     let dir = gio::File::for_uri(dir_uri);
+    let enumeration_started = std::time::Instant::now();
     let enumerator = dir.enumerate_children(
         "standard::name,standard::type,standard::size,standard::icon,standard::content-type",
         gio::FileQueryInfoFlags::NONE,
-        gio::Cancellable::NONE,
+        Some(cancellable),
     )?;
 
     let mut entries = Vec::new();
-    while let Some(info) = enumerator.next_file(gio::Cancellable::NONE)? {
+    while let Some(info) = enumerator.next_file(Some(cancellable))? {
         let name = info.name();
         let name = name.to_string_lossy();
         if !show_hidden && name.starts_with('.') {
@@ -64,8 +94,29 @@ pub fn list_dir(dir_uri: &str, show_hidden: bool) -> Result<Vec<Entry>, glib::Er
         });
     }
 
+    let enumeration = enumeration_started.elapsed();
+    if cancellable.is_cancelled() {
+        return Err(glib::Error::new(
+            gio::IOErrorEnum::Cancelled,
+            "Operation cancelled",
+        ));
+    }
+    let sorting_started = std::time::Instant::now();
     entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
-    Ok(entries)
+    let sorting = sorting_started.elapsed();
+    if cancellable.is_cancelled() {
+        return Err(glib::Error::new(
+            gio::IOErrorEnum::Cancelled,
+            "Operation cancelled",
+        ));
+    }
+    Ok((
+        entries,
+        ListTimings {
+            enumeration,
+            sorting,
+        },
+    ))
 }
 
 fn io_error(msg: &str) -> glib::Error {
@@ -160,6 +211,17 @@ pub fn resolve_path_text(text: &str, shown_text: &str, shown_uri: &str) -> Optio
 /// Empties `dir_uri`: deletes every contained entry. Returns
 /// `(total entries, entries not deleted)`. Used by trash (`empty_trash`).
 pub fn empty_dir(dir_uri: &str) -> Result<(usize, usize), glib::Error> {
+    let results = empty_dir_detailed(dir_uri)?;
+    let failed = results
+        .iter()
+        .filter(|result| result.error.is_some())
+        .count();
+    Ok((results.len(), failed))
+}
+
+/// Empties a directory and retains each attempted URI and its technical
+/// error for a caller that needs an operation report.
+pub fn empty_dir_detailed(dir_uri: &str) -> Result<Vec<DeleteResult>, glib::Error> {
     let dir = gio::File::for_uri(dir_uri);
     let children = dir.enumerate_children(
         "standard::name",
@@ -173,18 +235,23 @@ pub fn empty_dir(dir_uri: &str) -> Result<(usize, usize), glib::Error> {
         uris.push(children.child(&info).uri().to_string());
     }
     drop(children);
-    let mut failed = 0;
-    for uri in &uris {
-        if delete_recursive(uri).is_err() {
-            failed += 1;
-        }
-    }
-    Ok((uris.len(), failed))
+    Ok(uris
+        .into_iter()
+        .map(|uri| {
+            let error = delete_recursive(&uri).err();
+            DeleteResult { uri, error }
+        })
+        .collect())
 }
 
 /// Empties the trash: all entries are deleted permanently.
 pub fn empty_trash() -> Result<(usize, usize), glib::Error> {
     empty_dir(TRASH_URI)
+}
+
+/// Detailed results for emptying Trash after the UI has confirmed it.
+pub fn empty_trash_detailed() -> Result<Vec<DeleteResult>, glib::Error> {
+    empty_dir_detailed(TRASH_URI)
 }
 
 /// Restores a trash entry to its original location.
@@ -489,6 +556,32 @@ mod tests {
     #[test]
     fn list_dir_missing_returns_error() {
         assert!(list_dir("file:///non/esiste/sicuramente", true).is_err());
+    }
+
+    #[test]
+    fn list_dir_honors_a_pre_cancelled_gio_cancellable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("entry.txt"), b"x").unwrap();
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let uri = gio::File::for_path(tmp.path()).uri().to_string();
+        assert!(list_dir_with_cancellable(&uri, true, &cancellable).is_err());
+    }
+
+    #[test]
+    fn detailed_empty_dir_preserves_item_uris_and_successes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), b"b").unwrap();
+        let uri = gio::File::for_path(tmp.path()).uri().to_string();
+
+        let mut results = empty_dir_detailed(&uri).unwrap();
+        results.sort_by(|left, right| left.uri.cmp(&right.uri));
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.error.is_none()));
+        assert!(results[0].uri.contains("a.txt"));
+        assert!(results[1].uri.contains("b.txt"));
     }
 
     #[test]

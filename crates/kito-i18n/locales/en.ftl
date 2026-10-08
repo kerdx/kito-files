@@ -89,6 +89,7 @@ error-open-folder = Could not open folder
 error-invalid-path = Enter a local path or URI to open.
 empty-folder = This folder is empty
 loading-folder = Loading…
+loading-interrupt = Stop
 error-open-file = Could not open file
 error-open-file-detail = Kito Files could not start the default application: { $error }
 
@@ -157,6 +158,35 @@ rename-select = Select a single item to rename
 renamed-ok = Renamed
 folder-created = Folder created
 created-file = Created { $name }
+
+## Operation results
+operation-copy = Copy
+operation-move = Move
+operation-trash = Move to Trash
+operation-restore = Restore
+operation-delete = Delete permanently
+operation-empty-trash = Empty Trash
+operation-rename = Rename
+operation-create-folder = Create folder
+operation-create-file = Create file
+operation-result-title = Operation result
+operation-result-success = { $operation }: { $count ->
+    [one] completed one item.
+   *[other] completed { $count } items.
+}
+operation-result-failed = { $operation }: all { $total } items failed.
+operation-result-partial = { $operation }: { $succeeded } of { $total } succeeded; { $failed } failed.
+operation-result-cancelled = { $operation }: { $succeeded } succeeded, { $failed } failed, and { $cancelled } cancelled out of { $total }.
+operation-details = Details
+operation-detail-operation = Operation: { $operation }
+operation-detail-source = Source: { $source }
+operation-detail-destination = Destination: { $destination }
+operation-item-succeeded = Completed
+operation-item-failed = Failed: { $error }
+operation-item-cancelled = Cancelled: { $error }
+operation-retry-failed = Retry failed items
+operation-close = Close
+trash-already-empty = The Trash is already empty.
 
 ## Dialogs
 dialog-ok = Ok
