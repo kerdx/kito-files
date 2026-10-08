@@ -147,6 +147,14 @@ Design rules:
   Fluent catalogs with English fallback. No runtime catalog path or `msgfmt` is needed.
 - **Freedesktop, not GNOME** — GIO/GVfs for files, freedesktop bookmarks, icon themes
   and `gio::AppInfo` for launching default applications.
+- **GTK4 menu icons** — `GtkPopoverMenu` does not show an icon attribute beside a
+  normal text menu item. Icons are shown for icon-only items or sections using an
+  icon-button display hint ([GTK docs](https://docs.gtk.org/gtk4/class.PopoverMenu.html),
+  [GTK explanation](https://discourse.gnome.org/t/g-menu-attribute-icon-does-not-work-in-gtk4-as-expected/7377)).
+  When a row needs both an icon and a label, use a custom `gtk::Popover` row with
+  `GtkImage` and `GtkLabel`, an accessible label, and the existing window action;
+  see the application menu in `main.rs` and context menus in `context_menu.rs`.
+  `GMenuItem::set_icon` alone is not enough for a regular text row.
 
 ## Adding translations
 
