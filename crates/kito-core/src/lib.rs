@@ -18,6 +18,8 @@ pub struct Entry {
     pub is_dir: bool,
     /// Size in bytes, -1 if folder or unknown.
     pub size: i64,
+    /// Unix seconds from `time::modified`, if the backend provides it.
+    pub modified: Option<i64>,
     /// MIME content type (files only), e.g. `text/plain`.
     pub content_type: Option<String>,
     /// Theme icon in `g_icon_to_string` form (parse back with
@@ -26,6 +28,139 @@ pub struct Entry {
     /// icons enumerators return, and unparsable values fall back to the
     /// generic icon in the view.
     pub icon: Option<String>,
+}
+
+#[cfg(test)]
+mod sorting_tests {
+    use super::*;
+
+    fn entry(
+        name: &str,
+        uri: &str,
+        is_dir: bool,
+        size: i64,
+        modified: Option<i64>,
+        content_type: Option<&str>,
+    ) -> Entry {
+        Entry {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            is_dir,
+            size,
+            modified,
+            content_type: content_type.map(str::to_string),
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn name_order_is_natural_and_handles_unbounded_numeric_runs() {
+        let run_300 = format!("file{}", "9".repeat(300));
+        let run_255 = format!("file{}", "9".repeat(255));
+        let mut entries = vec![
+            entry(&run_300, "u4", false, 0, None, None),
+            entry(&run_255, "u3", false, 0, None, None),
+            entry("file10", "u2", false, 0, None, None),
+            entry("file2", "u1", false, 0, None, None),
+        ];
+        sort_entries(&mut entries, SortOrder::default());
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["file2", "file10", run_255.as_str(), run_300.as_str()]
+        );
+    }
+
+    #[test]
+    fn directories_stay_first_and_missing_metadata_stays_last_in_both_directions() {
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            let mut entries = vec![
+                entry("unknown", "u4", false, -1, None, None),
+                entry("file2", "u3", false, 2, Some(2), Some("text/plain")),
+                entry("folder", "u1", true, -1, None, None),
+                entry("file1", "u2", false, 1, Some(1), Some("text/plain")),
+            ];
+            sort_entries(
+                &mut entries,
+                SortOrder {
+                    field: SortField::Modified,
+                    direction,
+                },
+            );
+            assert!(entries[0].is_dir);
+            assert_eq!(entries[3].name, "unknown");
+        }
+    }
+
+    #[test]
+    fn equal_keys_use_name_then_uri_for_deterministic_order() {
+        let mut entries = vec![
+            entry("same", "uri-b", false, 4, Some(1), None),
+            entry("same", "uri-a", false, 4, Some(1), None),
+        ];
+        sort_entries(
+            &mut entries,
+            SortOrder {
+                field: SortField::Size,
+                direction: SortDirection::Descending,
+            },
+        );
+        assert_eq!(entries[0].uri, "uri-a");
+        assert_eq!(entries[1].uri, "uri-b");
+    }
+
+    #[test]
+    fn cached_sort_keys_match_the_shared_comparator_for_all_orders() {
+        let original = vec![
+            entry("file10", "uri-z", false, 10, Some(3), Some("text/plain")),
+            entry("file2", "uri-c", false, 2, Some(1), Some("text/plain")),
+            entry("file02", "uri-b", false, 2, Some(1), Some("text/plain")),
+            entry("folder2", "uri-a", true, -1, None, None),
+            entry("unknown", "uri-d", false, -1, None, None),
+            entry("image", "uri-e", false, 8, Some(2), Some("image/png")),
+        ];
+
+        for field in [
+            SortField::Name,
+            SortField::Size,
+            SortField::Type,
+            SortField::Modified,
+        ] {
+            for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                let order = SortOrder { field, direction };
+                let mut expected = original.clone();
+                expected.sort_by(|left, right| compare_entries(left, right, order));
+                let mut actual = original.clone();
+                sort_entries(&mut actual, order);
+                assert_eq!(
+                    actual.iter().map(|entry| &entry.uri).collect::<Vec<_>>(),
+                    expected.iter().map(|entry| &entry.uri).collect::<Vec<_>>(),
+                    "cached key mismatch for {field:?} {direction:?}"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortField {
+    #[default]
+    Name,
+    Size,
+    Type,
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SortOrder {
+    pub field: SortField,
+    pub direction: SortDirection,
 }
 
 /// Timings for the two independent stages of directory listing. These are
@@ -61,10 +196,21 @@ pub fn list_dir_with_cancellable(
     show_hidden: bool,
     cancellable: &gio::Cancellable,
 ) -> Result<(Vec<Entry>, ListTimings), glib::Error> {
+    list_dir_with_sort(dir_uri, show_hidden, cancellable, SortOrder::default())
+}
+
+/// Lists a directory with a selected sort order. GIO metadata and sorting
+/// both run on the caller's worker thread.
+pub fn list_dir_with_sort(
+    dir_uri: &str,
+    show_hidden: bool,
+    cancellable: &gio::Cancellable,
+    order: SortOrder,
+) -> Result<(Vec<Entry>, ListTimings), glib::Error> {
     let dir = gio::File::for_uri(dir_uri);
     let enumeration_started = std::time::Instant::now();
     let enumerator = dir.enumerate_children(
-        "standard::name,standard::type,standard::size,standard::icon,standard::content-type",
+        "standard::name,standard::type,standard::size,time::modified,standard::icon,standard::content-type",
         gio::FileQueryInfoFlags::NONE,
         Some(cancellable),
     )?;
@@ -83,6 +229,7 @@ pub fn list_dir_with_cancellable(
             uri: file.uri().into(),
             is_dir,
             size: if is_dir { -1 } else { info.size() },
+            modified: info.attribute_uint64("time::modified").try_into().ok(),
             content_type: (!is_dir)
                 .then(|| info.content_type())
                 .flatten()
@@ -102,7 +249,7 @@ pub fn list_dir_with_cancellable(
         ));
     }
     let sorting_started = std::time::Instant::now();
-    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
+    sort_entries(&mut entries, order);
     let sorting = sorting_started.elapsed();
     if cancellable.is_cancelled() {
         return Err(glib::Error::new(
@@ -117,6 +264,181 @@ pub fn list_dir_with_cancellable(
             sorting,
         },
     ))
+}
+
+/// Sorts entries deterministically. Directories remain first in both
+/// directions; unknown metadata remains last within each group.
+pub fn sort_entries(entries: &mut [Entry], order: SortOrder) {
+    let name_keys: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|entry| natural_name_sort_key(&entry.name))
+        .collect();
+    let mut indices: Vec<usize> = (0..entries.len()).collect();
+    indices.sort_by(|left, right| {
+        compare_entries_with_name_keys(
+            &entries[*left],
+            &entries[*right],
+            &name_keys[*left],
+            &name_keys[*right],
+            order,
+        )
+    });
+
+    // Apply the computed order in place; the index map keeps URI and icon
+    // strings from being cloned into a second listing.
+    let mut positions = vec![0; indices.len()];
+    for (new_index, old_index) in indices.into_iter().enumerate() {
+        positions[old_index] = new_index;
+    }
+    for index in 0..positions.len() {
+        while positions[index] != index {
+            let target = positions[index];
+            entries.swap(index, target);
+            positions.swap(index, target);
+        }
+    }
+}
+
+/// Queries one directory entry's display and sort metadata. Intended for
+/// worker threads, including targeted updates from GIO monitors.
+pub fn query_entry(uri: &str) -> Result<Entry, glib::Error> {
+    let file = gio::File::for_uri(uri);
+    let info = file.query_info(
+        "standard::name,standard::type,standard::size,time::modified,standard::icon,standard::content-type",
+        gio::FileQueryInfoFlags::NONE,
+        gio::Cancellable::NONE,
+    )?;
+    let is_dir = info.file_type() == gio::FileType::Directory;
+    Ok(Entry {
+        name: info.name().to_string_lossy().into_owned(),
+        uri: file.uri().to_string(),
+        is_dir,
+        size: if is_dir { -1 } else { info.size() },
+        modified: info.attribute_uint64("time::modified").try_into().ok(),
+        content_type: (!is_dir)
+            .then(|| info.content_type())
+            .flatten()
+            .map(|content_type| content_type.to_string()),
+        icon: info
+            .icon()
+            .and_then(|icon| icon.to_string())
+            .map(|icon| icon.to_string()),
+    })
+}
+
+pub fn compare_entries(left: &Entry, right: &Entry, order: SortOrder) -> std::cmp::Ordering {
+    let left_name = natural_name_sort_key(&left.name);
+    let right_name = natural_name_sort_key(&right.name);
+    compare_entries_with_name_keys(left, right, &left_name, &right_name, order)
+}
+
+fn compare_entries_with_name_keys(
+    left: &Entry,
+    right: &Entry,
+    left_name: &[u8],
+    right_name: &[u8],
+    order: SortOrder,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match right.is_dir.cmp(&left.is_dir) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    let key = match order.field {
+        SortField::Name => match order.direction {
+            SortDirection::Ascending => left_name.cmp(right_name),
+            SortDirection::Descending => right_name.cmp(left_name),
+        },
+        SortField::Size => compare_optional(
+            (left.size >= 0).then_some(left.size),
+            (right.size >= 0).then_some(right.size),
+            order.direction,
+        ),
+        SortField::Type => {
+            let left_type = if left.is_dir {
+                Some("inode/directory")
+            } else {
+                left.content_type.as_deref()
+            };
+            let right_type = if right.is_dir {
+                Some("inode/directory")
+            } else {
+                right.content_type.as_deref()
+            };
+            compare_optional(left_type, right_type, order.direction)
+        }
+        SortField::Modified => compare_optional(left.modified, right.modified, order.direction),
+    };
+    key.then_with(|| left_name.cmp(right_name))
+        .then_with(|| left.uri.cmp(&right.uri))
+}
+
+fn compare_optional<T: Ord>(
+    left: Option<T>,
+    right: Option<T>,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Some(left), Some(right)) => match direction {
+            SortDirection::Ascending => left.cmp(&right),
+            SortDirection::Descending => right.cmp(&left),
+        },
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Encodes a natural, case-insensitive name key for bytewise comparison.
+/// Numeric runs use fixed-width length prefixes, so arbitrarily long digit
+/// sequences sort naturally without parsing into a machine integer.
+fn natural_name_sort_key(name: &str) -> Vec<u8> {
+    let folded = name.to_lowercase();
+    let bytes = folded.as_bytes();
+    let mut key = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            key.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let mut significant = start;
+        while significant + 1 < index && bytes[significant] == b'0' {
+            significant += 1;
+        }
+
+        // This marker sorts between non-digit bytes and ASCII digit bytes.
+        key.push(b'0');
+        append_ordered_len(&mut key, index - significant);
+        key.extend_from_slice(&bytes[significant..index]);
+        append_ordered_len(&mut key, index - start);
+    }
+    key
+}
+
+fn append_ordered_len(key: &mut Vec<u8>, length: usize) {
+    if length < u8::MAX as usize {
+        key.push(length as u8);
+        return;
+    }
+
+    let bytes = length.to_be_bytes();
+    let first_significant = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    let significant = &bytes[first_significant..];
+    key.push(u8::MAX);
+    key.push(significant.len() as u8);
+    key.extend_from_slice(significant);
 }
 
 fn io_error(msg: &str) -> glib::Error {
@@ -505,12 +827,24 @@ pub fn copy_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
 /// the UI shows the error (copy+delete fallback coming).
 pub fn move_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
     let src = gio::File::for_uri(src_uri);
+    let dest_dir = gio::File::for_uri(dest_dir_uri);
+    if src.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+        == gio::FileType::Directory
+        && dest_inside_src(&src, &dest_dir)
+    {
+        return Err(io_error(
+            "Cannot move a folder into itself or one of its subfolders",
+        ));
+    }
+    if src.parent().is_some_and(|parent| parent.equal(&dest_dir)) {
+        return Err(io_error("Source is already in the destination folder"));
+    }
     let name = src
         .basename()
         .and_then(|n| n.into_string().ok())
         .filter(|n| !n.is_empty())
         .ok_or_else(|| io_error("Invalid file name"))?;
-    let dest = unique_child(&gio::File::for_uri(dest_dir_uri), OsStr::new(&name));
+    let dest = unique_child(&dest_dir, OsStr::new(&name));
     src.move_(
         &dest,
         gio::FileCopyFlags::NONE,
@@ -523,6 +857,22 @@ pub fn move_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_entry_returns_metadata_for_uri_with_spaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("directory with spaces");
+        std::fs::create_dir(&path).unwrap();
+        let file_path = path.join("report final.txt");
+        std::fs::write(&file_path, b"report").unwrap();
+
+        let uri = gio::File::for_path(&file_path).uri();
+        let entry = query_entry(uri.as_ref()).unwrap();
+        assert_eq!(entry.name, "report final.txt");
+        assert_eq!(entry.size, 6);
+        assert!(!entry.is_dir);
+        assert!(entry.uri.contains("%20") || entry.uri.contains(' '));
+    }
 
     #[test]
     fn list_dir_orders_dirs_first() {
@@ -1073,6 +1423,42 @@ mod tests {
 
         assert_eq!(names(&a), before);
         assert_eq!(std::fs::read(a.join("f.txt")).unwrap(), b"effe");
+    }
+
+    #[test]
+    fn move_dir_into_self_or_descendant_is_rejected_without_changes() {
+        let tmp = copy_fixture();
+        let a = tmp.path().join("A");
+        let before = names(&a);
+
+        assert!(move_to(&uri(&a), &uri(&a)).is_err());
+        assert!(move_to(&uri(&a), &uri(&a.join("sub"))).is_err());
+
+        assert_eq!(names(&a), before);
+        assert_eq!(std::fs::read(a.join("f.txt")).unwrap(), b"effe");
+        assert_eq!(std::fs::read(a.join("sub").join("g.txt")).unwrap(), b"gi");
+    }
+
+    #[test]
+    fn move_dir_through_symlink_destination_is_rejected() {
+        let tmp = copy_fixture();
+        let a = tmp.path().join("A");
+        std::os::unix::fs::symlink(a.join("sub"), tmp.path().join("link_sub")).unwrap();
+
+        assert!(move_to(&uri(&a), &uri(&tmp.path().join("link_sub"))).is_err());
+        assert!(a.join("f.txt").exists());
+        assert!(a.join("sub").join("g.txt").exists());
+    }
+
+    #[test]
+    fn move_to_the_same_parent_is_rejected_instead_of_renaming_as_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("report.txt");
+        std::fs::write(&file, b"data").unwrap();
+
+        assert!(move_to(&uri(&file), &uri(tmp.path())).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"data");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[test]

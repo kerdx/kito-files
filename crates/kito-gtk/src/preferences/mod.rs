@@ -9,6 +9,8 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc};
 type OpenItemsListener = Rc<dyn Fn(OpenItems)>;
 type LanguageListener = Rc<dyn Fn(kito_i18n::AppLang)>;
 type WindowControlsListener = Rc<dyn Fn(WindowControls)>;
+type ZoomListener = Rc<dyn Fn(u8)>;
+type DisplayListener = Rc<dyn Fn(Preferences)>;
 
 /// Process-wide settings state shared by every window.
 pub struct PreferenceStore {
@@ -17,6 +19,8 @@ pub struct PreferenceStore {
     open_items_listeners: RefCell<Vec<OpenItemsListener>>,
     language_listeners: RefCell<Vec<LanguageListener>>,
     window_controls_listeners: RefCell<Vec<WindowControlsListener>>,
+    zoom_listeners: RefCell<Vec<ZoomListener>>,
+    display_listeners: RefCell<Vec<DisplayListener>>,
 }
 
 impl PreferenceStore {
@@ -29,6 +33,8 @@ impl PreferenceStore {
             open_items_listeners: RefCell::new(Vec::new()),
             language_listeners: RefCell::new(Vec::new()),
             window_controls_listeners: RefCell::new(Vec::new()),
+            zoom_listeners: RefCell::new(Vec::new()),
+            display_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -40,6 +46,8 @@ impl PreferenceStore {
             open_items_listeners: RefCell::new(Vec::new()),
             language_listeners: RefCell::new(Vec::new()),
             window_controls_listeners: RefCell::new(Vec::new()),
+            zoom_listeners: RefCell::new(Vec::new()),
+            display_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -102,6 +110,46 @@ impl PreferenceStore {
         self.save()
     }
 
+    pub fn set_icon_zoom(&self, zoom: u8) -> io::Result<()> {
+        let zoom = zoom.clamp(model::ICON_ZOOM_MIN, model::ICON_ZOOM_MAX);
+        if self.current.borrow().icon_zoom == zoom {
+            return Ok(());
+        }
+        self.current.borrow_mut().icon_zoom = zoom;
+        for listener in self.zoom_listeners.borrow().iter() {
+            listener(zoom);
+        }
+        self.notify_display();
+        self.save()
+    }
+
+    pub fn set_show_size_column(&self, show: bool) -> io::Result<()> {
+        if self.current.borrow().show_size_column == show {
+            return Ok(());
+        }
+        self.current.borrow_mut().show_size_column = show;
+        self.notify_display();
+        self.save()
+    }
+
+    pub fn set_show_type_column(&self, show: bool) -> io::Result<()> {
+        if self.current.borrow().show_type_column == show {
+            return Ok(());
+        }
+        self.current.borrow_mut().show_type_column = show;
+        self.notify_display();
+        self.save()
+    }
+
+    pub fn set_show_modified_column(&self, show: bool) -> io::Result<()> {
+        if self.current.borrow().show_modified_column == show {
+            return Ok(());
+        }
+        self.current.borrow_mut().show_modified_column = show;
+        self.notify_display();
+        self.save()
+    }
+
     fn notify_window_controls(&self) {
         let controls = self.current.borrow().window_controls;
         for listener in self.window_controls_listeners.borrow().iter() {
@@ -119,6 +167,21 @@ impl PreferenceStore {
 
     pub fn subscribe_window_controls(&self, listener: WindowControlsListener) {
         self.window_controls_listeners.borrow_mut().push(listener);
+    }
+
+    pub fn subscribe_icon_zoom(&self, listener: ZoomListener) {
+        self.zoom_listeners.borrow_mut().push(listener);
+    }
+
+    pub fn subscribe_display(&self, listener: DisplayListener) {
+        self.display_listeners.borrow_mut().push(listener);
+    }
+
+    fn notify_display(&self) {
+        let snapshot = self.snapshot();
+        for listener in self.display_listeners.borrow().iter() {
+            listener(snapshot.clone());
+        }
     }
 
     fn save(&self) -> io::Result<()> {

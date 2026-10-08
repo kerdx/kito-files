@@ -8,7 +8,9 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashSet, VecDeque},
     rc::Rc,
+    sync::Arc,
 };
 
 /// Called on every navigation: updates the tab's pathbar + status + view.
@@ -17,6 +19,7 @@ pub type OnNavigate = Rc<dyn Fn(&str, usize, ViewMode)>;
 pub type OnHistory = Rc<dyn Fn(bool, bool)>;
 /// Updates the status bar: total items, selected items.
 pub type OnStatus = Rc<dyn Fn(usize, usize)>;
+pub type OnSort = Rc<dyn Fn(kito_core::SortOrder)>;
 
 pub struct FileTab {
     page: adw::TabPage,
@@ -28,14 +31,30 @@ pub struct FileTab {
     loading_label: gtk::Label,
     loading_panel: gtk::Box,
     loading_stop: gtk::Button,
-    selection: RefCell<gtk::SingleSelection>,
+    selection: RefCell<gtk::MultiSelection>,
     mode: Cell<ViewMode>,
     open_items: Cell<OpenItems>,
+    sort_order: Rc<Cell<kito_core::SortOrder>>,
+    scroll_before_load: Cell<Option<f64>>,
     history: NavHistory,
+    cached_entries: RefCell<Arc<Vec<kito_core::Entry>>>,
+    monitor: RefCell<Option<gio::FileMonitor>>,
+    monitor_uri: RefCell<Option<String>>,
+    monitor_generation: Cell<u64>,
+    monitor_revision: Cell<u64>,
+    monitor_batch: RefCell<MonitorBatch>,
+    monitor_timer: RefCell<Option<glib::SourceId>>,
+    monitor_unavailable_reported: Cell<bool>,
+    load_monitor_revision: Cell<Option<u64>>,
+    ctx: std::rc::Weak<crate::ops::Ctx>,
+    pending_restore: RefCell<Option<ClosedTab>>,
+    reopening: Cell<bool>,
+    close_on_load_failure: Cell<bool>,
     /// Async load generation: bumped on every navigation; only the latest
     /// worker result may touch history, store and chrome. Older results are
     /// discarded, so a slow folder can never overwrite a newer one.
     load_gen: LoadGen,
+    sort_gen: LoadGen,
     load_cancel: RefCell<Option<gio::Cancellable>>,
     load_active: Cell<Option<u64>>,
     /// Hidden-view sync: the view is fresh only for the global value it
@@ -47,6 +66,7 @@ pub struct FileTab {
     on_navigate: OnNavigate,
     on_history: OnHistory,
     on_status: OnStatus,
+    on_sort: OnSort,
 }
 
 /// Generation protocol for asynchronous loads. The tab bumps the counter
@@ -63,6 +83,88 @@ struct LoadGen {
 struct ListedFolder {
     entries: Vec<kito_core::Entry>,
     timings: kito_core::ListTimings,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ClosedTab {
+    uri: String,
+    mode: ViewMode,
+    sort_order: kito_core::SortOrder,
+    back: Vec<String>,
+    forward: Vec<String>,
+    selected_uris: Vec<String>,
+    scroll_value: f64,
+}
+
+#[derive(Default)]
+struct ClosedTabs(VecDeque<ClosedTab>);
+
+impl ClosedTabs {
+    const LIMIT: usize = 20;
+
+    fn push(&mut self, tab: ClosedTab) {
+        if self.0.len() == Self::LIMIT {
+            self.0.pop_front();
+        }
+        self.0.push_back(tab);
+    }
+
+    fn pop(&mut self) -> Option<ClosedTab> {
+        self.0.pop_back()
+    }
+}
+
+const MONITOR_BATCH_LIMIT: usize = 1024;
+const MONITOR_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(180);
+
+#[derive(Default)]
+struct MonitorBatch {
+    upsert: HashSet<String>,
+    remove: HashSet<String>,
+    reconcile: bool,
+}
+
+impl MonitorBatch {
+    fn upsert(&mut self, uri: String) {
+        self.remove.remove(&uri);
+        self.upsert.insert(uri);
+        self.enforce_limit();
+    }
+
+    fn remove(&mut self, uri: String) {
+        self.upsert.remove(&uri);
+        self.remove.insert(uri);
+        self.enforce_limit();
+    }
+
+    fn require_reconcile(&mut self) {
+        self.reconcile = true;
+        self.upsert.clear();
+        self.remove.clear();
+    }
+
+    fn enforce_limit(&mut self) {
+        if self.upsert.len() + self.remove.len() > MONITOR_BATCH_LIMIT {
+            self.require_reconcile();
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.reconcile && self.upsert.is_empty() && self.remove.is_empty()
+    }
+}
+
+fn monitor_result_is_current(
+    current_uri: &str,
+    expected_uri: &str,
+    current_generation: u64,
+    expected_generation: u64,
+    current_revision: u64,
+    expected_revision: u64,
+) -> bool {
+    current_uri == expected_uri
+        && current_generation == expected_generation
+        && current_revision == expected_revision
 }
 
 impl LoadGen {
@@ -206,8 +308,7 @@ fn run_navigation(
 }
 
 fn activate_at(tab: &Rc<FileTab>, pos: u32) {
-    let selection = tab.selection.borrow().clone();
-    let Some(obj) = selection.item(pos).and_downcast::<FileObject>() else {
+    let Some(obj) = tab.store.item(pos).and_downcast::<FileObject>() else {
         return;
     };
     tab.activate_entry(&obj.uri(), obj.is_dir());
@@ -219,12 +320,22 @@ fn mode_for_new_tab(preferences: &Preferences) -> ViewMode {
 
 /// Wires GTK activation (pointer or Enter) to the freshly created view.
 fn wire_activate(tab: &Rc<FileTab>, widget: &gtk::Widget) {
+    file_list::add_file_shortcuts(widget);
+    let suppress_modified_click = file_list::add_modified_click_guard(widget);
     if let Ok(view) = widget.clone().downcast::<gtk::ColumnView>() {
         let tab = tab.clone();
-        view.connect_activate(move |_, pos| activate_at(&tab, pos));
+        view.connect_activate(move |_, pos| {
+            if !suppress_modified_click.get() {
+                activate_at(&tab, pos);
+            }
+        });
     } else if let Ok(view) = widget.clone().downcast::<gtk::GridView>() {
         let tab = tab.clone();
-        view.connect_activate(move |_, pos| activate_at(&tab, pos));
+        view.connect_activate(move |_, pos| {
+            if !suppress_modified_click.get() {
+                activate_at(&tab, pos);
+            }
+        });
     }
 }
 
@@ -233,26 +344,119 @@ fn is_trash_uri(uri: &str) -> bool {
     uri.starts_with("trash:")
 }
 
-/// Rebuilds widget + selection for the tab's mode.
-/// Right-click first selects the row, then opens the menu on it.
+/// Rebuilds widget + selection for the tab's mode, preserving selected URIs.
+/// Right-click preserves the group when the clicked row is already selected.
 fn rebuild_view(tab: &Rc<FileTab>) {
+    let selected_uris: Vec<String> = tab.selected_objects().iter().map(FileObject::uri).collect();
+    let scroll_value = tab.scrolled.vadjustment().value();
+    let old_view = tab.scrolled.child();
+    let had_focus = old_view.as_ref().is_some_and(|old_view| {
+        let mut focused = gtk::prelude::GtkWindowExt::focus(&tab.window);
+        while let Some(widget) = focused {
+            if widget == *old_view {
+                return true;
+            }
+            focused = widget.parent();
+        }
+        false
+    });
     let on_secondary: SecondaryHandler = Rc::new({
         let tab = tab.clone();
         move |obj: &FileObject, x: f64, y: f64, anchor: &gtk::Widget| {
             if let Some(pos) = tab.store.find(obj) {
-                tab.selection.borrow().select_item(pos, true);
+                let selection = tab.selection.borrow();
+                if !selection.is_selected(pos) {
+                    selection.unselect_all();
+                    selection.select_item(pos, false);
+                }
             }
+            let selected = tab.selected_objects();
+            let folders_only = !selected.is_empty() && selected.iter().all(FileObject::is_dir);
             // In trash the menu changes: restore instead of rename.
             if is_trash_uri(&tab.history.current_uri()) {
-                crate::context_menu::show_trash(anchor, x, y, &tab.window);
+                crate::context_menu::show_trash(anchor, x, y, &tab.window, selected.len());
             } else {
-                crate::context_menu::show(anchor, x, y, &tab.window);
+                crate::context_menu::show(anchor, x, y, &tab.window, selected.len(), folders_only);
+            }
+        }
+    });
+    let on_middle: file_list::MiddleHandler = Rc::new({
+        let manager = tab.manager.clone();
+        let ctx = tab.ctx.clone();
+        move |obj| {
+            if let (Some(manager), Some(ctx)) = (manager.upgrade(), ctx.upgrade()) {
+                manager.open_tab_in_background(&obj.uri(), &ctx);
+            }
+        }
+    });
+    let on_drag_prepare: file_list::DragPrepareHandler = Rc::new({
+        let tab = Rc::downgrade(tab);
+        move |obj| {
+            let tab = tab.upgrade()?;
+            if let Some(position) = tab.store.find(obj) {
+                let selection = tab.selection.borrow();
+                if !selection.is_selected(position) {
+                    selection.unselect_all();
+                    selection.select_item(position, false);
+                }
+            }
+            let uris: Vec<String> = tab.selected_objects().iter().map(FileObject::uri).collect();
+            crate::dnd::prepared_file_list(&uris)
+        }
+    });
+    let on_drop: crate::dnd::DropHandler = Rc::new({
+        let ctx = tab.ctx.clone();
+        move |uris, destination, action, internal, drop| {
+            if let Some(ctx) = ctx.upgrade() {
+                ctx.transfer_uris(uris, destination, action, internal, Some(drop));
+            } else {
+                drop.finish(gtk::gdk::DragAction::empty());
+            }
+        }
+    });
+    let on_external_move: crate::dnd::ExternalMoveHandler = Rc::new({
+        let ctx = tab.ctx.clone();
+        move |uris| {
+            if let Some(ctx) = ctx.upgrade() {
+                ctx.trash_external_move(uris);
             }
         }
     });
     let store = tab.store.clone();
-    let (widget, selection) =
-        file_list::build_view(tab.mode.get(), &store, &on_secondary, tab.open_items.get());
+    let display = tab
+        .manager
+        .upgrade()
+        .map(|manager| manager.preferences.borrow().clone())
+        .unwrap_or_default();
+    let display = file_list::ViewDisplay {
+        icon_zoom: display.icon_zoom,
+        show_size: display.show_size_column,
+        show_type: display.show_type_column,
+        show_modified: display.show_modified_column,
+    };
+    let on_sort: Rc<dyn Fn(kito_core::SortOrder)> = Rc::new({
+        let tab = Rc::downgrade(tab);
+        move |order| {
+            if let Some(tab) = tab.upgrade() {
+                tab.set_sort_order(order);
+            }
+        }
+    });
+    let (widget, selection) = file_list::build_view(
+        tab.mode.get(),
+        &store,
+        &file_list::ViewHandlers {
+            on_secondary: &on_secondary,
+            on_middle: &on_middle,
+            on_drag_prepare: &on_drag_prepare,
+            on_drop: &on_drop,
+            on_external_move: &on_external_move,
+        },
+        tab.open_items.get(),
+        display,
+        tab.sort_order.clone(),
+        on_sort,
+    );
     wire_activate(tab, &widget);
     // Selection -> status bar (selected items).
     {
@@ -260,19 +464,27 @@ fn rebuild_view(tab: &Rc<FileTab>) {
         let store = store.clone();
         let manager = tab.manager.clone();
         let page = tab.page.clone();
-        selection.connect_notify_local(Some("selected-item"), move |selection, _| {
+        selection.connect_selection_changed(move |selection, _, _| {
             if !manager
                 .upgrade()
                 .is_some_and(|manager| manager.is_active_page(&page))
             {
                 return;
             }
-            let selected = usize::from(selection.selected_item().is_some());
+            let selected = (0..store.n_items())
+                .filter(|&index| selection.is_selected(index))
+                .count();
             on_status(store.n_items() as usize, selected);
         });
     }
     *tab.selection.borrow_mut() = selection;
     tab.scrolled.set_child(Some(&widget));
+    tab.restore_selection(&selected_uris);
+    if had_focus {
+        widget.grab_focus();
+    }
+    let adjustment = tab.scrolled.vadjustment();
+    glib::idle_add_local_once(move || adjustment.set_value(scroll_value));
 }
 
 impl FileTab {
@@ -294,19 +506,96 @@ impl FileTab {
         self.sync_chrome();
     }
 
+    fn set_sort_order(self: &Rc<Self>, order: kito_core::SortOrder) {
+        if self.sort_order.get() == order {
+            return;
+        }
+        self.sort_order.set(order);
+        rebuild_view(self);
+        (self.on_sort)(order);
+        if self.load_active.get().is_some() {
+            self.reload();
+        } else {
+            self.sort_cached_entries();
+        }
+    }
+
+    fn sort_cached_entries(self: &Rc<Self>) {
+        let source = self.cached_entries.borrow().clone();
+        if source.is_empty() {
+            return;
+        }
+        let id = self.sort_gen.start();
+        let order = self.sort_order.get();
+        let uri = self.history.current_uri();
+        let (tx, rx) = async_channel::bounded::<Arc<Vec<kito_core::Entry>>>(1);
+        std::thread::spawn(move || {
+            let mut entries = source.as_ref().clone();
+            kito_core::sort_entries(&mut entries, order);
+            let _ = tx.send_blocking(Arc::new(entries));
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(entries) = rx.recv().await else {
+                return;
+            };
+            let Some(tab) = weak.upgrade() else {
+                return;
+            };
+            if !tab.sort_gen.is_current(id) || tab.history.current_uri() != uri {
+                return;
+            }
+            *tab.cached_entries.borrow_mut() = entries.clone();
+            tab.apply_sorted_entries(id, entries);
+        });
+    }
+
+    fn apply_sorted_entries(self: &Rc<Self>, id: u64, entries: Arc<Vec<kito_core::Entry>>) {
+        let staging = gio::ListStore::new::<FileObject>();
+        let offset = Rc::new(Cell::new(0usize));
+        let entries = entries.clone();
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local(move || {
+            let Some(tab) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !tab.sort_gen.is_current(id) {
+                return glib::ControlFlow::Break;
+            }
+            let start = offset.get();
+            let end = (start + file_list::LOAD_CHUNK).min(entries.len());
+            if start < end {
+                file_list::append_chunk(&staging, &entries[start..end]);
+                offset.set(end);
+            }
+            if end >= entries.len() {
+                let selected: Vec<String> =
+                    tab.selected_objects().iter().map(FileObject::uri).collect();
+                let scroll = tab.scrolled.vadjustment().value();
+                let objects: Vec<FileObject> = (0..staging.n_items())
+                    .filter_map(|index| staging.item(index).and_downcast::<FileObject>())
+                    .collect();
+                tab.selection.borrow().unselect_all();
+                tab.store.splice(0, tab.store.n_items(), &objects);
+                tab.restore_selection(&selected);
+                let adjustment = tab.scrolled.vadjustment();
+                glib::idle_add_local_once(move || adjustment.set_value(scroll));
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+
     /// Rebuilds this tab's translated row widgets while preserving its
     /// current selection, folder, view mode, and navigation history.
     fn retranslate(self: &Rc<Self>) {
-        let selected_uri = self.selected_objects().first().map(|obj| obj.uri());
         self.empty_page.set_title(&crate::l10n::tr("empty-folder"));
         self.loading_label
             .set_text(&crate::l10n::tr("loading-folder"));
         self.loading_stop
             .set_label(&crate::l10n::tr("loading-interrupt"));
         rebuild_view(self);
-        if let Some(uri) = selected_uri {
-            self.select_uri(&uri);
-        }
     }
 
     fn set_open_items(&self, behavior: OpenItems) {
@@ -320,14 +609,14 @@ impl FileTab {
         self.navigate(NavKind::Visit, uri);
     }
 
-    fn cancel_current_load(&self) {
+    fn cancel_current_load(self: &Rc<Self>) {
         let Some(id) = self.load_active.get() else {
             return;
         };
         self.cancel_load(id);
     }
 
-    fn cancel_load(&self, id: u64) {
+    fn cancel_load(self: &Rc<Self>, id: u64) {
         if !self.load_gen.invalidate(id) {
             return;
         }
@@ -336,6 +625,10 @@ impl FileTab {
         }
         self.load_active.set(None);
         self.loading_panel.set_visible(false);
+        if self.load_monitor_revision.take().is_some() {
+            self.monitor_batch.borrow_mut().require_reconcile();
+            self.schedule_monitor_flush();
+        }
     }
 
     /// Single navigation path: resolves, enumerates and sorts off the UI
@@ -347,7 +640,15 @@ impl FileTab {
             return;
         };
         let previous = self.history.current_uri();
+        self.load_monitor_revision.set(
+            if previous == target && self.monitor_uri.borrow().as_deref() == Some(target.as_str()) {
+                Some(self.monitor_revision.get())
+            } else {
+                None
+            },
+        );
         let id = self.load_gen.start();
+        self.sort_gen.start();
         if let Some(cancellable) = self.load_cancel.borrow_mut().take() {
             cancellable.cancel();
         }
@@ -359,6 +660,13 @@ impl FileTab {
             manager.close_bg_menu();
         }
         let show_hidden = self.show_hidden.get();
+        let sort_order = self.sort_order.get();
+        if previous == target {
+            self.scroll_before_load
+                .set(Some(self.scrolled.vadjustment().value()));
+        } else {
+            self.scroll_before_load.set(None);
+        }
         let weak_for_timer = Rc::downgrade(self);
         glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
             if let Some(tab) = weak_for_timer.upgrade() {
@@ -371,10 +679,14 @@ impl FileTab {
         let (tx, rx) = async_channel::bounded::<Result<ListedFolder, String>>(1);
         let worker_target = target.clone();
         std::thread::spawn(move || {
-            let result =
-                kito_core::list_dir_with_cancellable(&worker_target, show_hidden, &cancellable)
-                    .map(|(entries, timings)| ListedFolder { entries, timings })
-                    .map_err(|e| e.to_string());
+            let result = kito_core::list_dir_with_sort(
+                &worker_target,
+                show_hidden,
+                &cancellable,
+                sort_order,
+            )
+            .map(|(entries, timings)| ListedFolder { entries, timings })
+            .map_err(|e| e.to_string());
             let _ = tx.send_blocking(result);
         });
         glib::spawn_future_local(async move {
@@ -415,13 +727,18 @@ impl FileTab {
             entries.len()
         );
         let keep = if previous == target {
-            self.selected_objects().first().map(|obj| obj.uri())
+            self.selected_objects()
+                .iter()
+                .map(FileObject::uri)
+                .collect()
         } else {
-            None
+            Vec::new()
         };
         let staging = gio::ListStore::new::<FileObject>();
         let apply_started = std::time::Instant::now();
-        let entries = Rc::new(entries);
+        let entries = Arc::new(entries);
+        *self.cached_entries.borrow_mut() = entries.clone();
+        self.sort_gen.start();
         let offset = Rc::new(Cell::new(0usize));
         let weak = Rc::downgrade(self);
         let target = target.to_string();
@@ -463,9 +780,41 @@ impl FileTab {
 
     /// Final chrome for a completed load: selection, freshness, stack page,
     /// pathbar and status bar.
-    fn finish_loaded(&self, target: &str, keep: Option<String>, show_hidden: bool, n: usize) {
-        if let Some(uri) = keep {
-            self.select_uri(&uri);
+    fn finish_loaded(
+        self: &Rc<Self>,
+        target: &str,
+        keep: Vec<String>,
+        show_hidden: bool,
+        n: usize,
+    ) {
+        let monitor_dirty = match self.load_monitor_revision.take() {
+            Some(revision) if revision == self.monitor_revision.get() => {
+                self.clear_monitor_batch();
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        self.install_directory_monitor(target);
+        if monitor_dirty && self.monitor_uri.borrow().as_deref() == Some(target) {
+            self.monitor_batch.borrow_mut().require_reconcile();
+            self.schedule_monitor_flush();
+        }
+        if let Some(snapshot) = self.pending_restore.borrow_mut().take() {
+            *self.history.back.borrow_mut() = snapshot.back;
+            *self.history.forward.borrow_mut() = snapshot.forward;
+            self.sort_order.set(snapshot.sort_order);
+            self.restore_selection(&snapshot.selected_uris);
+            let adjustment = self.scrolled.vadjustment();
+            glib::idle_add_local_once(move || adjustment.set_value(snapshot.scroll_value));
+            self.reopening.set(false);
+            self.close_on_load_failure.set(false);
+        } else {
+            self.restore_selection(&keep);
+            if let Some(value) = self.scroll_before_load.take() {
+                let adjustment = self.scrolled.vadjustment();
+                glib::idle_add_local_once(move || adjustment.set_value(value));
+            }
         }
         self.hidden_sync.mark_refreshed(show_hidden);
         self.stack.set_visible_child_name(settled_child(n, true));
@@ -475,7 +824,8 @@ impl FileTab {
             .is_some_and(|manager| manager.is_active_page(&self.page))
         {
             (self.on_navigate)(target, n, self.mode.get());
-            let selected = usize::from(self.selection.borrow().selected_item().is_some());
+            (self.on_sort)(self.sort_order.get());
+            let selected = self.selected_objects().len();
             (self.on_status)(n, selected);
             self.emit_history();
         }
@@ -493,27 +843,328 @@ impl FileTab {
     /// Failed load: history, current URI and store are untouched (the store
     /// still shows the previous folder); only the loading page is reverted
     /// and the error is reported.
-    fn apply_load_error(&self, message: String) {
+    fn apply_load_error(self: &Rc<Self>, message: String) {
         let dialog = adw::AlertDialog::builder()
             .heading(crate::l10n::tr("error-open-folder"))
             .body(message)
             .build();
         dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
         dialog.present(Some(&self.window));
+        if self.load_monitor_revision.take().is_some() {
+            self.monitor_batch.borrow_mut().require_reconcile();
+            self.schedule_monitor_flush();
+        }
+        if self.close_on_load_failure.get() {
+            if let Some(manager) = self.manager.upgrade() {
+                manager.close_page(&self.page);
+            }
+        }
     }
 
-    /// Selects the entry with `uri`, if listed. No-op otherwise.
-    fn select_uri(&self, uri: &str) {
-        let listed: Vec<String> = (0..self.store.n_items())
-            .filter_map(|i| {
-                self.store
-                    .item(i)
-                    .and_downcast::<FileObject>()
-                    .map(|obj| obj.uri())
-            })
+    fn closed_snapshot(&self) -> ClosedTab {
+        ClosedTab {
+            uri: self.history.current_uri(),
+            mode: self.mode.get(),
+            sort_order: self.sort_order.get(),
+            back: self.history.back.borrow().clone(),
+            forward: self.history.forward.borrow().clone(),
+            selected_uris: self
+                .selected_objects()
+                .iter()
+                .map(FileObject::uri)
+                .collect(),
+            scroll_value: self.scrolled.vadjustment().value(),
+        }
+    }
+
+    fn stop_monitor(&self) {
+        self.monitor_generation
+            .set(self.monitor_generation.get().wrapping_add(1));
+        self.monitor_revision
+            .set(self.monitor_revision.get().wrapping_add(1));
+        if let Some(timer) = self.monitor_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        self.clear_monitor_batch();
+        if let Some(monitor) = self.monitor.borrow_mut().take() {
+            monitor.cancel();
+        }
+        *self.monitor_uri.borrow_mut() = None;
+    }
+
+    fn clear_monitor_batch(&self) {
+        if let Some(timer) = self.monitor_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        *self.monitor_batch.borrow_mut() = MonitorBatch::default();
+    }
+
+    fn install_directory_monitor(self: &Rc<Self>, uri: &str) {
+        if self.monitor_uri.borrow().as_deref() == Some(uri) {
+            return;
+        }
+        self.stop_monitor();
+        let generation = self.monitor_generation.get().wrapping_add(1);
+        self.monitor_generation.set(generation);
+        self.monitor_unavailable_reported.set(false);
+        *self.monitor_uri.borrow_mut() = Some(uri.to_string());
+        let file = gio::File::for_uri(uri);
+        match file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE) {
+            Ok(monitor) => {
+                let weak = Rc::downgrade(self);
+                let uri = uri.to_string();
+                monitor.connect_changed(move |_, file, other, event| {
+                    let Some(tab) = weak.upgrade() else {
+                        return;
+                    };
+                    if tab.monitor_generation.get() != generation
+                        || tab.monitor_uri.borrow().as_deref() != Some(uri.as_str())
+                    {
+                        return;
+                    }
+                    tab.record_monitor_event(
+                        &uri,
+                        file.uri().as_ref(),
+                        other.map(|other| other.uri().to_string()),
+                        event,
+                    );
+                });
+                *self.monitor.borrow_mut() = Some(monitor);
+            }
+            Err(error) => {
+                eprintln!("monitor directory {uri}: {error}");
+                if !self.monitor_unavailable_reported.replace(true) {
+                    if let Some(ctx) = self.ctx.upgrade() {
+                        ctx.toast(&crate::l10n::tr("monitor-unavailable"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_monitor_event(
+        self: &Rc<Self>,
+        directory: &str,
+        file_uri: &str,
+        other_uri: Option<String>,
+        event: gio::FileMonitorEvent,
+    ) {
+        if self.history.current_uri() != directory {
+            return;
+        }
+        self.monitor_revision
+            .set(self.monitor_revision.get().wrapping_add(1));
+        // Invalidate a sort or monitor model being applied while more
+        // changes are arriving; the next batch will contain the latest view.
+        self.sort_gen.start();
+        let mut batch = self.monitor_batch.borrow_mut();
+        if file_uri == directory {
+            batch.require_reconcile();
+        } else {
+            match event {
+                gio::FileMonitorEvent::Deleted | gio::FileMonitorEvent::MovedOut => {
+                    batch.remove(file_uri.to_string());
+                }
+                gio::FileMonitorEvent::Moved | gio::FileMonitorEvent::Renamed => {
+                    batch.remove(file_uri.to_string());
+                    if let Some(other_uri) = other_uri {
+                        batch.upsert(other_uri);
+                    } else {
+                        batch.require_reconcile();
+                    }
+                }
+                gio::FileMonitorEvent::Created
+                | gio::FileMonitorEvent::MovedIn
+                | gio::FileMonitorEvent::Changed
+                | gio::FileMonitorEvent::ChangesDoneHint
+                | gio::FileMonitorEvent::AttributeChanged => {
+                    batch.upsert(file_uri.to_string());
+                }
+                gio::FileMonitorEvent::PreUnmount | gio::FileMonitorEvent::Unmounted => {
+                    batch.require_reconcile();
+                }
+                _ => batch.require_reconcile(),
+            }
+        }
+        drop(batch);
+        self.schedule_monitor_flush();
+    }
+
+    fn schedule_monitor_flush(self: &Rc<Self>) {
+        if self.monitor_timer.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local_once(MONITOR_DEBOUNCE, move || {
+            if let Some(tab) = weak.upgrade() {
+                tab.monitor_timer.borrow_mut().take();
+                tab.flush_monitor_batch();
+            }
+        });
+        *self.monitor_timer.borrow_mut() = Some(timer);
+    }
+
+    fn retry_monitor_reconcile(self: &Rc<Self>, directory: &str, generation: u64) {
+        if self.monitor_generation.get() != generation
+            || self.monitor_uri.borrow().as_deref() != Some(directory)
+            || self.history.current_uri() != directory
+        {
+            return;
+        }
+        self.monitor_batch.borrow_mut().require_reconcile();
+        self.schedule_monitor_flush();
+    }
+
+    fn flush_monitor_batch(self: &Rc<Self>) {
+        if self.load_active.get().is_some() {
+            self.monitor_batch.borrow_mut().require_reconcile();
+            return;
+        }
+        let batch = std::mem::take(&mut *self.monitor_batch.borrow_mut());
+        if batch.is_empty() {
+            return;
+        }
+        let directory = self.history.current_uri();
+        let generation = self.monitor_generation.get();
+        let revision = self.monitor_revision.get();
+        let cached = self.cached_entries.borrow().clone();
+        let order = self.sort_order.get();
+        let show_hidden = self.show_hidden.get();
+        let worker_directory = directory.clone();
+        let (tx, rx) = async_channel::bounded::<Result<Arc<Vec<kito_core::Entry>>, String>>(1);
+        std::thread::spawn(move || {
+            let result = if batch.reconcile {
+                kito_core::list_dir_with_sort(
+                    &worker_directory,
+                    show_hidden,
+                    &gio::Cancellable::new(),
+                    order,
+                )
+                .map(|(entries, _)| Arc::new(entries))
+                .map_err(|error| error.to_string())
+            } else {
+                let mut entries = cached.as_ref().clone();
+                let mut needs_reconcile = false;
+                for uri in &batch.remove {
+                    entries.retain(|entry| &entry.uri != uri);
+                }
+                for uri in &batch.upsert {
+                    let parent_matches = gio::File::for_uri(uri)
+                        .parent()
+                        .is_some_and(|parent| parent.uri().as_str() == worker_directory);
+                    if !parent_matches {
+                        continue;
+                    }
+                    match kito_core::query_entry(uri) {
+                        Ok(entry) if show_hidden || !entry.name.starts_with('.') => {
+                            entries.retain(|existing| existing.uri != entry.uri);
+                            entries.push(entry);
+                        }
+                        Ok(_) => entries.retain(|entry| entry.uri != *uri),
+                        Err(_) => {
+                            needs_reconcile = true;
+                            break;
+                        }
+                    }
+                }
+                if needs_reconcile {
+                    kito_core::list_dir_with_sort(
+                        &worker_directory,
+                        show_hidden,
+                        &gio::Cancellable::new(),
+                        order,
+                    )
+                    .map(|(entries, _)| Arc::new(entries))
+                    .map_err(|error| error.to_string())
+                } else {
+                    kito_core::sort_entries(&mut entries, order);
+                    Ok(Arc::new(entries))
+                }
+            };
+            let _ = tx.send_blocking(result);
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            let Some(tab) = weak.upgrade() else {
+                return;
+            };
+            let current = monitor_result_is_current(
+                &tab.history.current_uri(),
+                &directory,
+                tab.monitor_generation.get(),
+                generation,
+                tab.monitor_revision.get(),
+                revision,
+            ) && tab.load_active.get().is_none();
+            if !current {
+                if tab.load_active.get().is_none() {
+                    tab.retry_monitor_reconcile(&directory, generation);
+                }
+                return;
+            }
+            match result {
+                Ok(entries) => {
+                    *tab.cached_entries.borrow_mut() = entries.clone();
+                    let sort_id = tab.sort_gen.start();
+                    tab.apply_sorted_entries(sort_id, entries);
+                }
+                Err(error) => {
+                    eprintln!("reconcile monitored directory {directory}: {error}");
+                    if let Some(ctx) = tab.ctx.upgrade() {
+                        ctx.toast(&crate::l10n::tr("monitor-refresh-error"));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Re-applies a URI snapshot to the current model, dropping items that
+    /// have disappeared. The selected URI sequence follows current view order.
+    fn restore_selection(&self, uris: &[String]) {
+        let selection = self.selection.borrow();
+        selection.unselect_all();
+        if uris.is_empty() {
+            return;
+        }
+        let current: Vec<String> = (0..self.store.n_items())
+            .filter_map(|index| self.store.item(index).and_downcast::<FileObject>())
+            .map(|obj| obj.uri())
             .collect();
-        if let Some(pos) = find_uri_index(&listed, uri) {
-            self.selection.borrow().select_item(pos, true);
+        let retained = retained_selection_uris(uris, &current);
+        let wanted: std::collections::HashSet<&str> = retained.iter().map(String::as_str).collect();
+        for index in 0..self.store.n_items() {
+            if self
+                .store
+                .item(index)
+                .and_downcast::<FileObject>()
+                .is_some_and(|obj| wanted.contains(obj.uri().as_str()))
+            {
+                selection.select_item(index, false);
+            }
+        }
+    }
+
+    pub fn select_all(&self) {
+        self.selection.borrow().select_all();
+    }
+
+    pub fn deselect_all(&self) {
+        self.selection.borrow().unselect_all();
+    }
+
+    pub fn invert_selection(&self) {
+        let selection = self.selection.borrow();
+        let selected: Vec<bool> = (0..self.store.n_items())
+            .map(|index| selection.is_selected(index))
+            .collect();
+        selection.unselect_all();
+        for (index, was_selected) in selected.into_iter().enumerate() {
+            if !was_selected {
+                selection.select_item(index as u32, false);
+            }
         }
     }
 
@@ -536,7 +1187,8 @@ impl FileTab {
             self.store.n_items() as usize,
             self.mode.get(),
         );
-        let selected = usize::from(self.selection.borrow().selected_item().is_some());
+        (self.on_sort)(self.sort_order.get());
+        let selected = self.selected_objects().len();
         (self.on_status)(self.store.n_items() as usize, selected);
         self.emit_history();
     }
@@ -559,13 +1211,12 @@ impl FileTab {
         }
     }
 
-    /// Selected object in the tab's view (single selection).
+    /// Selected objects in current view order.
     pub fn selected_objects(&self) -> Vec<FileObject> {
-        self.selection
-            .borrow()
-            .selected_item()
-            .and_downcast::<FileObject>()
-            .into_iter()
+        let selection = self.selection.borrow();
+        (0..self.store.n_items())
+            .filter(|&index| selection.is_selected(index))
+            .filter_map(|index| self.store.item(index).and_downcast::<FileObject>())
             .collect()
     }
 
@@ -597,6 +1248,12 @@ impl Drop for FileTab {
         if let Some(cancellable) = self.load_cancel.get_mut().take() {
             cancellable.cancel();
         }
+        if let Some(timer) = self.monitor_timer.get_mut().take() {
+            timer.remove();
+        }
+        if let Some(monitor) = self.monitor.get_mut().take() {
+            monitor.cancel();
+        }
     }
 }
 
@@ -622,8 +1279,12 @@ pub struct TabManager {
     on_navigate: OnNavigate,
     on_history: OnHistory,
     on_status: OnStatus,
+    on_sort: OnSort,
     show_hidden: Rc<Cell<bool>>,
     preferences: Rc<RefCell<Preferences>>,
+    open_window: Rc<dyn Fn(Vec<String>)>,
+    closed_tabs: RefCell<ClosedTabs>,
+    ctx: RefCell<std::rc::Weak<crate::ops::Ctx>>,
     tabs: RefCell<Vec<Rc<FileTab>>>,
     /// Open background menu, if any: closed on tab switch and navigation so
     /// actions can never land on the wrong folder.
@@ -631,6 +1292,43 @@ pub struct TabManager {
 }
 
 impl TabManager {
+    pub fn setup_tab_bar(self: &Rc<Self>, tab_bar: &adw::TabBar, ctx: &Rc<crate::ops::Ctx>) {
+        let actions = gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE;
+        tab_bar.setup_extra_drop_target(actions, &[gtk::gdk::FileList::static_type()]);
+        let manager = Rc::downgrade(self);
+        let ctx = Rc::downgrade(ctx);
+        tab_bar.connect_extra_drag_drop(move |bar, page, value| {
+            let Some(action) =
+                crate::dnd::transfer_action(bar.extra_drag_preferred_action(), actions, actions)
+            else {
+                return false;
+            };
+            let Some(uris) = crate::dnd::file_list_uris(value).filter(|uris| !uris.is_empty())
+            else {
+                return false;
+            };
+            let Some(manager) = manager.upgrade() else {
+                return false;
+            };
+            let Some(destination) = manager.uri_for_page(page) else {
+                return false;
+            };
+            let internal = crate::dnd::mark_active_internal_drop();
+            // AdwTabBar's extra-drag-drop signal cannot defer its GDK
+            // acknowledgement until background I/O completes. Reject an
+            // external MOVE here so its source cannot delete data early.
+            if !internal && action == crate::dnd::TransferAction::Move {
+                return false;
+            }
+            if let Some(ctx) = ctx.upgrade() {
+                ctx.transfer_uris(uris, destination, action, internal, None);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tab_view: adw::TabView,
@@ -638,8 +1336,10 @@ impl TabManager {
         on_navigate: OnNavigate,
         on_history: OnHistory,
         on_status: OnStatus,
+        on_sort: OnSort,
         show_hidden: Rc<Cell<bool>>,
         preferences: Rc<RefCell<Preferences>>,
+        open_window: Rc<dyn Fn(Vec<String>)>,
     ) -> Rc<Self> {
         let manager = Rc::new(Self {
             tab_view,
@@ -647,8 +1347,12 @@ impl TabManager {
             on_navigate,
             on_history,
             on_status,
+            on_sort,
             show_hidden,
             preferences,
+            open_window,
+            closed_tabs: RefCell::new(ClosedTabs::default()),
+            ctx: RefCell::new(std::rc::Weak::new()),
             tabs: RefCell::new(Vec::new()),
             bg_menu: RefCell::new(None),
         });
@@ -661,6 +1365,10 @@ impl TabManager {
                 };
                 let mut tabs = manager.tabs.borrow_mut();
                 if let Some(pos) = tabs.iter().position(|t| t.page == *page) {
+                    let tab = &tabs[pos];
+                    if !tab.reopening.get() && !tab.history.current_uri().is_empty() {
+                        manager.closed_tabs.borrow_mut().push(tab.closed_snapshot());
+                    }
                     tabs.remove(pos);
                 }
                 drop(tabs);
@@ -708,6 +1416,15 @@ impl TabManager {
 
     pub fn selected_uri(&self) -> Option<String> {
         self.selected().map(|t| t.history.current_uri())
+    }
+
+    fn uri_for_page(&self, page: &adw::TabPage) -> Option<String> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.page == *page)
+            .map(|tab| tab.history.current_uri())
+            .filter(|uri| !uri.is_empty())
     }
 
     /// Tracks the open background menu so tab switches and navigations can
@@ -766,7 +1483,11 @@ impl TabManager {
             .into_iter()
             .filter(|tab| tab.history.current_uri() == uri)
         {
-            tab.reload();
+            let monitor_is_live =
+                tab.monitor_uri.borrow().as_deref() == Some(uri) && tab.monitor.borrow().is_some();
+            if !monitor_is_live {
+                tab.reload();
+            }
         }
     }
 
@@ -784,6 +1505,43 @@ impl TabManager {
     pub fn set_mode(&self, mode: ViewMode) {
         if let Some(tab) = self.selected() {
             tab.set_mode(mode);
+        }
+    }
+
+    pub fn refresh_display_preferences(&self) {
+        for tab in self.tabs.borrow().iter() {
+            rebuild_view(tab);
+        }
+        if let Some(tab) = self.selected() {
+            tab.sync_chrome();
+        }
+    }
+
+    pub fn set_sort_field(&self, field: kito_core::SortField) {
+        if let Some(tab) = self.selected() {
+            let current = tab.sort_order.get();
+            let direction = if current.field == field {
+                match current.direction {
+                    kito_core::SortDirection::Ascending => kito_core::SortDirection::Descending,
+                    kito_core::SortDirection::Descending => kito_core::SortDirection::Ascending,
+                }
+            } else {
+                kito_core::SortDirection::Ascending
+            };
+            tab.set_sort_order(kito_core::SortOrder { field, direction });
+        }
+    }
+
+    pub fn toggle_sort_direction(&self) {
+        if let Some(tab) = self.selected() {
+            let current = tab.sort_order.get();
+            tab.set_sort_order(kito_core::SortOrder {
+                field: current.field,
+                direction: match current.direction {
+                    kito_core::SortDirection::Ascending => kito_core::SortDirection::Descending,
+                    kito_core::SortDirection::Descending => kito_core::SortDirection::Ascending,
+                },
+            });
         }
     }
 
@@ -823,8 +1581,98 @@ impl TabManager {
             .unwrap_or_default()
     }
 
+    pub fn select_all(&self) {
+        if let Some(tab) = self.selected() {
+            tab.select_all();
+        }
+    }
+
+    pub fn deselect_all(&self) {
+        if let Some(tab) = self.selected() {
+            tab.deselect_all();
+        }
+    }
+
+    pub fn invert_selection(&self) {
+        if let Some(tab) = self.selected() {
+            tab.invert_selection();
+        }
+    }
+
+    pub fn close_selected_tab(&self) {
+        if let Some(tab) = self.selected() {
+            self.close_page(&tab.page);
+        }
+    }
+
+    fn close_page(&self, page: &adw::TabPage) {
+        self.tab_view.close_page(page);
+    }
+
+    pub fn select_next_tab(&self) {
+        self.tab_view.select_next_page();
+    }
+
+    pub fn select_previous_tab(&self) {
+        self.tab_view.select_previous_page();
+    }
+
+    pub fn reopen_last_closed(self: &Rc<Self>) {
+        if let Some(snapshot) = self.closed_tabs.borrow_mut().pop() {
+            let uri = snapshot.uri.clone();
+            if let Some(ctx) = self.ctx.borrow().upgrade() {
+                self.open_tab_with_state(&uri, &ctx, true, Some(snapshot));
+            } else {
+                self.closed_tabs.borrow_mut().push(snapshot);
+            }
+        }
+    }
+
+    pub fn open_tab_from_context(self: &Rc<Self>, uri: &str) {
+        if let Some(ctx) = self.ctx.borrow().upgrade() {
+            self.open_tab(uri, &ctx);
+        }
+    }
+
+    pub fn open_folders_in_tabs_from_context(self: &Rc<Self>, uris: &[String]) {
+        for uri in uris {
+            self.open_tab_from_context(uri);
+        }
+    }
+
+    pub fn open_folders_in_new_window(&self, uris: &[String]) {
+        if !uris.is_empty() {
+            (self.open_window)(uris.to_vec());
+        }
+    }
+
+    pub fn new_tab_here(self: &Rc<Self>) {
+        let uri = self
+            .selected_uri()
+            .filter(|uri| !uri.is_empty())
+            .unwrap_or_else(|| format!("file://{}", glib::home_dir().display()));
+        self.open_tab_from_context(&uri);
+    }
+
     /// Opens `uri` in a new tab and selects it.
     pub fn open_tab(self: &Rc<Self>, uri: &str, ctx: &Rc<crate::ops::Ctx>) {
+        *self.ctx.borrow_mut() = Rc::downgrade(ctx);
+        self.open_tab_with_state(uri, ctx, true, None);
+    }
+
+    pub fn open_tab_in_background(self: &Rc<Self>, uri: &str, ctx: &Rc<crate::ops::Ctx>) {
+        *self.ctx.borrow_mut() = Rc::downgrade(ctx);
+        self.open_tab_with_state(uri, ctx, false, None);
+    }
+
+    fn open_tab_with_state(
+        self: &Rc<Self>,
+        uri: &str,
+        ctx: &Rc<crate::ops::Ctx>,
+        select: bool,
+        restore: Option<ClosedTab>,
+    ) {
+        let previously_selected = self.tab_view.selected_page();
         let preferences = self.preferences.borrow().clone();
         let (scrolled, store) = file_list::build_file_view();
         // Placeholder page when the folder has no visible entries.
@@ -876,13 +1724,39 @@ impl TabManager {
             loading_label,
             loading_panel,
             loading_stop,
-            selection: RefCell::new(gtk::SingleSelection::new(Some(gio::ListStore::new::<
+            selection: RefCell::new(gtk::MultiSelection::new(Some(gio::ListStore::new::<
                 FileObject,
             >()))),
-            mode: Cell::new(mode_for_new_tab(&preferences)),
+            mode: Cell::new(
+                restore
+                    .as_ref()
+                    .map(|snapshot| snapshot.mode)
+                    .unwrap_or_else(|| mode_for_new_tab(&preferences)),
+            ),
             open_items: Cell::new(preferences.open_items),
+            sort_order: Rc::new(Cell::new(
+                restore
+                    .as_ref()
+                    .map(|snapshot| snapshot.sort_order)
+                    .unwrap_or_default(),
+            )),
+            scroll_before_load: Cell::new(None),
             history: NavHistory::default(),
+            cached_entries: RefCell::new(Arc::new(Vec::new())),
+            monitor: RefCell::new(None),
+            monitor_uri: RefCell::new(None),
+            monitor_generation: Cell::new(0),
+            monitor_revision: Cell::new(0),
+            monitor_batch: RefCell::new(MonitorBatch::default()),
+            monitor_timer: RefCell::new(None),
+            monitor_unavailable_reported: Cell::new(false),
+            load_monitor_revision: Cell::new(None),
+            ctx: Rc::downgrade(ctx),
+            pending_restore: RefCell::new(restore.clone()),
+            reopening: Cell::new(restore.is_some()),
+            close_on_load_failure: Cell::new(restore.is_some()),
             load_gen: LoadGen::default(),
+            sort_gen: LoadGen::default(),
             load_cancel: RefCell::new(None),
             load_active: Cell::new(None),
             hidden_sync: HiddenSync::new(self.show_hidden.get()),
@@ -892,7 +1766,23 @@ impl TabManager {
             on_navigate: self.on_navigate.clone(),
             on_history: self.on_history.clone(),
             on_status: self.on_status.clone(),
+            on_sort: self.on_sort.clone(),
         });
+        let background_destination = {
+            let tab = Rc::downgrade(&tab);
+            Rc::new(move || tab.upgrade().map(|tab| tab.history.current_uri()))
+        };
+        let background_drop: crate::dnd::DropHandler = {
+            let ctx = Rc::downgrade(ctx);
+            Rc::new(move |uris, destination, action, internal, drop| {
+                if let Some(ctx) = ctx.upgrade() {
+                    ctx.transfer_uris(uris, destination, action, internal, Some(drop));
+                } else {
+                    drop.finish(gtk::gdk::DragAction::empty());
+                }
+            })
+        };
+        crate::dnd::attach_drop_target(&tab.scrolled, background_destination, background_drop);
         self.tabs.borrow_mut().push(tab.clone());
         tab.loading_stop.connect_clicked({
             let tab = Rc::downgrade(&tab);
@@ -933,9 +1823,40 @@ impl TabManager {
         });
         tab.stack.add_controller(background);
 
+        // A primary click in blank space clears selection. Cells mark their
+        // own picked widget with `file-item`, so this controller leaves row
+        // selection and the views' native Ctrl/Shift handling untouched.
+        let clear_background_selection = gtk::GestureClick::builder().button(1).build();
+        clear_background_selection.connect_pressed({
+            let stack = tab.stack.downgrade();
+            let tab = Rc::downgrade(&tab);
+            move |gesture, _, x, y| {
+                let (Some(stack), Some(tab)) = (stack.upgrade(), tab.upgrade()) else {
+                    return;
+                };
+                let mut picked = stack.pick(x, y, gtk::PickFlags::DEFAULT);
+                while let Some(widget) = picked {
+                    if widget.has_css_class("file-item") {
+                        return;
+                    }
+                    if widget == stack {
+                        break;
+                    }
+                    picked = widget.parent();
+                }
+                tab.deselect_all();
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            }
+        });
+        tab.stack.add_controller(clear_background_selection);
+
         rebuild_view(&tab);
 
-        self.tab_view.set_selected_page(&page);
+        if select || previously_selected.is_none() {
+            self.tab_view.set_selected_page(&page);
+        } else if let Some(previously_selected) = previously_selected {
+            self.tab_view.set_selected_page(&previously_selected);
+        }
         tab.load(uri);
     }
 }
@@ -943,6 +1864,41 @@ impl TabManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_batch_coalesces_latest_state_per_uri() {
+        let mut batch = MonitorBatch::default();
+        batch.upsert("file:///a".to_string());
+        batch.remove("file:///a".to_string());
+        batch.upsert("file:///b".to_string());
+        batch.remove("file:///b".to_string());
+        batch.upsert("file:///b".to_string());
+
+        assert!(!batch.upsert.contains("file:///a"));
+        assert!(batch.remove.contains("file:///a"));
+        assert!(batch.upsert.contains("file:///b"));
+        assert!(!batch.remove.contains("file:///b"));
+        assert!(!batch.reconcile);
+    }
+
+    #[test]
+    fn monitor_batch_overflow_requests_full_reconcile() {
+        let mut batch = MonitorBatch::default();
+        for index in 0..=MONITOR_BATCH_LIMIT {
+            batch.upsert(format!("file:///{index}"));
+        }
+        assert!(batch.reconcile);
+        assert!(batch.upsert.is_empty());
+        assert!(batch.remove.is_empty());
+    }
+
+    #[test]
+    fn monitor_result_requires_matching_folder_generation_and_revision() {
+        assert!(monitor_result_is_current("folder", "folder", 3, 3, 9, 9));
+        assert!(!monitor_result_is_current("other", "folder", 3, 3, 9, 9));
+        assert!(!monitor_result_is_current("folder", "folder", 4, 3, 9, 9));
+        assert!(!monitor_result_is_current("folder", "folder", 3, 3, 10, 9));
+    }
 
     fn uri(path: &std::path::Path) -> String {
         format!("file://{}", path.display())
@@ -978,6 +1934,64 @@ mod tests {
         let new_tab_mode = mode_for_new_tab(&preferences);
         assert_eq!(existing_tab_mode.get(), ViewMode::Compact);
         assert_eq!(new_tab_mode, ViewMode::Details);
+    }
+
+    #[test]
+    fn selection_follows_uris_when_view_order_changes_and_drops_missing_items() {
+        let selected = vec![
+            "file:///b".to_string(),
+            "file:///gone".to_string(),
+            "file:///a".to_string(),
+        ];
+        let reordered = vec![
+            "file:///c".to_string(),
+            "file:///a".to_string(),
+            "file:///b".to_string(),
+        ];
+        assert_eq!(
+            retained_selection_uris(&selected, &reordered),
+            vec!["file:///a".to_string(), "file:///b".to_string()]
+        );
+    }
+
+    #[test]
+    fn closed_tab_history_keeps_only_the_latest_twenty_entries() {
+        let mut closed = ClosedTabs::default();
+        for index in 0..25 {
+            closed.push(ClosedTab {
+                uri: format!("file:///dir-{index}"),
+                mode: ViewMode::Compact,
+                sort_order: kito_core::SortOrder::default(),
+                back: Vec::new(),
+                forward: Vec::new(),
+                selected_uris: Vec::new(),
+                scroll_value: 0.0,
+            });
+        }
+        assert_eq!(closed.0.len(), 20);
+        assert_eq!(closed.pop().unwrap().uri, "file:///dir-24");
+        assert_eq!(closed.pop().unwrap().uri, "file:///dir-23");
+        assert_eq!(closed.0.front().unwrap().uri, "file:///dir-5");
+    }
+
+    #[test]
+    fn closed_tab_snapshot_round_trips_navigation_and_view_state() {
+        let snapshot = ClosedTab {
+            uri: "file:///home/example".into(),
+            mode: ViewMode::Details,
+            sort_order: kito_core::SortOrder {
+                field: kito_core::SortField::Modified,
+                direction: kito_core::SortDirection::Descending,
+            },
+            back: vec!["file:///home".into()],
+            forward: vec!["file:///home/example/child".into()],
+            selected_uris: vec!["file:///home/example/report.txt".into()],
+            scroll_value: 128.5,
+        };
+        let mut closed = ClosedTabs::default();
+        closed.push(snapshot.clone());
+
+        assert_eq!(closed.pop(), Some(snapshot));
     }
 
     #[test]
@@ -1231,8 +2245,19 @@ impl HiddenSync {
     }
 }
 
-/// Index of `uri` in a listing, for restoring the selection after a
-/// refresh. Pure over URIs so selection matching stays headless-testable.
+/// Selection survives sorting/reloads by identity, and missing URIs are
+/// removed. The returned order follows the current view.
+fn retained_selection_uris(selected: &[String], current_order: &[String]) -> Vec<String> {
+    let selected: std::collections::HashSet<&str> = selected.iter().map(String::as_str).collect();
+    current_order
+        .iter()
+        .filter(|uri| selected.contains(uri.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Index of `uri` in a listing, retained for the hidden-file regression.
+#[cfg(test)]
 fn find_uri_index(listed: &[String], uri: &str) -> Option<u32> {
     listed.iter().position(|u| u == uri).map(|i| i as u32)
 }

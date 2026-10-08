@@ -117,6 +117,7 @@ kito-files/
 │           ├── tabs.rs         # AdwTabView, per-tab state and history
 │           ├── sidebar.rs      # Places, Devices, Network, Trash
 │           ├── ops.rs          # clipboard, file operations, properties, dialogs
+│           ├── dnd.rs          # GDK file-list drag sources, targets and action negotiation
 │           ├── context_menu.rs # file / background / trash popovers
 │           ├── path_completion.rs # asynchronous local path suggestions
 │           ├── l10n.rs         # shared app translations and live language updates
@@ -138,8 +139,29 @@ Design rules:
   delivered to the main loop through a bounded async channel (no polling).
   Directory listing also runs in a worker thread with generation-guarded,
   chunked staging and atomic view updates; only the newest navigation touches
-  history and widgets. Small bookmark/configuration updates remain synchronous.
-  The sidebar checks Trash contents asynchronously.
+  history and widgets. Selections are stored as URI identities and restored
+  after sorting, view changes and monitor updates. Sort-order changes sort the
+  cached entries on a worker and apply them in chunks. Small bookmark/configuration
+  updates remain synchronous. The sidebar checks Trash contents asynchronously.
+- **Live directory changes** — a confirmed directory gets a per-tab GIO monitor.
+  Events are coalesced into a bounded batch and queried off the UI thread; simple
+  changes update the entry cache, while ambiguous or overflowing batches trigger
+  a background reconciliation. Folder URI, navigation generation and monitor
+  revision guard results. Monitor installation happens only after successful
+  navigation; failed navigation keeps the old monitor, and tab disposal releases
+  the monitor and its pending source.
+- **Drag-and-drop** — `dnd.rs` uses GDK `FileList` content and accepts file lists
+  or `text/uri-list` at asynchronous targets. It captures source URIs at drag
+  preparation and the destination at drop, negotiates only Copy/Move actions
+  actually offered by GDK, and rejects Link. Drops reuse the operation-result
+  pipeline in `ops.rs`; incoming external Move copies first and reports Move to
+  the source only after complete success. Partial external transfers report no
+  completed Move, so the source retains its originals. Outgoing external Move
+  trashes originals only after the destination signals success. Internal moves
+  track the originating drag to avoid deleting the source twice. The tab-strip
+  extra-drop callback is synchronous: external Move is rejected there because
+  it cannot defer acknowledgment until the async transfer finishes. Drop on the
+  folder view to move external items into that directory.
 - **No GNOME desktop coupling** — libadwaita is used as a widget library only: no
   GSettings/dconf, no libpanel, no Tracker, no desktop portals required.
 - **Localization** — the `kito-i18n` crate resolves the system locale through
@@ -175,15 +197,32 @@ only after success. Generation checks protect each delayed indicator, worker
 result and chunk from superseded navigation; closing a tab cancels its worker.
 The empty page appears only after a successful listing with no visible items.
 
+Sort order is per tab; zoom and visible Details columns are global persistent
+preferences in the existing `settings.conf` model. Size, content type and modified
+time are collected through GIO during enumeration; the comparator performs no
+file I/O and folder sizes are not recursively calculated. Re-sorting a loaded
+folder runs on a worker, then stages rows in bounded chunks while preserving URI
+selection and the current scroll anchor.
+
+Live monitor updates debounce nearby changes but have both a maximum batch size
+and a periodic flush, so continuous events do not postpone updates indefinitely.
+An event batch is queried once per URI and sorted/applied together; incomplete or
+ambiguous batches reconcile the folder in the background. Explicit reloads and
+monitor updates share generation guards to prevent duplicate or stale commits.
+
 The app logs worker enumeration and sorting durations separately, followed by
 model build/application wall time. The last figure includes chunk scheduling
 and main-loop delays; it is not a pure CPU measurement. These figures separate
 phases but do not establish a shorter total load or a user-perceived speedup.
-Sorting precomputes one lowercase key per entry (5–8× faster on unsorted
-folders, identical order); the model updates in bulk `splice` calls
-(1001 → 1 notifications per 1000 rows). Worker results wake the main loop
-once through a channel instead of polling it. The release profile stays at
-`opt-level = "z"` (measured: `3` adds 31% size with no speedup here).
+The Phase 0 cached lowercase-key benchmark (5–8× faster on shuffled names)
+predates natural numeric sorting and is historical; it does not describe the
+current comparator. Phase 1 precomputes compact natural-name keys and keeps URI
+tie-breaks, without parsing digit runs into machine integers. The new release
+comparison and its variability are recorded in the [verification matrix](VERIFICATION.md);
+the GTK-facing sort remains on a worker. The model still updates in bulk
+`splice` calls (1001 → 1 notifications per 1000 rows). Worker results wake the
+main loop once through a channel instead of polling it. The release profile stays
+at `opt-level = "z"` (historical measurement: `3` adds 31% size with no speedup).
 
 File operations return per-item operation/source/destination/status/error
 records from workers. The main thread presents one localized summary and

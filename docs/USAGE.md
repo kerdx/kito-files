@@ -22,8 +22,11 @@ The header bar separates navigation, view controls and app settings:
 - **New tab** button: opens the current location in another tab.
 
 The sidebar provides places, devices, network and Trash. Context menus provide file
-operations, creation, terminal actions and properties. File selection currently
-supports one item at a time.
+operations, creation, terminal actions and properties. File selection supports
+groups in all three views: click, Ctrl-click to add or remove, Shift-click for a
+visible range, and Ctrl+A for all visible entries. A background click clears the
+selection; right-clicking a selected item keeps the group. The status bar reports
+the selected count.
 
 ## Features
 
@@ -34,6 +37,14 @@ supports one item at a time.
   side-by-side buttons in the dedicated view popover at the top right. The toolbar
   button shows the active tab's view icon
 - Tabs (`AdwTabView`), each tab keeps its own folder, view mode and back/forward history
+- Open a folder in a new tab or window from its context menu; opening a group of
+  folders creates tabs in visible order, while selected files open with their
+  default applications
+- Middle-click a folder to open it in a background tab. `Ctrl+T` opens the current
+  folder in a new tab; `Ctrl+W` closes the current tab and `Ctrl+Shift+T` reopens
+  one of the last 20 tabs closed in this window, if its folder still exists
+- `Ctrl+Tab` / `Ctrl+Shift+Tab` switch tabs; `Alt+Left`, `Alt+Right` and `Alt+Up`
+  navigate back, forward and to the parent folder
 - Back / forward / up navigation, plus mouse side buttons (back = button 8, forward = button 9)
 - Failed navigation leaves the current folder and back/forward history unchanged
 - The path bar fills the available header space; `Ctrl+L`, the current breadcrumb,
@@ -50,6 +61,39 @@ supports one item at a time.
   the next folder is ready; after 200 ms, a small overlay offers **Stop**
   (Interrompi in Italian). Fast loads do not show it
 - Status bar with item and selection counters
+- Group actions (copy, cut, trash and permanent delete) capture their selected
+  URIs and destination before running; Rename and Properties are disabled for
+  groups because they act on one item
+
+**Sorting and display**
+
+- Choose Name, Size, Type or Modified and ascending/descending order from the
+  view controls; folders stay ahead of files, and names use natural numeric order
+- In Details, toggle Size, Type and Modified columns; Name is always present and
+  column headers also change the sort
+- Icon zoom is controlled by the header-bar controls and persists globally. Use
+  `Ctrl++` / `Ctrl+-` to change it and `Ctrl+0` to reset; visible columns are also
+  saved globally. Sort order remains attached to each tab
+- Changing view or sort keeps the selection by URI and retains the visible item
+  when it still exists
+
+**Live updates and drag-and-drop**
+
+- Each successfully opened folder is monitored through GIO when its backend
+  supports monitoring. Nearby changes are coalesced, applied incrementally where
+  possible, and reconciled in the background when needed; `F5` / `Ctrl+R` remains
+  available
+- Drag the selected group, or an unselected row by itself, to a folder row, the
+  current folder background, a sidebar folder or another compatible application.
+  Hold Ctrl to request Copy and Shift to request Move when that action is offered;
+  unsupported Link actions are rejected. Drops on Trash use Trash semantics
+- Internal Move uses the file-operation backend. An external Move into a folder
+  finishes only after the copy succeeds, allowing the source application to
+  remove its originals safely. Dragging files out with Move sends the originals
+  to Trash after the destination reports success
+- Drops onto a tab work for internal moves and external copies. External Move on
+  the tab strip is currently rejected because its synchronous callback cannot
+  wait for asynchronous transfer completion; drop onto the folder view instead
 
 **Sidebar**
 
@@ -150,9 +194,16 @@ fallback. No separate translation files need to be installed alongside the binar
 | `Delete` | Move to Trash |
 | `Shift+Delete` | Delete permanently (confirmation required) |
 | `F2` | Rename selection |
+| `Ctrl+A` | Select all visible items |
+| `Ctrl+T` | New tab at the current folder |
+| `Ctrl+W` | Close current tab |
+| `Ctrl+Shift+T` | Reopen last closed tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / reset |
 | `Ctrl+L` | Edit the current path |
 | `F5` / `Ctrl+R` | Reload the folder |
 | `Ctrl+Shift+N` | New folder |
+| `Alt+Left` / `Alt+Right` / `Alt+Up` | Back / forward / parent folder |
 | `Ctrl+,` | Open Preferences |
 | `Enter` | Open the selected item |
 | `Esc` | Leave the path editor |

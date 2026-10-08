@@ -3,6 +3,11 @@
 Baseline first, then changes. Only justified optimizations were kept.
 No commit/push from this work.
 
+The measurements in §§1–6 record the Phase 0 loading work. In particular, §3's
+cached lowercase-name sort predates Phase 1 natural numeric sorting, so its
+speedup does not describe the current comparator. The Phase 1 base comparison,
+memory result and remaining uncertainty are in [the verification matrix](VERIFICATION.md).
+
 ## Environment
 
 - CPU: 6 cores, RAM 16 GiB, `/tmp` on tmpfs, Fedora, rustc 1.98.1.

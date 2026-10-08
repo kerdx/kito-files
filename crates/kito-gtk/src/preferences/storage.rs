@@ -43,6 +43,10 @@ mod tests {
                 show_maximize: false,
                 show_close: true,
             },
+            icon_zoom: 140,
+            show_size_column: false,
+            show_type_column: true,
+            show_modified_column: true,
         };
         save_to(&path, &preferences).unwrap();
         assert_eq!(load_from(&path), preferences);
@@ -54,7 +58,7 @@ mod tests {
         let path = dir.path().join("settings.conf");
         std::fs::write(
             &path,
-            "default-view=invalid\nopen-items=single\nterminal=???\nlanguage = klingon\nfuture-option = retained\n",
+            "default-view=invalid\nopen-items=single\nterminal=???\nlanguage = klingon\nicon-zoom = invalid\nshow-size-column = maybe\nfuture-option = retained\n",
         )
         .unwrap();
         assert_eq!(load_from(&path), Preferences::default());

@@ -3,6 +3,7 @@
 //! system libadwaita 1.9 (v1_10 only when the runtime updates).
 
 mod context_menu;
+mod dnd;
 mod file_list;
 mod l10n;
 mod ops;
@@ -95,6 +96,41 @@ fn update_view_control(
         gtk::accessible::Property::Label(&selector),
         gtk::accessible::Property::Description(&current),
     ]);
+}
+
+fn preference_switch_row(label_id: &str, switch: &gtk::Switch) -> gtk::Box {
+    let label = tr(label_id);
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(5)
+        .margin_bottom(5)
+        .build();
+    let text = gtk::Label::builder()
+        .label(&label)
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .build();
+    switch.update_property(&[gtk::accessible::Property::Label(&label)]);
+    row.append(&text);
+    row.append(switch);
+    row
+}
+
+fn sort_order_label(order: kito_core::SortOrder) -> String {
+    let field = tr(match order.field {
+        kito_core::SortField::Name => "sort-label-name",
+        kito_core::SortField::Size => "sort-label-size",
+        kito_core::SortField::Type => "sort-label-type",
+        kito_core::SortField::Modified => "sort-label-modified",
+    });
+    let direction = match order.direction {
+        kito_core::SortDirection::Ascending => "↑",
+        kito_core::SortDirection::Descending => "↓",
+    };
+    format!("{field} {direction}")
 }
 
 /// Applies the window-controls preference to a window's start/end controls
@@ -199,10 +235,13 @@ fn register_actions(
     ctx: Rc<ops::Ctx>,
     preferences: Rc<PreferenceStore>,
     preferences_dialog: preferences_dialog::SharedDialog,
+    single_item_actions: Rc<RefCell<Vec<gio::SimpleAction>>>,
 ) {
     let group = gio::SimpleActionGroup::new();
-    let defs: [ActionDef; 22] = [
+    let defs: [ActionDef; 43] = [
         ("open", ops::Ctx::open_selected),
+        ("open-in-new-tab", ops::Ctx::open_selected_in_new_tabs),
+        ("open-in-new-window", ops::Ctx::open_selected_in_new_window),
         ("new-folder", ops::Ctx::new_folder),
         ("new-text-file", |c| {
             c.new_file(format!("{}.txt", tr("suggest-text-file")))
@@ -232,9 +271,39 @@ fn register_actions(
         ("edit-path", |c| c.focus_path()),
         ("reload", |c| c.manager.reload_selected()),
         ("about", |c| show_about(&c.window)),
+        ("select-all", |c| c.manager.select_all()),
+        ("deselect-all", |c| c.manager.deselect_all()),
+        ("invert-selection", |c| c.manager.invert_selection()),
+        ("new-tab", |c| c.manager.new_tab_here()),
+        ("close-tab", |c| c.manager.close_selected_tab()),
+        ("reopen-tab", |c| c.manager.reopen_last_closed()),
+        ("next-tab", |c| c.manager.select_next_tab()),
+        ("previous-tab", |c| c.manager.select_previous_tab()),
+        ("back", |c| c.manager.go_back()),
+        ("forward", |c| c.manager.go_forward()),
+        ("up", ops::Ctx::go_up),
+        ("sort-name", |c| {
+            c.manager.set_sort_field(kito_core::SortField::Name)
+        }),
+        ("sort-size", |c| {
+            c.manager.set_sort_field(kito_core::SortField::Size)
+        }),
+        ("sort-type", |c| {
+            c.manager.set_sort_field(kito_core::SortField::Type)
+        }),
+        ("sort-modified", |c| {
+            c.manager.set_sort_field(kito_core::SortField::Modified)
+        }),
+        ("sort-direction", |c| c.manager.toggle_sort_direction()),
+        ("zoom-in", ops::Ctx::zoom_in),
+        ("zoom-out", ops::Ctx::zoom_out),
+        ("zoom-reset", ops::Ctx::zoom_reset),
     ];
     for (name, run) in defs {
         let action = gio::SimpleAction::new(name, None);
+        if matches!(name, "rename" | "properties") {
+            single_item_actions.borrow_mut().push(action.clone());
+        }
         let ctx = ctx.clone();
         action.connect_activate(move |_, _| run(&ctx));
         group.add_action(&action);
@@ -713,6 +782,32 @@ fn build_window(
     hidden_row.append(&hidden_label);
     hidden_row.append(&hidden_switch);
 
+    let column_options = preferences.snapshot();
+    let column_section = gtk::Label::builder()
+        .label(tr("view-columns"))
+        .halign(gtk::Align::Start)
+        .css_classes(["heading"])
+        .margin_start(8)
+        .build();
+    let size_column_switch = gtk::Switch::builder()
+        .active(column_options.show_size_column)
+        .tooltip_text(tr("column-size"))
+        .valign(gtk::Align::Center)
+        .build();
+    let type_column_switch = gtk::Switch::builder()
+        .active(column_options.show_type_column)
+        .tooltip_text(tr("column-type"))
+        .valign(gtk::Align::Center)
+        .build();
+    let modified_column_switch = gtk::Switch::builder()
+        .active(column_options.show_modified_column)
+        .tooltip_text(tr("column-modified"))
+        .valign(gtk::Align::Center)
+        .build();
+    let size_column_row = preference_switch_row("column-size", &size_column_switch);
+    let type_column_row = preference_switch_row("column-type", &type_column_switch);
+    let modified_column_row = preference_switch_row("column-modified", &modified_column_switch);
+
     let view_contents = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -724,6 +819,11 @@ fn build_window(
     view_contents.append(&view_choices);
     view_contents.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     view_contents.append(&hidden_row);
+    view_contents.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    view_contents.append(&column_section);
+    view_contents.append(&size_column_row);
+    view_contents.append(&type_column_row);
+    view_contents.append(&modified_column_row);
     let view_popover = gtk::Popover::new();
     view_popover.set_child(Some(&view_contents));
 
@@ -748,9 +848,60 @@ fn build_window(
         gtk::accessible::Property::Label(&view_selector_name),
         gtk::accessible::Property::Description(&current_view),
     ]);
+    let sort_menu = gio::Menu::new();
+    for (label, action) in [
+        ("sort-menu-name", "win.sort-name"),
+        ("sort-menu-size", "win.sort-size"),
+        ("sort-menu-type", "win.sort-type"),
+        ("sort-menu-modified", "win.sort-modified"),
+    ] {
+        sort_menu.append(Some(&tr(label)), Some(action));
+    }
+    let direction_menu = gio::Menu::new();
+    direction_menu.append(
+        Some(&tr("sort-menu-toggle-direction")),
+        Some("win.sort-direction"),
+    );
+    sort_menu.append_section(None, &direction_menu);
+    let sort_popover = gtk::PopoverMenu::from_model(Some(&sort_menu));
+    let sort_label = gtk::Label::builder()
+        .label(sort_order_label(kito_core::SortOrder::default()))
+        .build();
+    let sort_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .build();
+    let sort_icon = gtk::Image::from_icon_name("view-sort-ascending-symbolic");
+    sort_content.append(&sort_icon);
+    sort_content.append(&sort_label);
+    let sort_button = gtk::MenuButton::builder()
+        .tooltip_text(tr("sort-selector"))
+        .popover(&sort_popover)
+        .child(&sort_content)
+        .build();
+    let sort_accessible_name = tr("sort-selector");
+    sort_button.update_property(&[gtk::accessible::Property::Label(&sort_accessible_name)]);
+
+    let zoom_controls = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(2)
+        .css_classes(["toolbar"])
+        .build();
+    let zoom_out_button = themed_button(&["zoom-out-symbolic", "zoom-out"], &tr("zoom-out"));
+    let zoom_label = gtk::Label::builder()
+        .label(format!("{}%", preferences.snapshot().icon_zoom))
+        .width_chars(4)
+        .css_classes(["numeric"])
+        .build();
+    let zoom_in_button = themed_button(&["zoom-in-symbolic", "zoom-in"], &tr("zoom-in"));
+    zoom_controls.append(&zoom_out_button);
+    zoom_controls.append(&zoom_label);
+    zoom_controls.append(&zoom_in_button);
     let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], &tr("nav-new-tab"));
     header_contents.append(&new_tab_button);
     header_contents.append(&view_button);
+    header_contents.append(&sort_button);
+    header_contents.append(&zoom_controls);
     let end_window_controls = gtk::WindowControls::new(gtk::PackType::End);
     end_window_controls.set_visible(!end_window_controls.is_empty());
     end_window_controls.connect_empty_notify(|controls| {
@@ -869,11 +1020,15 @@ fn build_window(
 
     // Pathbar + title + status + view follow the selected tab.
     let syncing_views = Rc::new(Cell::new(false));
+    // Rename and selected-item properties are unavailable for a group.
+    let single_item_actions: Rc<RefCell<Vec<gio::SimpleAction>>> =
+        Rc::new(RefCell::new(Vec::new()));
     // Sidebar created later: slot to highlight the current folder.
     let sidebar_slot: Rc<RefCell<Option<sidebar::Sidebar>>> = Rc::new(RefCell::new(None));
     // Status bar: totals + selection, text recomposed on every change.
     let set_status: tabs::OnStatus = Rc::new({
         let status = status.clone();
+        let single_item_actions = single_item_actions.clone();
         move |items: usize, selected: usize| {
             let text = if selected > 0 {
                 format!(
@@ -885,6 +1040,9 @@ fn build_window(
                 tr_num("status-items", items as u64)
             };
             status.set_text(&text);
+            for action in single_item_actions.borrow().iter() {
+                action.set_enabled(selected <= 1);
+            }
         }
     });
     let on_navigate: tabs::OnNavigate = Rc::new({
@@ -948,18 +1106,102 @@ fn build_window(
             forward_button.set_sensitive(can_forward);
         }
     });
+    let on_sort: tabs::OnSort = Rc::new({
+        let label = sort_label.downgrade();
+        let icon = sort_icon.downgrade();
+        move |order| {
+            if let Some(label) = label.upgrade() {
+                label.set_text(&sort_order_label(order));
+            }
+            if let Some(icon) = icon.upgrade() {
+                icon.set_icon_name(Some(match order.direction {
+                    kito_core::SortDirection::Ascending => "view-sort-ascending-symbolic",
+                    kito_core::SortDirection::Descending => "view-sort-descending-symbolic",
+                }));
+            }
+        }
+    });
     // Hidden files (those starting with `.`): state shared with tabs.
     let show_hidden = Rc::new(Cell::new(false));
+    let open_window: Rc<dyn Fn(Vec<String>)> = Rc::new({
+        let app = app.clone();
+        let preferences = preferences.clone();
+        move |uris| build_window(&app, uris, preferences.clone())
+    });
     let manager = tabs::TabManager::new(
         tab_view,
         window.clone(),
         on_navigate.clone(),
         on_history,
         set_status,
+        on_sort,
         show_hidden.clone(),
         preferences.shared(),
+        open_window,
     );
     *manager_slot.borrow_mut() = Some(manager.clone());
+    preferences.subscribe_display({
+        let manager = Rc::downgrade(&manager);
+        let zoom_label = zoom_label.downgrade();
+        let size_switch = size_column_switch.downgrade();
+        let type_switch = type_column_switch.downgrade();
+        let modified_switch = modified_column_switch.downgrade();
+        Rc::new(move |prefs| {
+            if let Some(label) = zoom_label.upgrade() {
+                label.set_text(&format!("{}%", prefs.icon_zoom));
+            }
+            if let Some(switch) = size_switch.upgrade() {
+                if switch.is_active() != prefs.show_size_column {
+                    switch.set_active(prefs.show_size_column);
+                }
+            }
+            if let Some(switch) = type_switch.upgrade() {
+                if switch.is_active() != prefs.show_type_column {
+                    switch.set_active(prefs.show_type_column);
+                }
+            }
+            if let Some(switch) = modified_switch.upgrade() {
+                if switch.is_active() != prefs.show_modified_column {
+                    switch.set_active(prefs.show_modified_column);
+                }
+            }
+            if let Some(manager) = manager.upgrade() {
+                manager.refresh_display_preferences();
+            }
+        })
+    });
+    size_column_switch.connect_active_notify({
+        let preferences = preferences.clone();
+        move |switch| {
+            if let Err(error) = preferences.set_show_size_column(switch.is_active()) {
+                eprintln!("save size-column preference: {error}");
+            }
+        }
+    });
+    type_column_switch.connect_active_notify({
+        let preferences = preferences.clone();
+        move |switch| {
+            if let Err(error) = preferences.set_show_type_column(switch.is_active()) {
+                eprintln!("save type-column preference: {error}");
+            }
+        }
+    });
+    modified_column_switch.connect_active_notify({
+        let preferences = preferences.clone();
+        move |switch| {
+            if let Err(error) = preferences.set_show_modified_column(switch.is_active()) {
+                eprintln!("save modified-column preference: {error}");
+            }
+        }
+    });
+    preferences.subscribe_icon_zoom({
+        let label = zoom_label.downgrade();
+        Rc::new(move |zoom| {
+            if let Some(label) = label.upgrade() {
+                label.set_text(&format!("{zoom}%"));
+            }
+        })
+    });
     let autocomplete = path_completion::PathAutocomplete::new(
         &path_entry,
         &path_stack,
@@ -1083,12 +1325,22 @@ fn build_window(
         preferences: preferences.clone(),
         focus_path: select_path_entry,
     });
+    manager.setup_tab_bar(&tab_bar, &ctx);
+    zoom_out_button.connect_clicked({
+        let ctx = ctx.clone();
+        move |_| ctx.zoom_out()
+    });
+    zoom_in_button.connect_clicked({
+        let ctx = ctx.clone();
+        move |_| ctx.zoom_in()
+    });
     register_actions(
         app,
         &window,
         ctx.clone(),
         preferences.clone(),
         preferences_dialog.clone(),
+        single_item_actions,
     );
 
     // System clipboard decides what to paste: track ownership changes.
@@ -1109,7 +1361,17 @@ fn build_window(
     // Sidebar and arrows operate on the selected tab.
     let load: Rc<dyn Fn(&str)> = slot_load.clone();
 
-    let sidebar = sidebar::build_sidebar(load.clone(), window.clone());
+    let sidebar_drop: dnd::DropHandler = {
+        let ctx = Rc::downgrade(&ctx);
+        Rc::new(move |uris, destination, action, internal, drop| {
+            if let Some(ctx) = ctx.upgrade() {
+                ctx.transfer_uris(uris, destination, action, internal, Some(drop));
+            } else {
+                drop.finish(gdk::DragAction::empty());
+            }
+        })
+    };
+    let sidebar = sidebar::build_sidebar(load.clone(), window.clone(), sidebar_drop);
     paned.set_start_child(Some(sidebar.widget()));
     paned.set_position(170);
     *sidebar_slot.borrow_mut() = Some(sidebar);

@@ -37,6 +37,10 @@ pub enum OpenItems {
     SingleClick,
 }
 
+pub const ICON_ZOOM_MIN: u8 = 60;
+pub const ICON_ZOOM_MAX: u8 = 180;
+pub const ICON_ZOOM_STEP: u8 = 10;
+
 impl OpenItems {
     pub fn as_config_value(self) -> &'static str {
         match self {
@@ -156,13 +160,33 @@ impl WindowControls {
 
 /// All preferences for one process. New options can be added here without
 /// tying persistence to the dialog implementation.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preferences {
     pub default_view: ViewMode,
     pub open_items: OpenItems,
     pub terminal: TerminalChoice,
     pub language: kito_i18n::AppLang,
     pub window_controls: WindowControls,
+    pub icon_zoom: u8,
+    pub show_size_column: bool,
+    pub show_type_column: bool,
+    pub show_modified_column: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            default_view: ViewMode::default(),
+            open_items: OpenItems::default(),
+            terminal: TerminalChoice::default(),
+            language: kito_i18n::AppLang::default(),
+            window_controls: WindowControls::default(),
+            icon_zoom: 100,
+            show_size_column: true,
+            show_type_column: true,
+            show_modified_column: false,
+        }
+    }
 }
 
 impl Preferences {
@@ -207,13 +231,31 @@ impl Preferences {
                     result.window_controls.show_close =
                         WindowControls::parse_bool(value).unwrap_or(true);
                 }
+                "icon-zoom" => {
+                    result.icon_zoom = value
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|zoom| (ICON_ZOOM_MIN..=ICON_ZOOM_MAX).contains(zoom))
+                        .unwrap_or(100);
+                }
+                "show-size-column" => {
+                    result.show_size_column = WindowControls::parse_bool(value).unwrap_or(true);
+                }
+                "show-type-column" => {
+                    result.show_type_column = WindowControls::parse_bool(value).unwrap_or(true);
+                }
+                "show-modified-column" => {
+                    result.show_modified_column =
+                        WindowControls::parse_bool(value).unwrap_or(false);
+                }
                 _ => {}
             }
         }
         result
     }
 
-    pub fn config_entries(&self) -> [(&'static str, String); 8] {
+    pub fn config_entries(&self) -> [(&'static str, String); 12] {
         [
             (
                 "default-view",
@@ -237,6 +279,19 @@ impl Preferences {
             (
                 "window-controls-close",
                 WindowControls::as_config_bool(self.window_controls.show_close).to_string(),
+            ),
+            ("icon-zoom", self.icon_zoom.to_string()),
+            (
+                "show-size-column",
+                WindowControls::as_config_bool(self.show_size_column).to_string(),
+            ),
+            (
+                "show-type-column",
+                WindowControls::as_config_bool(self.show_type_column).to_string(),
+            ),
+            (
+                "show-modified-column",
+                WindowControls::as_config_bool(self.show_modified_column).to_string(),
             ),
         ]
     }
@@ -262,6 +317,26 @@ mod tests {
         assert_eq!(preferences.terminal, TerminalChoice::Automatic);
         assert_eq!(preferences.language, kito_i18n::AppLang::System);
         assert_eq!(preferences.window_controls, WindowControls::default());
+        assert_eq!(preferences.icon_zoom, 100);
+        assert!(preferences.show_size_column && preferences.show_type_column);
+        assert!(!preferences.show_modified_column);
+    }
+
+    #[test]
+    fn icon_zoom_and_detail_columns_parse_with_safe_fallbacks() {
+        let preferences = Preferences::from_config_text(
+            "icon-zoom = 160\nshow-size-column = false\nshow-type-column = true\nshow-modified-column = true\n",
+        );
+        assert_eq!(preferences.icon_zoom, 160);
+        assert!(!preferences.show_size_column);
+        assert!(preferences.show_type_column && preferences.show_modified_column);
+
+        let invalid = Preferences::from_config_text(
+            "icon-zoom = 250\nshow-size-column = maybe\nshow-type-column = false\nshow-modified-column = no\n",
+        );
+        assert_eq!(invalid.icon_zoom, 100);
+        assert!(invalid.show_size_column);
+        assert!(!invalid.show_type_column && !invalid.show_modified_column);
     }
 
     #[test]

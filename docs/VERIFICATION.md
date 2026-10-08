@@ -43,6 +43,54 @@ backend effettivo e gli eventuali limiti. Gli esiti Wayland sopra riportati
 riflettono la conferma dell’utente; non sono stati osservati in modo indipendente
 dal runner di questa verifica.
 
+## Phase 1 verification (2026-10-08)
+
+`./scripts/check.sh` passed formatting, workspace compilation, 44 `kito-core`,
+103 `kito-gtk` and 11 `kito-i18n` tests, plus Clippy with warnings denied. The
+script filtered the session-Trash integration test (one filtered `kito-core`
+test); no other test was skipped. The isolated run used generated fixtures only.
+
+| ID | Requisito e risultato atteso | Tipo | Ambiente/backend effettivo | Esito | Evidenza e limiti |
+|---|---|---|---|---|---|
+| A-01 | Selezione identificata per URI e conservata dopo riordino; elementi mancanti rimossi. | Automatica, grafica | Test headless Linux; nessuna finestra controllabile | PARZIALE | `selection_follows_uris_when_view_order_changes_and_drops_missing_items` passato; click e selezione nelle tre viste non provati graficamente. |
+| A-02 | Azioni di gruppo mantengono sorgenti e destinazione catturate anche se cambia la selezione; retry include solo fallimenti. | Automatica, grafica | Test headless Linux | PARZIALE | `captured_group_transfer_is_independent_of_later_selection_changes`, `partial_move_retries_only_failed` e `operation_retry_candidates_exclude_successes` passati; dialoghi e operazioni sul desktop non provati. |
+| B-01 | Cronologia limitata a 20; snapshot conserva percorso, vista, sort, cronologia, selezione e scroll. | Automatica, grafica | Test headless Linux | PARZIALE | `closed_tab_history_keeps_only_the_latest_twenty_entries` e `closed_tab_snapshot_round_trips_navigation_and_view_state` passati; apertura/chiusura reale e scorciatoie non provate. |
+| C-01 | Ordinamento naturale, stabile, metadati mancanti ultimi e cartelle prime in entrambe le direzioni. | Automatica | `kito-core`, Linux | SUPERATO | Test con nomi `file2`/`file10`, sequenze numeriche di 255 e 300 cifre, parità, metadati mancanti e confronto delle chiavi per tutti i campi/direzioni passati. |
+| C-02 | Preferenze globali di zoom/colonne persistono; ordinamento resta per scheda. | Automatica, grafica | Test headless Linux | PARZIALE | Parsing, fallback e persistenza delle preferenze passati; layout, intestazioni e scorciatoie zoom non provati graficamente. |
+| D-01 | Raffiche monitor coalesciute, overflow riconciliato, risultati di cartella/generazione/revisione obsolete scartati. | Automatica, grafica | Test headless Linux; GIO locale non provato con finestra | PARZIALE | Test `monitor_batch_*` e `monitor_result_requires_matching_folder_generation_and_revision` passati; creazione/modifica/rename in una sessione live non provati. |
+| E-01 | GDK negozia solo Copy/Move offerti e supportati; Link rifiutato; URI list interoperabile esposto. | Automatica, grafica | Test headless Linux | PARZIALE | Test di negoziazione e formati `FileList`/`text/uri-list` passati; scambio reale con altre app e drop su viste/sidebar non provati. |
+| E-02 | Drop interno su scheda usa la sua cartella; drop esterno Copy su scheda e Move esterno solo dopo completamento. | Sorgenti, grafica | Nessuna sessione GUI osservabile | PARZIALE | Drop interno ed esterno Copy sono collegati; Move esterno sulla barra schede è rifiutato perché il callback libadwaita è sincrono e non può confermare il risultato asincrono. |
+
+### GUI e performance
+
+La sessione espone `XDG_SESSION_TYPE=wayland`, `WAYLAND_DISPLAY=wayland-0` e
+`DISPLAY=:0`; questi valori non dimostrano quale backend abbia usato Kito. Il
+controllo UI non ha esposto app o finestre controllabili. In questa verifica non
+sono state eseguite prove grafiche Wayland o X11: tre viste, selezione, scorciatoie,
+schede, monitor live, destinazioni DND e scambio con applicazioni restano da provare.
+
+Per il confronto è stato estratto in `/tmp` il commit base `fc4b1176b2120e08b642c12bfec36d943bfa9cb7` e usato lo stesso helper release e le stesse
+directory generate su tmpfs (10% cartelle, nomi con numeri, spazi e Unicode).
+Sono stati alternati base e working tree dopo un warm-up, con cinque campioni
+per versione. Le colonne riportano il tempo totale della lista, enumerazione e
+sort; il picco RSS è stato rilevato in processi separati con lo stesso helper.
+I risultati variavano fra invocazioni, quindi non dimostrano un miglioramento
+stabile. Nell’ultima serie accoppiata:
+
+| Elementi | Base totale (enum; sort) | Fase 1 totale (enum; sort) | Variazione totale |
+|---:|---:|---:|---:|
+| 100 | 3.401 ms (3.356 + 0.018) | 4.803 ms (4.769 + 0.019) | +41%, circa +1.4 ms |
+| 10,000 | 265.949 ms (255.845 + 4.259) | 270.804 ms (258.084 + 5.250) | +1.8% |
+| 50,000 | 1,199.961 ms (1,160.591 + 20.539) | 1,298.442 ms (1,239.279 + 32.801) | +8.2% |
+
+Il picco RSS a 50,000 elementi era 27,200 KiB alla base e 28,492 KiB con la Fase
+1 (circa +1.3 MiB). Il sort naturale costa in questa serie circa 12 ms in più a
+50,000 voci; l’enumerazione continua a dominare il tempo totale. Le ulteriori
+due serie accoppiate a 50,000 elementi hanno avuto mediane totali di 1.710–1.948 s
+alla base e 1.690–1.738 s con la Fase 1; la variabilità impedisce di attribuire
+con sicurezza la differenza complessiva. La reattività grafica non è stata
+misurata, né è possibile dedurla dai tempi del worker.
+
 ## Automated checks
 
 From the repository, run:

@@ -42,8 +42,14 @@ const fn danger_row(
 }
 
 /// Menu on a selected entry (row or cell).
-const ROWS: [Row; 9] = [
+const ROWS: [Row; 11] = [
     row(&["document-open"], "menu-open", "open"),
+    row(&["tab-new"], "menu-open-new-tab", "open-in-new-tab"),
+    row(
+        &["window-new"],
+        "menu-open-new-window",
+        "open-in-new-window",
+    ),
     row(&["bookmark-new", "list-add"], "menu-pin", "pin"),
     row(&["edit-cut"], "menu-cut", "cut"),
     row(&["edit-copy"], "menu-copy", "copy"),
@@ -62,8 +68,8 @@ const ROWS: [Row; 9] = [
     ),
 ];
 
-/// Groups: [0..2, 2..5, 5..8, 8..9].
-const SEPARATORS_AFTER: [usize; 3] = [1, 4, 7];
+/// Groups: open, clipboard/pin, single-item actions, properties.
+const SEPARATORS_AFTER: [usize; 3] = [2, 6, 9];
 
 /// Menu on an entry inside the trash: restore and delete.
 const TRASH_ROWS: [Row; 5] = [
@@ -128,6 +134,8 @@ fn build(
     rows: &[Row],
     separators_after: &[usize],
     window: &adw::ApplicationWindow,
+    selected_count: usize,
+    folders_only: bool,
 ) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
@@ -135,6 +143,12 @@ fn build(
     let list = menu_box();
     for (i, r) in rows.iter().enumerate() {
         let button = row_button(r);
+        if matches!(r.action, "rename" | "properties") && selected_count != 1 {
+            button.set_sensitive(false);
+        }
+        if matches!(r.action, "open-in-new-tab" | "open-in-new-window") && !folders_only {
+            button.set_sensitive(false);
+        }
         let window = window.clone();
         let action = r.action.to_string();
         let popover = popover.downgrade();
@@ -158,15 +172,23 @@ fn build(
 /// Builds and opens the menu anchored at `(x, y)` on `anchor`.
 /// The popover unparents itself on close, so repeated openings never
 /// accumulate widgets.
-fn popup(
-    anchor: &gtk::Widget,
-    x: f64,
-    y: f64,
-    window: &adw::ApplicationWindow,
-    rows: &[Row],
-    separators_after: &[usize],
-) {
-    let popover = build(anchor, rows, separators_after, window);
+struct PopupOptions<'a> {
+    window: &'a adw::ApplicationWindow,
+    rows: &'a [Row],
+    separators_after: &'a [usize],
+    selected_count: usize,
+    folders_only: bool,
+}
+
+fn popup(anchor: &gtk::Widget, x: f64, y: f64, options: PopupOptions<'_>) {
+    let popover = build(
+        anchor,
+        options.rows,
+        options.separators_after,
+        options.window,
+        options.selected_count,
+        options.folders_only,
+    );
     popover.connect_closed(|popover| popover.unparent());
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
     popover.set_position(side_for(anchor, x));
@@ -193,13 +215,48 @@ fn side_for(anchor: &gtk::Widget, x: f64) -> gtk::PositionType {
 }
 
 /// Right-click on an entry: full menu, the entry is already selected.
-pub fn show(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::ApplicationWindow) {
-    popup(anchor, x, y, window, &ROWS, &SEPARATORS_AFTER);
+pub fn show(
+    anchor: &gtk::Widget,
+    x: f64,
+    y: f64,
+    window: &adw::ApplicationWindow,
+    selected_count: usize,
+    folders_only: bool,
+) {
+    popup(
+        anchor,
+        x,
+        y,
+        PopupOptions {
+            window,
+            rows: &ROWS,
+            separators_after: &SEPARATORS_AFTER,
+            selected_count,
+            folders_only,
+        },
+    );
 }
 
 /// Right-click on a trash entry: restore, copy, delete.
-pub fn show_trash(anchor: &gtk::Widget, x: f64, y: f64, window: &adw::ApplicationWindow) {
-    popup(anchor, x, y, window, &TRASH_ROWS, &TRASH_SEPARATORS_AFTER);
+pub fn show_trash(
+    anchor: &gtk::Widget,
+    x: f64,
+    y: f64,
+    window: &adw::ApplicationWindow,
+    selected_count: usize,
+) {
+    popup(
+        anchor,
+        x,
+        y,
+        PopupOptions {
+            window,
+            rows: &TRASH_ROWS,
+            separators_after: &TRASH_SEPARATORS_AFTER,
+            selected_count,
+            folders_only: false,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +380,27 @@ const BG_PROPS_ROWS: [BgRow; 1] = [BgRow {
     sub: None,
 }];
 
+const BG_SELECTION_ROWS: [BgRow; 3] = [
+    BgRow {
+        icons: &["edit-select-all"],
+        label: "menu-select-all",
+        action: "win.select-all",
+        sub: None,
+    },
+    BgRow {
+        icons: &["edit-select-all"],
+        label: "menu-invert-selection",
+        action: "win.invert-selection",
+        sub: None,
+    },
+    BgRow {
+        icons: &["edit-clear"],
+        label: "menu-deselect-all",
+        action: "win.deselect-all",
+        sub: None,
+    },
+];
+
 const BG_TRASH_ROWS: [BgRow; 1] = [BgRow {
     icons: &["user-trash-full", "user-trash"],
     label: "menu-empty-trash",
@@ -333,7 +411,11 @@ const BG_TRASH_ROWS: [BgRow; 1] = [BgRow {
 /// Sections in order; separators fall between sections only, never
 /// trailing. The terminal section exists only for local paths.
 pub(crate) fn bg_sections(local: bool) -> Vec<&'static [BgRow]> {
-    let mut sections: Vec<&'static [BgRow]> = vec![&BG_CREATE_ROWS[..], &BG_PASTE_ROWS[..]];
+    let mut sections: Vec<&'static [BgRow]> = vec![
+        &BG_CREATE_ROWS[..],
+        &BG_PASTE_ROWS[..],
+        &BG_SELECTION_ROWS[..],
+    ];
     if local {
         sections.push(&BG_TERM_ROWS[..]);
     }
@@ -797,31 +879,35 @@ mod tests {
     #[test]
     fn background_structure_matches_the_spec() {
         let sections = bg_sections(true);
-        // Four sections: create, paste, terminal, properties.
+        // Sections: create, paste, selection, terminal, properties.
         assert_eq!(
             sections
                 .iter()
                 .map(|section| section.len())
                 .collect::<Vec<_>>(),
-            vec![2, 1, 2, 1]
+            vec![2, 1, 3, 2, 1]
         );
         assert_eq!(section_actions(sections[0]), vec!["bg.new-folder", ""]);
         assert_eq!(section_actions(sections[1]), vec!["bg.paste"]);
         assert_eq!(
             section_actions(sections[2]),
+            vec!["win.select-all", "win.invert-selection", "win.deselect-all"]
+        );
+        assert_eq!(
+            section_actions(sections[3]),
             vec!["bg.open-terminal", "bg.open-terminal-root"]
         );
         // Last section is folder properties: separators only sit between.
-        assert_eq!(section_actions(sections[3]), vec!["bg.folder-properties"]);
+        assert_eq!(section_actions(sections[4]), vec!["bg.folder-properties"]);
     }
 
     #[test]
     fn background_hides_terminal_off_local_paths() {
         let sections = bg_sections(false);
-        // Remote: create, paste, properties only.
-        assert_eq!(sections.len(), 3);
+        // Remote: create, paste, selection, properties.
+        assert_eq!(sections.len(), 4);
         assert_eq!(
-            sections[2].iter().map(|row| row.action).collect::<Vec<_>>(),
+            sections[3].iter().map(|row| row.action).collect::<Vec<_>>(),
             vec!["bg.folder-properties"]
         );
     }

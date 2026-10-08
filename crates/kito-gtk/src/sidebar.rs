@@ -1,6 +1,7 @@
 //! Places sidebar: Places (XDG + bookmarks) + Devices (volumes) + Network.
 //! UI labels use the app catalogs; names returned by GIO remain system data.
 
+use crate::dnd::{self, DropHandler};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::{cell::RefCell, rc::Rc};
@@ -21,7 +22,13 @@ fn add_row(container: &gtk::Box, rows: &Rows, uri: &str, button: &gtk::Button) {
 }
 
 /// Clickable row with icon + label.
-fn nav_row(icon: &impl IsA<gio::Icon>, label: &str, load: LoadFn, uri: String) -> gtk::Button {
+fn nav_row(
+    icon: &impl IsA<gio::Icon>,
+    label: &str,
+    load: LoadFn,
+    uri: String,
+    on_drop: &DropHandler,
+) -> gtk::Button {
     let button = gtk::Button::builder()
         .has_frame(false)
         .css_classes(["side-row"])
@@ -51,6 +58,12 @@ fn nav_row(icon: &impl IsA<gio::Icon>, label: &str, load: LoadFn, uri: String) -
             .build(),
     );
     button.set_child(Some(&row));
+    let destination = uri.clone();
+    dnd::attach_drop_target(
+        &button,
+        Rc::new(move || Some(destination.clone())),
+        on_drop.clone(),
+    );
     button.connect_clicked(move |_| load(&uri));
     button
 }
@@ -77,12 +90,13 @@ fn row_label(button: &gtk::Button) -> Option<gtk::Label> {
 
 /// Bookmark row with right-click to remove it. The sidebar reloads
 /// on its own via monitor on the file (see `build_sidebar`).
-fn bookmark_row(name: &str, uri: &str, load: LoadFn) -> gtk::Button {
+fn bookmark_row(name: &str, uri: &str, load: LoadFn, on_drop: &DropHandler) -> gtk::Button {
     let button = nav_row(
         &gio::ThemedIcon::new("user-bookmarks"),
         name,
         load,
         uri.to_string(),
+        on_drop,
     );
     let gesture = gtk::GestureClick::builder()
         .button(gtk::gdk::BUTTON_SECONDARY)
@@ -133,17 +147,25 @@ fn display_name(path: &std::path::Path, fallback: &str) -> String {
         .unwrap_or_else(|_| fallback.to_string())
 }
 
-fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::ApplicationWindow) {
+fn xdg_places(
+    load: &LoadFn,
+    parent: &gtk::Box,
+    rows: &Rows,
+    window: &adw::ApplicationWindow,
+    on_drop: &DropHandler,
+) {
     // Home is not an XDG user dir: taken separately.
     let home = glib::home_dir();
     {
+        let home_uri = gio::File::for_path(&home).uri().to_string();
         let button = nav_row(
             &place_icon("user-home"),
             &display_name(&home, &crate::l10n::tr("side-home")),
             load.clone(),
-            format!("file://{}", home.display()),
+            home_uri.clone(),
+            on_drop,
         );
-        add_row(parent, rows, &format!("file://{}", home.display()), &button);
+        add_row(parent, rows, &home_uri, &button);
     }
     const PLACES: [(&str, &str, glib::UserDirectory); 6] = [
         (
@@ -176,22 +198,23 @@ fn xdg_places(load: &LoadFn, parent: &gtk::Box, rows: &Rows, window: &adw::Appli
         if !path.is_dir() {
             continue;
         }
-        let uri = format!("file://{}", path.display());
+        let uri = gio::File::for_path(&path).uri().to_string();
         let button = nav_row(
             &place_icon(icon_name),
             &display_name(&path, &crate::l10n::tr(label_id)),
             load.clone(),
             uri.clone(),
+            on_drop,
         );
         add_row(parent, rows, &uri, &button);
     }
     // Trash: end of fixed places, before the user bookmarks.
     {
-        let button = trash_row(load.clone(), window);
+        let button = trash_row(load.clone(), window, on_drop);
         add_row(parent, rows, kito_core::TRASH_URI, &button);
     }
     for (name, uri) in kito_core::bookmarks::read() {
-        let button = bookmark_row(&name, &uri, load.clone());
+        let button = bookmark_row(&name, &uri, load.clone(), on_drop);
         add_row(parent, rows, &uri, &button);
     }
 }
@@ -292,12 +315,13 @@ fn poll_trash_once(image: &glib::WeakRef<gtk::Image>, state: &Rc<RefCell<TrashIc
     );
 }
 
-fn trash_row(load: LoadFn, window: &adw::ApplicationWindow) -> gtk::Button {
+fn trash_row(load: LoadFn, window: &adw::ApplicationWindow, on_drop: &DropHandler) -> gtk::Button {
     let button = nav_row(
         &trash_icon(false),
         &crate::l10n::tr("side-trash"),
         load,
         kito_core::TRASH_URI.to_string(),
+        on_drop,
     );
     // The icon follows the trash asynchronously: an initial probe plus
     // a bounded 3s poll, both async so the UI thread never blocks. The
@@ -403,7 +427,12 @@ fn error_dialog(window: &adw::ApplicationWindow, body: String) {
 }
 
 /// Volume row: if mounted it opens, otherwise it tries to mount first.
-fn volume_row(volume: &gio::Volume, load: LoadFn, window: adw::ApplicationWindow) -> gtk::Button {
+fn volume_row(
+    volume: &gio::Volume,
+    load: LoadFn,
+    window: adw::ApplicationWindow,
+    on_drop: &DropHandler,
+) -> gtk::Button {
     let button = gtk::Button::builder()
         .has_frame(false)
         .css_classes(["side-row"])
@@ -430,6 +459,12 @@ fn volume_row(volume: &gio::Volume, load: LoadFn, window: adw::ApplicationWindow
 
     if let Some(root) = volume.activation_root() {
         let uri = root.uri().to_string();
+        let destination = uri.clone();
+        dnd::attach_drop_target(
+            &button,
+            Rc::new(move || Some(destination.clone())),
+            on_drop.clone(),
+        );
         button.connect_clicked(move |_| load(&uri));
     } else {
         let volume = volume.clone();
@@ -533,7 +568,11 @@ impl Sidebar {
 /// Full sidebar in a ScrolledWindow. Updates itself on
 /// mount/unmount (GVolumeMonitor) and on bookmark changes
 /// (monitor on `~/.config/gtk-3.0`, so pins made by Nautilus count too).
-pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
+pub fn build_sidebar(
+    load: LoadFn,
+    window: adw::ApplicationWindow,
+    on_drop: DropHandler,
+) -> Sidebar {
     let places_rows: Rows = Rc::new(RefCell::new(Vec::new()));
     let other_rows: Rows = Rc::new(RefCell::new(Vec::new()));
     let outer = gtk::Box::builder()
@@ -562,6 +601,7 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         let load = load.clone();
         let rows = places_rows.clone();
         let window = window.clone();
+        let on_drop = on_drop.clone();
         // Kept on purpose: monitor -> handler -> refresh -> monitor loop,
         // living as long as the process.
         let _monitor = monitor.clone();
@@ -572,7 +612,7 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
             }
             // Rows are recreated: registry cleared and repopulated.
             rows.borrow_mut().clear();
-            xdg_places(&load, &places, &rows, &window);
+            xdg_places(&load, &places, &rows, &window, &on_drop);
         }
     });
     refresh_places();
@@ -604,6 +644,7 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         &crate::l10n::tr("side-browse-network"),
         load.clone(),
         "network:///".to_string(),
+        &on_drop,
     );
     let network_label = row_label(&network_row).expect("network row has a label");
     add_row(&outer, &other_rows, "network:///", &network_row);
@@ -612,12 +653,13 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
         let devices = devices.clone();
         let load = load.clone();
         let window = window.clone();
+        let on_drop = on_drop.clone();
         move || {
             while let Some(child) = devices.first_child() {
                 devices.remove(&child);
             }
             for volume in gio::VolumeMonitor::get().volumes() {
-                devices.append(&volume_row(&volume, load.clone(), window.clone()));
+                devices.append(&volume_row(&volume, load.clone(), window.clone(), &on_drop));
             }
             // No volumes: the root filesystem is reachable anyway.
             if devices.first_child().is_none() {
@@ -630,6 +672,7 @@ pub fn build_sidebar(load: LoadFn, window: adw::ApplicationWindow) -> Sidebar {
                     &crate::l10n::tr("side-filesystem"),
                     load.clone(),
                     "file:///".to_string(),
+                    &on_drop,
                 ));
             }
         }

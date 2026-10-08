@@ -61,6 +61,38 @@ struct OperationItemResult {
 
 type RetryHandler = Rc<dyn Fn(Vec<OperationItemResult>)>;
 
+#[derive(Clone)]
+struct DropCompletion {
+    drop: gdk::Drop,
+    action: crate::dnd::TransferAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedTransfer {
+    uris: Vec<String>,
+    destination: String,
+    cut: bool,
+    move_with_backend: bool,
+}
+
+impl DropCompletion {
+    fn finish(&self, results: &[OperationItemResult]) {
+        let succeeded = results
+            .iter()
+            .filter(|result| matches!(result.state, ItemState::Succeeded))
+            .count();
+        let all_succeeded = !results.is_empty()
+            && succeeded == results.len()
+            && results.iter().all(|result| !result.needs_retry());
+        let action = match self.action {
+            crate::dnd::TransferAction::Copy if succeeded > 0 => gdk::DragAction::COPY,
+            crate::dnd::TransferAction::Move if all_succeeded => gdk::DragAction::MOVE,
+            _ => gdk::DragAction::empty(),
+        };
+        self.drop.finish(action);
+    }
+}
+
 impl OperationItemResult {
     fn from_result(
         operation: &'static str,
@@ -277,6 +309,59 @@ impl Ctx {
         self.toast.add_toast(adw::Toast::new(msg));
     }
 
+    /// Starts a drag-and-drop transfer using the action selected by GDK.
+    /// This path uses the operation engine directly and never changes the clipboard.
+    pub fn transfer_uris(
+        &self,
+        uris: Vec<String>,
+        destination: String,
+        action: crate::dnd::TransferAction,
+        internal: bool,
+        drop: Option<gdk::Drop>,
+    ) {
+        let completion = drop.map(|drop| DropCompletion { drop, action });
+        if uris.is_empty() {
+            if let Some(completion) = completion {
+                completion.finish(&[]);
+            }
+            return;
+        }
+        match (destination.as_str(), action) {
+            (kito_core::TRASH_URI, crate::dnd::TransferAction::Move) => {
+                self.trash_uris(uris, kito_core::TRASH_URI.to_string(), completion);
+            }
+            (kito_core::TRASH_URI, crate::dnd::TransferAction::Copy) => {
+                self.toast(&crate::l10n::tr("drop-trash-copy-unsupported"));
+                if let Some(completion) = completion {
+                    completion.finish(&[]);
+                }
+            }
+            (_, action) => {
+                self.paste_uris_with_drop(
+                    uris,
+                    action == crate::dnd::TransferAction::Move,
+                    destination,
+                    None,
+                    completion,
+                    internal && action == crate::dnd::TransferAction::Move,
+                );
+            }
+        }
+    }
+
+    /// A completed external MOVE asks the source to delete its data. Route
+    /// that deletion to the recoverable trash and retain the original URIs.
+    pub fn trash_external_move(&self, uris: Vec<String>) {
+        if uris.is_empty() {
+            return;
+        }
+        let folder = gio::File::for_uri(&uris[0])
+            .parent()
+            .map(|parent| parent.uri().to_string())
+            .unwrap_or_default();
+        self.trash_uris(uris, folder, None);
+    }
+
     /// Ctrl+L: switches to path writing mode.
     pub fn focus_path(&self) {
         (self.focus_path)();
@@ -479,11 +564,70 @@ impl Ctx {
             return;
         };
         let objs = tab.selected_objects();
-        let Some(first) = objs.first() else {
+        if objs.is_empty() {
             self.toast(&crate::l10n::tr("toast-nothing"));
             return;
-        };
-        tab.activate_entry(&first.uri(), first.is_dir());
+        }
+        if objs.len() == 1 {
+            tab.activate_entry(&objs[0].uri(), objs[0].is_dir());
+            return;
+        }
+        for obj in objs {
+            if obj.is_dir() {
+                self.manager.open_tab_from_context(&obj.uri());
+            } else {
+                tab.activate_entry(&obj.uri(), false);
+            }
+        }
+    }
+
+    pub fn open_selected_in_new_tabs(&self) {
+        let selected = self.manager.selected_objects();
+        if selected.is_empty() || selected.iter().any(|obj| !obj.is_dir()) {
+            self.toast(&crate::l10n::tr("open-folders-only"));
+            return;
+        }
+        let uris: Vec<String> = selected.iter().map(|obj| obj.uri()).collect();
+        self.manager.open_folders_in_tabs_from_context(&uris);
+    }
+
+    pub fn open_selected_in_new_window(&self) {
+        let selected = self.manager.selected_objects();
+        if selected.is_empty() || selected.iter().any(|obj| !obj.is_dir()) {
+            self.toast(&crate::l10n::tr("open-folders-only"));
+            return;
+        }
+        let uris: Vec<String> = selected.iter().map(|obj| obj.uri()).collect();
+        self.manager.open_folders_in_new_window(&uris);
+    }
+
+    pub fn go_up(&self) {
+        if let Some(uri) = self.manager.selected_uri() {
+            if let Some(parent) = gio::File::for_uri(&uri).parent() {
+                self.manager.load_selected(&parent.uri());
+            }
+        }
+    }
+
+    fn change_zoom(&self, zoom: u8) {
+        if let Err(error) = self.preferences.set_icon_zoom(zoom) {
+            self.toast(&error.to_string());
+        }
+        self.manager.refresh_display_preferences();
+    }
+
+    pub fn zoom_in(&self) {
+        let zoom = self.preferences.snapshot().icon_zoom;
+        self.change_zoom(zoom.saturating_add(crate::preferences::model::ICON_ZOOM_STEP));
+    }
+
+    pub fn zoom_out(&self) {
+        let zoom = self.preferences.snapshot().icon_zoom;
+        self.change_zoom(zoom.saturating_sub(crate::preferences::model::ICON_ZOOM_STEP));
+    }
+
+    pub fn zoom_reset(&self) {
+        self.change_zoom(100);
     }
 
     /// Ctrl+C / Ctrl+X: internal state + `text/uri-list` for other apps.
@@ -576,30 +720,53 @@ impl Ctx {
     /// Copies (or moves, for a cut) `uris` into `dest`. `cut_op` is the
     /// dispatch generation of a cut move, applied at completion.
     fn paste_uris(&self, uris: Vec<String>, cut: bool, dest: String, cut_op: Option<u64>) {
+        self.paste_uris_with_drop(uris, cut, dest, cut_op, None, cut);
+    }
+
+    fn paste_uris_with_drop(
+        &self,
+        uris: Vec<String>,
+        cut: bool,
+        dest: String,
+        cut_op: Option<u64>,
+        drop_completion: Option<DropCompletion>,
+        move_with_backend: bool,
+    ) {
         if uris.is_empty() {
-            self.toast(&crate::l10n::tr("clip-empty"));
+            if let Some(completion) = drop_completion {
+                completion.finish(&[]);
+            } else {
+                self.toast(&crate::l10n::tr("clip-empty"));
+            }
             return;
         }
+        let transfer = CapturedTransfer {
+            uris,
+            destination: dest,
+            cut,
+            move_with_backend: cut && move_with_backend,
+        };
         let this = self.clone();
-        let result_operation = if cut {
+        let result_operation = if transfer.cut {
             "operation-move"
         } else {
             "operation-copy"
         };
-        let retry_dest = dest.clone();
+        let is_cut = transfer.cut;
+        let retry_dest = transfer.destination.clone();
         Self::run_in_thread(
             move || {
-                let mut results = Vec::with_capacity(uris.len());
-                for uri in &uris {
-                    let r = if cut {
-                        kito_core::move_to(uri, &dest)
+                let mut results = Vec::with_capacity(transfer.uris.len());
+                for uri in &transfer.uris {
+                    let r = if transfer.move_with_backend {
+                        kito_core::move_to(uri, &transfer.destination)
                     } else {
-                        kito_core::copy_to(uri, &dest)
+                        kito_core::copy_to(uri, &transfer.destination)
                     };
                     results.push(OperationItemResult::from_result(
                         result_operation,
                         uri.clone(),
-                        Some(dest.clone()),
+                        Some(transfer.destination.clone()),
                         r,
                     ));
                 }
@@ -620,7 +787,10 @@ impl Ctx {
                     this.clear_system_clipboard();
                 }
                 this.manager.reload_if_current(&retry_dest);
-                let retry: Option<RetryHandler> = if cut {
+                if let Some(completion) = &drop_completion {
+                    completion.finish(&results);
+                }
+                let retry: Option<RetryHandler> = if is_cut {
                     match (cut_op, cut_finish) {
                         (Some(op_generation), Some(CutFinish::Partial)) => {
                             let this = this.clone();
@@ -633,6 +803,13 @@ impl Ctx {
                                 } else {
                                     this.toast(&crate::l10n::tr("clip-changed"));
                                 }
+                            }))
+                        }
+                        (None, _) => {
+                            let this = this.clone();
+                            Some(Rc::new(move |failed: Vec<OperationItemResult>| {
+                                let uris = failed.into_iter().map(|item| item.source).collect();
+                                this.paste_uris(uris, true, retry_dest.clone(), None);
                             }))
                         }
                         _ => None,
@@ -672,10 +849,15 @@ impl Ctx {
             return;
         }
         let folder = self.manager.selected_uri().unwrap_or_default();
-        self.trash_uris(uris, folder);
+        self.trash_uris(uris, folder, None);
     }
 
-    fn trash_uris(&self, uris: Vec<String>, folder: String) {
+    fn trash_uris(
+        &self,
+        uris: Vec<String>,
+        folder: String,
+        drop_completion: Option<DropCompletion>,
+    ) {
         let this = self.clone();
         let retry_folder = folder.clone();
         Self::run_in_thread(
@@ -693,10 +875,13 @@ impl Ctx {
             },
             move |results| {
                 this.manager.reload_if_current(&folder);
+                if let Some(completion) = &drop_completion {
+                    completion.finish(&results);
+                }
                 let retry_this = this.clone();
                 let retry: RetryHandler = Rc::new(move |failed| {
                     let uris = failed.into_iter().map(|item| item.source).collect();
-                    retry_this.trash_uris(uris, retry_folder.clone());
+                    retry_this.trash_uris(uris, retry_folder.clone(), None);
                 });
                 this.report_operation("operation-trash", results, Some(retry));
             },
@@ -1135,6 +1320,10 @@ impl Ctx {
     /// Properties: the selected entry (if just one) or the folder.
     pub fn show_properties(&self) {
         let selected = self.manager.selected_objects();
+        if selected.len() > 1 {
+            self.toast(&crate::l10n::tr("properties-select-one"));
+            return;
+        }
         let uri = if selected.len() == 1 {
             selected[0].uri()
         } else {
@@ -1361,6 +1550,23 @@ mod tests {
 
     const A: &str = "file:///tmp/A.txt";
     const B: &str = "file:///tmp/B.txt";
+
+    #[test]
+    fn captured_group_transfer_is_independent_of_later_selection_changes() {
+        let mut selection = vec![A.to_string(), B.to_string()];
+        let transfer = CapturedTransfer {
+            uris: selection.clone(),
+            destination: "file:///tmp/destination".into(),
+            cut: true,
+            move_with_backend: true,
+        };
+        selection.clear();
+        selection.push("file:///tmp/other.txt".into());
+
+        assert_eq!(transfer.uris, vec![A.to_string(), B.to_string()]);
+        assert_eq!(transfer.destination, "file:///tmp/destination");
+        assert!(transfer.cut && transfer.move_with_backend);
+    }
 
     #[test]
     fn external_copy_replaces_internal() {
