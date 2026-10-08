@@ -83,7 +83,8 @@ const TRASH_ROWS: [Row; 5] = [
 /// Groups: [0..1, 1..3, 3..4, 4..5].
 const TRASH_SEPARATORS_AFTER: [usize; 3] = [0, 2, 3];
 
-/// Vertical container for a menu's rows.
+/// Vertical container for a menu's rows, naturally sized to fit both
+/// translations without a fixed width.
 fn menu_box() -> gtk::Box {
     gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -92,7 +93,6 @@ fn menu_box() -> gtk::Box {
         .margin_end(6)
         .margin_top(6)
         .margin_bottom(6)
-        .width_request(216)
         .build()
 }
 
@@ -132,6 +132,7 @@ fn build(
     window: &adw::ApplicationWindow,
 ) -> gtk::Popover {
     let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
     popover.add_css_class("ctx-menu");
     let list = menu_box();
     for (i, r) in rows.iter().enumerate() {
@@ -458,19 +459,6 @@ fn vertical_side(anchor: &gtk::Widget, y: f64, natural_h: i32) -> gtk::PositionT
     }
 }
 
-/// Compact menu container, naturally sized to its rows so both
-/// translations fit without a fixed width.
-fn bg_box() -> gtk::Box {
-    gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .margin_start(6)
-        .margin_end(6)
-        .margin_top(6)
-        .margin_bottom(6)
-        .build()
-}
-
 /// Icon + label row; a submenu adds the lateral `›` indicator.
 fn bg_row_button(row: &BgRow) -> gtk::Button {
     let button = gtk::Button::builder().has_frame(false).build();
@@ -559,7 +547,7 @@ fn popup_bg(
     popover.set_has_arrow(false);
     popover.add_css_class("ctx-menu");
     popover.insert_action_group("bg", Some(group));
-    let list = bg_box();
+    let list = menu_box();
     let open_sub: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
     for (index, section) in sections.iter().enumerate() {
         for row in section.iter() {
@@ -645,7 +633,7 @@ fn open_bg_sub(
     let sub = gtk::Popover::new();
     sub.set_has_arrow(false);
     sub.add_css_class("ctx-menu");
-    let list = bg_box();
+    let list = menu_box();
     for row in rows {
         let button = bg_row_button(row);
         wire_bg_button(&button, row, group, window, main, open_sub);
