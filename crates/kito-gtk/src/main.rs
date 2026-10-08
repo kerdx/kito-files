@@ -97,6 +97,24 @@ fn update_view_control(
     ]);
 }
 
+/// Applies the window-controls preference to a window's start/end controls
+/// with native decoration-layout APIs. Automatic mode clears the app
+/// override (`None`) so GTK/libadwaita follows the system layout live,
+/// including system changes at runtime. Custom mode shows only the selected
+/// buttons on the right (`":minimize,maximize,close"` filtered), leaving the
+/// left side empty. Appearance stays with the theme and actions with the
+/// window manager; dragging, window menu, shortcuts and other header buttons
+/// are untouched.
+fn apply_window_controls(
+    start: &gtk::WindowControls,
+    end: &gtk::WindowControls,
+    controls: &crate::preferences::model::WindowControls,
+) {
+    let layout = controls.decoration_layout();
+    start.set_decoration_layout(layout.as_deref());
+    end.set_decoration_layout(layout.as_deref());
+}
+
 fn app_menu_model() -> gio::Menu {
     let menu = gio::Menu::new();
     update_app_menu_model(&menu);
@@ -678,6 +696,23 @@ fn build_window(
         controls.set_visible(!controls.is_empty());
     });
     header_contents.append(&end_window_controls);
+
+    // Window controls follow the shared preference immediately and for new
+    // windows. Weak refs: closing a window releases its widgets.
+    apply_window_controls(
+        &start_window_controls,
+        &end_window_controls,
+        &preferences.snapshot().window_controls,
+    );
+    preferences.subscribe_window_controls({
+        let start_weak = start_window_controls.downgrade();
+        let end_weak = end_window_controls.downgrade();
+        Rc::new(move |controls| {
+            if let (Some(start), Some(end)) = (start_weak.upgrade(), end_weak.upgrade()) {
+                apply_window_controls(&start, &end, &controls);
+            }
+        })
+    });
 
     // Body: sidebar on the left, tabs + status on the right.
     let paned = gtk::Paned::builder()

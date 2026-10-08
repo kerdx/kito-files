@@ -20,6 +20,15 @@ pub struct PreferencesDialogState {
     language_row: adw::ComboRow,
     language_options: gtk::StringList,
     language_handler: glib::SignalHandlerId,
+    window_group: adw::PreferencesGroup,
+    follow_system_row: adw::SwitchRow,
+    follow_system_handler: glib::SignalHandlerId,
+    minimize_row: adw::SwitchRow,
+    minimize_handler: glib::SignalHandlerId,
+    maximize_row: adw::SwitchRow,
+    maximize_handler: glib::SignalHandlerId,
+    close_row: adw::SwitchRow,
+    close_handler: glib::SignalHandlerId,
     terminal_row: adw::ComboRow,
     terminal_options: gtk::StringList,
     terminal_handler: glib::SignalHandlerId,
@@ -122,6 +131,80 @@ pub fn present(
     };
     general_group.add(&language_row);
     general_page.add(&general_group);
+
+    let window_controls = store.snapshot().window_controls;
+    let window_group = adw::PreferencesGroup::builder()
+        .title(crate::l10n::tr("prefs-window-controls"))
+        .build();
+    let follow_system_row = adw::SwitchRow::builder()
+        .title(crate::l10n::tr("prefs-follow-system"))
+        .active(window_controls.follow_system)
+        .build();
+    let minimize_row = adw::SwitchRow::builder()
+        .title(crate::l10n::tr("prefs-show-minimize"))
+        .active(window_controls.show_minimize)
+        .sensitive(!window_controls.follow_system)
+        .build();
+    let maximize_row = adw::SwitchRow::builder()
+        .title(crate::l10n::tr("prefs-show-maximize"))
+        .active(window_controls.show_maximize)
+        .sensitive(!window_controls.follow_system)
+        .build();
+    let close_row = adw::SwitchRow::builder()
+        .title(crate::l10n::tr("prefs-show-close"))
+        .active(window_controls.show_close)
+        .sensitive(!window_controls.follow_system)
+        .build();
+    let minimize_weak = minimize_row.downgrade();
+    let maximize_weak = maximize_row.downgrade();
+    let close_weak = close_row.downgrade();
+    let follow_system_handler = {
+        let store = store.clone();
+        follow_system_row.connect_active_notify(move |row| {
+            let follow = row.is_active();
+            row.set_subtitle(&save_status(
+                store.set_window_controls_follow_system(follow),
+            ));
+            if let Some(minimize) = minimize_weak.upgrade() {
+                minimize.set_sensitive(!follow);
+            }
+            if let Some(maximize) = maximize_weak.upgrade() {
+                maximize.set_sensitive(!follow);
+            }
+            if let Some(close) = close_weak.upgrade() {
+                close.set_sensitive(!follow);
+            }
+        })
+    };
+    let minimize_handler = {
+        let store = store.clone();
+        minimize_row.connect_active_notify(move |row| {
+            row.set_subtitle(&save_status(
+                store.set_window_controls_minimize(row.is_active()),
+            ));
+        })
+    };
+    let maximize_handler = {
+        let store = store.clone();
+        maximize_row.connect_active_notify(move |row| {
+            row.set_subtitle(&save_status(
+                store.set_window_controls_maximize(row.is_active()),
+            ));
+        })
+    };
+    let close_handler = {
+        let store = store.clone();
+        close_row.connect_active_notify(move |row| {
+            row.set_subtitle(&save_status(
+                store.set_window_controls_close(row.is_active()),
+            ));
+        })
+    };
+    window_group.add(&follow_system_row);
+    window_group.add(&minimize_row);
+    window_group.add(&maximize_row);
+    window_group.add(&close_row);
+    general_page.add(&window_group);
     dialog.add(&general_page);
 
     let integration_page = adw::PreferencesPage::builder()
@@ -177,6 +260,15 @@ pub fn present(
         language_row,
         language_options,
         language_handler,
+        window_group,
+        follow_system_row,
+        follow_system_handler,
+        minimize_row,
+        minimize_handler,
+        maximize_row,
+        maximize_handler,
+        close_row,
+        close_handler,
         terminal_row,
         terminal_options,
         terminal_handler,
@@ -238,6 +330,50 @@ pub fn retranslate(state: &PreferencesDialogState, store: &PreferenceStore) {
     state
         .language_row
         .set_subtitle(&crate::l10n::tr("prefs-language-applied"));
+
+    state
+        .window_group
+        .set_title(&crate::l10n::tr("prefs-window-controls"));
+    state
+        .follow_system_row
+        .set_title(&crate::l10n::tr("prefs-follow-system"));
+    state
+        .follow_system_row
+        .block_signal(&state.follow_system_handler);
+    state
+        .follow_system_row
+        .set_active(snapshot.window_controls.follow_system);
+    state
+        .follow_system_row
+        .unblock_signal(&state.follow_system_handler);
+    state.follow_system_row.set_subtitle("");
+    for (row, handler, title, active) in [
+        (
+            &state.minimize_row,
+            &state.minimize_handler,
+            "prefs-show-minimize",
+            snapshot.window_controls.show_minimize,
+        ),
+        (
+            &state.maximize_row,
+            &state.maximize_handler,
+            "prefs-show-maximize",
+            snapshot.window_controls.show_maximize,
+        ),
+        (
+            &state.close_row,
+            &state.close_handler,
+            "prefs-show-close",
+            snapshot.window_controls.show_close,
+        ),
+    ] {
+        row.set_title(&crate::l10n::tr(title));
+        row.block_signal(handler);
+        row.set_active(active);
+        row.unblock_signal(handler);
+        row.set_sensitive(!snapshot.window_controls.follow_system);
+        row.set_subtitle("");
+    }
 
     state
         .terminal_row

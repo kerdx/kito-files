@@ -3,11 +3,12 @@
 pub mod model;
 pub mod storage;
 
-use model::{OpenItems, Preferences, ViewMode};
+use model::{OpenItems, Preferences, ViewMode, WindowControls};
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 type OpenItemsListener = Rc<dyn Fn(OpenItems)>;
 type LanguageListener = Rc<dyn Fn(kito_i18n::AppLang)>;
+type WindowControlsListener = Rc<dyn Fn(WindowControls)>;
 
 /// Process-wide settings state shared by every window.
 pub struct PreferenceStore {
@@ -15,6 +16,7 @@ pub struct PreferenceStore {
     path: Option<PathBuf>,
     open_items_listeners: RefCell<Vec<OpenItemsListener>>,
     language_listeners: RefCell<Vec<LanguageListener>>,
+    window_controls_listeners: RefCell<Vec<WindowControlsListener>>,
 }
 
 impl PreferenceStore {
@@ -26,6 +28,7 @@ impl PreferenceStore {
             path,
             open_items_listeners: RefCell::new(Vec::new()),
             language_listeners: RefCell::new(Vec::new()),
+            window_controls_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -36,6 +39,7 @@ impl PreferenceStore {
             path: Some(path),
             open_items_listeners: RefCell::new(Vec::new()),
             language_listeners: RefCell::new(Vec::new()),
+            window_controls_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -74,12 +78,47 @@ impl PreferenceStore {
         result
     }
 
+    pub fn set_window_controls_follow_system(&self, follow: bool) -> io::Result<()> {
+        self.current.borrow_mut().window_controls.follow_system = follow;
+        self.notify_window_controls();
+        self.save()
+    }
+
+    pub fn set_window_controls_minimize(&self, show: bool) -> io::Result<()> {
+        self.current.borrow_mut().window_controls.show_minimize = show;
+        self.notify_window_controls();
+        self.save()
+    }
+
+    pub fn set_window_controls_maximize(&self, show: bool) -> io::Result<()> {
+        self.current.borrow_mut().window_controls.show_maximize = show;
+        self.notify_window_controls();
+        self.save()
+    }
+
+    pub fn set_window_controls_close(&self, show: bool) -> io::Result<()> {
+        self.current.borrow_mut().window_controls.show_close = show;
+        self.notify_window_controls();
+        self.save()
+    }
+
+    fn notify_window_controls(&self) {
+        let controls = self.current.borrow().window_controls;
+        for listener in self.window_controls_listeners.borrow().iter() {
+            listener(controls);
+        }
+    }
+
     pub fn subscribe_open_items(&self, listener: OpenItemsListener) {
         self.open_items_listeners.borrow_mut().push(listener);
     }
 
     pub fn subscribe_language(&self, listener: LanguageListener) {
         self.language_listeners.borrow_mut().push(listener);
+    }
+
+    pub fn subscribe_window_controls(&self, listener: WindowControlsListener) {
+        self.window_controls_listeners.borrow_mut().push(listener);
     }
 
     fn save(&self) -> io::Result<()> {
@@ -132,5 +171,90 @@ mod tests {
             vec![kito_i18n::AppLang::English, kito_i18n::AppLang::English]
         );
         assert_eq!(store.snapshot().language, kito_i18n::AppLang::English);
+    }
+
+    #[test]
+    fn window_controls_changes_notify_open_windows_and_new_windows_follow_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PreferenceStore::at_path(dir.path().join("settings.conf"));
+        // Two open windows subscribed.
+        let first = Rc::new(RefCell::new(Vec::new()));
+        let second = Rc::new(RefCell::new(Vec::new()));
+        for target in [first.clone(), second.clone()] {
+            store.subscribe_window_controls({
+                let target = target.clone();
+                Rc::new(move |controls| target.borrow_mut().push(controls))
+            });
+        }
+
+        store.set_window_controls_follow_system(false).unwrap();
+        store.set_window_controls_minimize(false).unwrap();
+
+        let expected = WindowControls {
+            follow_system: false,
+            show_minimize: false,
+            show_maximize: true,
+            show_close: true,
+        };
+        assert_eq!(store.snapshot().window_controls, expected);
+        // New windows read the same snapshot.
+        assert_eq!(store.snapshot().window_controls, expected);
+        for notified in [first.clone(), second.clone()] {
+            let notified = notified.borrow();
+            assert_eq!(notified.len(), 2);
+            assert_eq!(*notified.last().unwrap(), expected);
+            // Custom layout keeps the remaining buttons on the right.
+            assert_eq!(
+                notified.last().unwrap().decoration_layout(),
+                Some(":maximize,close".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn window_controls_auto_to_custom_to_auto_preserves_custom_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PreferenceStore::at_path(dir.path().join("settings.conf"));
+        store.set_window_controls_follow_system(false).unwrap();
+        store.set_window_controls_maximize(false).unwrap();
+        store.set_window_controls_close(false).unwrap();
+        let custom = WindowControls {
+            follow_system: false,
+            show_minimize: true,
+            show_maximize: false,
+            show_close: false,
+        };
+        assert_eq!(store.snapshot().window_controls, custom);
+
+        // Temporarily back to automatic: override removed, choices kept.
+        store.set_window_controls_follow_system(true).unwrap();
+        let automatic = store.snapshot().window_controls;
+        assert!(automatic.follow_system);
+        assert_eq!(automatic.decoration_layout(), None);
+        assert!(automatic.show_minimize);
+        assert!(!automatic.show_maximize);
+        assert!(!automatic.show_close);
+
+        // Returning to custom restores the same layout.
+        store.set_window_controls_follow_system(false).unwrap();
+        assert_eq!(store.snapshot().window_controls, custom);
+        assert_eq!(
+            store.snapshot().window_controls.decoration_layout(),
+            Some(":minimize".to_string())
+        );
+    }
+
+    #[test]
+    fn window_controls_allow_hiding_all_buttons() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PreferenceStore::at_path(dir.path().join("settings.conf"));
+        store.set_window_controls_follow_system(false).unwrap();
+        store.set_window_controls_minimize(false).unwrap();
+        store.set_window_controls_maximize(false).unwrap();
+        store.set_window_controls_close(false).unwrap();
+        let controls = store.snapshot().window_controls;
+        assert!(!controls.follow_system);
+        assert_eq!(controls.custom_layout(), ":");
+        assert_eq!(controls.decoration_layout(), Some(":".to_string()));
     }
 }

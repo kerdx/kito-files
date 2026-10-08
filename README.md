@@ -295,12 +295,19 @@ dialog contains **General** and **Integration** pages:
 | Default view | Icons, Compact, Details | Applies to new tabs; existing tabs keep their view |
 | Open items | Double click, Single click | Applies immediately to existing and new tabs; keyboard activation is unchanged |
 | Language | System language, English, Italiano | Updates app translations immediately in open windows |
+| Window controls | Follow system settings, Show minimize / maximize / close | Follow uses the system layout live; turning it off shows only the selected buttons on the top right, immediately in open and new windows |
 | Terminal | Automatic or an installed emulator | Uses the selected emulator for terminal actions |
 
-Defaults are Icons, double-click opening, system language and automatic terminal
-detection. If a saved terminal is no longer available, detection falls back to
-Automatic and the preferences dialog reports the missing choice. Root terminal
-actions require an emulator that supports launching a root shell and `sudo`.
+Defaults are Icons, double-click opening, system language, following the system
+window controls (custom mode starts with all three buttons visible) and automatic
+terminal detection. In custom mode buttons appear only on the top right in
+minimize, maximize, close order, and all three may be hidden. Returning to Follow
+system settings removes the app override without saving a static copy of the
+system layout; custom choices are kept while following the system, system changes
+apply live, and global desktop settings are never modified. If a saved terminal
+is no longer available, detection falls back to Automatic and the preferences
+dialog reports the missing choice. Root terminal actions require an emulator
+that supports launching a root shell and `sudo`.
 
 Changes are saved automatically and shared by open windows. Preferences are stored
 atomically in `~/.config/kito-files/settings.conf`, or

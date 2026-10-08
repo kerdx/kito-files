@@ -24,7 +24,7 @@ pub fn save_to(path: &Path, preferences: &Preferences) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preferences::model::{OpenItems, TerminalChoice, ViewMode};
+    use crate::preferences::model::{OpenItems, TerminalChoice, ViewMode, WindowControls};
 
     #[test]
     fn missing_file_loads_defaults_and_save_load_round_trips() {
@@ -37,6 +37,12 @@ mod tests {
             open_items: OpenItems::SingleClick,
             terminal: TerminalChoice::Emulator("xterm".to_string()),
             language: kito_i18n::AppLang::Italian,
+            window_controls: WindowControls {
+                follow_system: false,
+                show_minimize: true,
+                show_maximize: false,
+                show_close: true,
+            },
         };
         save_to(&path, &preferences).unwrap();
         assert_eq!(load_from(&path), preferences);
@@ -58,5 +64,34 @@ mod tests {
         assert!(saved.contains("future-option = retained"));
         assert!(saved.contains("default-view = icons"));
         assert!(saved.contains("language = system"));
+        assert!(saved.contains("window-controls-follow-system = true"));
+    }
+
+    #[test]
+    fn window_controls_persist_and_invalid_values_use_automatic_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.conf");
+        let custom = Preferences {
+            window_controls: WindowControls {
+                follow_system: false,
+                show_minimize: false,
+                show_maximize: true,
+                show_close: false,
+            },
+            ..Preferences::default()
+        };
+        save_to(&path, &custom).unwrap();
+        assert_eq!(load_from(&path), custom);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("window-controls-follow-system = false"));
+        assert!(saved.contains("window-controls-minimize = false"));
+        assert!(saved.contains("window-controls-maximize = true"));
+
+        std::fs::write(
+            &path,
+            "window-controls-follow-system = maybe\nwindow-controls-minimize = 2\n",
+        )
+        .unwrap();
+        assert_eq!(load_from(&path), Preferences::default());
     }
 }
