@@ -12,33 +12,36 @@ The automated run used the workspace checkout on Linux with Rust 1.98.1,
 GTK 4.22.5 and libadwaita 1.9.4. `cargo fmt --all --check`,
 `./scripts/check.sh` and `cargo build --workspace --locked` were run; the check
 script passed 36 `kito-core`, 91 `kito-gtk` and 11 `kito-i18n` tests plus
-Clippy. It filtered out the session-Trash integration test. No GTK interaction
-was observed. The host exposed `WAYLAND_DISPLAY=wayland-0`, `DISPLAY=:0` and
-`GDK_BACKEND=x11`, but those variables do not establish which backend the app
-used. A UI automation inventory exposed no controllable app/window, so the
-matrix does not claim a Wayland or X11 pass. A generated 20,000-entry fixture
-and isolated XDG config/data/cache were prepared under `/tmp`; no personal
-files, real Trash contents or real clipboard were used.
+Clippy. It filtered out the session-Trash integration test. The user reports
+that the graphical Phase 0 checks were completed on Wayland; per-case logs and
+other session details were not provided here, so those results are identified
+as user-reported. X11 remains unverified. The GUI executor used for the
+automated run exposed no controllable app/window; its environment variables
+alone do not establish the backend used by the app. A generated 20,000-entry
+fixture and isolated XDG config/data/cache were prepared under `/tmp`; no
+personal files, real Trash contents or real clipboard were used by that run.
 
 | ID | Requisito e risultato atteso | Tipo | Ambiente/backend effettivo | Esito | Evidenza, limiti e lavoro residuo |
 |---|---|---|---|---|---|
-| B01-1 | Menu sullo sfondo con icone e senza barra di scorrimento, con e senza selezione; Proprietà descrive la cartella e lascia intatta la selezione. | Automatica, sorgenti, grafica | Test headless Linux; backend GUI non osservato | NON ESEGUITO | Struttura del modello e codici azione coperti dai test; layout custom ispezionato nei sorgenti. Controllare entrambi i casi e la selezione in GUI. |
-| B01-2 | Sottomenu Nuovo file con icone per ciascun tipo, clic fuori, Escape, navigazione da tastiera e aperture ripetute senza chiusure errate o callback residue. | Automatica, grafica | Test headless Linux; backend GUI non osservato | NON ESEGUITO | Azioni e icone (file vuoto, testo, HTML) coperte dai test; interazioni GTK non esercitate. |
-| B01-3 | Il menu del cestino mantiene le azioni dedicate e le conferme distruttive. | Automatica, sorgenti, grafica | Test headless Linux; test Trash reale escluso | NON ESEGUITO | Test modello menu passato; non è stato aperto né svuotato il cestino. Eseguire in sessione isolata. |
-| B02-1 | Sotto 200 ms non compare l’indicatore; dopo 200 ms compare overlay piccolo con spinner, testo e Interrompi; nessuna durata minima. | Automatica, grafica | Logica unit test headless Linux; backend GUI non osservato | SUPERATO (logica) | Testa generazione e soglia della logica; tempi di rendering e risposta visiva non misurati. |
-| B02-2 | Navigazioni rapide/out-of-order applicano solo la destinazione più recente; cronologia e vista restano coerenti. | Automatica, sorgenti, grafica | Test headless Linux; backend GUI non osservato | SUPERATO (stato) | Test di generazioni, risultati fuori ordine, errore e cronologia passati; manca prova di navigazione interattiva. |
-| B02-3 | Errore o annullamento durante lettura/inserimento a blocchi lascia la vista precedente coerente; annullamento interrompe il lavoro quando possibile. | Automatica, sorgenti, grafica | GIO e stato testati headless Linux; backend GUI non osservato | SUPERATO (unità) | Cancellazione GIO preannullata, invalidazione e risultati obsoleti coperti; annullamento durante un chunk non è testato direttamente. Il sort non è interrompibile a metà e la UI non è stata esercitata. |
-| B02-4 | Chiusura scheda/finestra durante il caricamento non causa crash o mutazioni tardive. | Automatica, grafica | Test di stato headless Linux; backend GUI non osservato | SUPERATO (stato) | Testa lo scarto quando la scheda è chiusa; distruzione finestra e cancellazione nel runtime grafico da verificare. |
-| B03-1 | Successi, fallimenti e successo parziale mostrano un riepilogo, dettagli per elemento e cause, senza un dialogo per file. | Automatica, sorgenti, grafica | Test headless Linux; backend GUI non osservato | NON ESEGUITO | Record e costruzione del dialogo implementati; manca test del dialogo con errori indotti e controllo dei testi/accessibilità. |
-| B03-2 | Appunti sostituiti durante un’operazione non vengono sovrascritti; retry del taglio resta spostamento e include solo fallimenti. | Automatica, grafica | Test appunti simulati headless Linux; clipboard reale non toccato | SUPERATO (unità) | Test di cambio generazione, taglio parziale, retry solo falliti e duplicati concorrenti passati; manca prova da sessione desktop. |
+| B01-1 | Menu sullo sfondo con icone e senza barra di scorrimento, con e senza selezione; Proprietà descrive la cartella e lascia intatta la selezione. | Automatica, sorgenti, grafica | Test automatici headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (conferma utente) | Modello e azioni coperti dai test; verifica grafica confermata dall’utente, senza note per singolo caso in questa matrice. |
+| B01-2 | Sottomenu Nuovo file con icone per ciascun tipo, clic fuori, Escape, navigazione da tastiera e aperture ripetute senza chiusure errate o callback residue. | Automatica, grafica | Test automatici headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (conferma utente) | Azioni e icone (file vuoto, testo, HTML) coperte dai test; verifica grafica confermata dall’utente, senza note per singolo caso in questa matrice. |
+| B01-3 | Il menu del cestino mantiene le azioni dedicate e le conferme distruttive. | Automatica, sorgenti, grafica | Test automatici headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (conferma utente) | Modello menu coperto dai test; verifica grafica confermata dall’utente. Il test d’integrazione con il cestino reale resta escluso. |
+| B02-1 | Sotto 200 ms non compare l’indicatore; dopo 200 ms compare overlay piccolo con spinner, testo e Interrompi; nessuna durata minima. | Automatica, grafica | Logica unit test headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (logica + conferma utente) | Testa generazione e soglia della logica; verifica grafica confermata dall’utente. Non sono riportate nuove misure prestazionali numeriche. |
+| B02-2 | Navigazioni rapide/out-of-order applicano solo la destinazione più recente; cronologia e vista restano coerenti. | Automatica, sorgenti, grafica | Test headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (stato + conferma utente) | Test di generazioni, risultati fuori ordine, errore e cronologia passati; verifica interattiva confermata dall’utente. |
+| B02-3 | Errore o annullamento durante lettura/inserimento a blocchi lascia la vista precedente coerente; annullamento interrompe il lavoro quando possibile. | Automatica, sorgenti, grafica | GIO e stato testati headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (unità + conferma utente) | Cancellazione GIO preannullata, invalidazione e risultati obsoleti coperti; verifica grafica confermata dall’utente. Il sort non è interrompibile a metà. |
+| B02-4 | Chiusura scheda/finestra durante il caricamento non causa crash o mutazioni tardive. | Automatica, grafica | Test di stato headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (stato + conferma utente) | Testa lo scarto quando la scheda è chiusa; verifica del runtime grafico confermata dall’utente. |
+| B03-1 | Successi, fallimenti e successo parziale mostrano un riepilogo, dettagli per elemento e cause, senza un dialogo per file. | Automatica, sorgenti, grafica | Test headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (conferma utente) | Record e costruzione del dialogo coperti dal codice; verifica grafica con errori parziali confermata dall’utente, senza note per singolo caso in questa matrice. |
+| B03-2 | Appunti sostituiti durante un’operazione non vengono sovrascritti; retry del taglio resta spostamento e include solo fallimenti. | Automatica, grafica | Test appunti simulati headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (unità + conferma utente) | Test di cambio generazione, taglio parziale, retry solo falliti e duplicati concorrenti passati; verifica desktop confermata dall’utente. |
 | B03-3 | Cancellare un symlink non modifica il target. | Automatica | GIO su directory temporanee Linux | SUPERATO | Test su link valido, rotto, circolare e alberi con link esterni passati. |
 | B03-4 | Copiare una directory dentro sé stessa o discendenti, anche via symlink, viene rifiutato prima di creare una copia ricorsiva. | Automatica | GIO su directory temporanee Linux | SUPERATO | Test sorgente, sottodirectory e destinazione via symlink passati. |
 | B03-5 | Ripristino gestisce collisioni, URI speciali e nomi non UTF-8 senza sovrascrivere o perdere i byte del percorso. | Automatica | GIO su directory temporanee Linux | SUPERATO | Test di collisione, metadata e percorso non UTF-8 passati; flusso integrato dal cestino e backend GVfs non provati. |
-| B04-1 | Inglese/italiano, tema chiaro/scuro, tastiera e accessibilità restano utilizzabili. | Automatica, grafica | Cataloghi testati headless Linux; backend GUI non osservato | NON ESEGUITO | Test dei cataloghi e delle chiavi passati; temi, focus, screen reader e navigazione menu da verificare graficamente. |
-| B04-2 | L’app funziona su Wayland e X11, provati separatamente. | Grafica | Endpoint Wayland/X11 presenti; backend app non confermato | NON ESEGUITO | Nessuna prova visiva/interattiva affidabile disponibile; ripetere la matrice manuale su entrambi i backend. |
+| B04-1 | Inglese/italiano, tema chiaro/scuro, tastiera e accessibilità restano utilizzabili. | Automatica, grafica | Cataloghi testati headless Linux; grafica Wayland (riferita dall’utente) | SUPERATO (conferma utente) | Test dei cataloghi e delle chiavi passati; verifica grafica riferita dall’utente, senza dettaglio dei singoli controlli di accessibilità in questa matrice. |
+| B04-2 | L’app funziona su Wayland e X11, provati separatamente. | Grafica | Wayland riferito dall’utente; X11 non provato | PARZIALE | Verifica Wayland riferita dall’utente; serve ancora la prova grafica in una sessione X11 separata. |
 
-Per completare le righe non eseguite, seguire i casi manuali sottostanti in una
-sessione grafica reale e registrare backend, controlli osservati e limiti.
+Per completare B04-2, ripetere le prove in una sessione X11 e registrare il
+backend effettivo e gli eventuali limiti. Gli esiti Wayland sopra riportati
+riflettono la conferma dell’utente; non sono stati osservati in modo indipendente
+dal runner di questa verifica.
 
 ## Automated checks
 
