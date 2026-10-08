@@ -123,8 +123,18 @@ fn app_menu_model() -> gio::Menu {
 
 fn update_app_menu_model(menu: &gio::Menu) {
     menu.remove_all();
-    menu.append(Some(&tr("menu-preferences")), Some("win.preferences"));
-    menu.append(Some(&tr("menu-about")), Some("win.about"));
+    for (label, action, icon) in [
+        (
+            tr("menu-preferences"),
+            "win.preferences",
+            "preferences-system-symbolic",
+        ),
+        (tr("menu-about"), "win.about", "help-about-symbolic"),
+    ] {
+        let item = gio::MenuItem::new(Some(&label), Some(action));
+        item.set_icon(&gio::ThemedIcon::new(icon));
+        menu.append_item(&item);
+    }
 }
 
 /// One `win.*` action entry: name + function on the context.
