@@ -115,26 +115,78 @@ fn apply_window_controls(
     end.set_decoration_layout(layout.as_deref());
 }
 
-fn app_menu_model() -> gio::Menu {
-    let menu = gio::Menu::new();
-    update_app_menu_model(&menu);
-    menu
+const APP_MENU_ITEMS: [(&str, &str, &[&str]); 2] = [
+    (
+        "menu-preferences",
+        "win.preferences",
+        &["preferences-system", "preferences-system-symbolic"],
+    ),
+    (
+        "menu-about",
+        "win.about",
+        &["help-about", "dialog-information"],
+    ),
+];
+
+fn update_app_menu_popover(popover: &gtk::Popover, window: &adw::ApplicationWindow) {
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+
+    for (label_id, action, icon_names) in APP_MENU_ITEMS {
+        let label = tr(label_id);
+        let button = gtk::Button::builder().has_frame(false).build();
+        button.add_css_class("ctx-row");
+        button.update_property(&[gtk::accessible::Property::Label(&label)]);
+
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(10)
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        let image = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(icon_names));
+        image.set_pixel_size(18);
+        content.append(&image);
+        content.append(
+            &gtk::Label::builder()
+                .label(&label)
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .build(),
+        );
+        button.set_child(Some(&content));
+
+        let weak_window = window.downgrade();
+        let weak_popover = popover.downgrade();
+        let action = action.to_owned();
+        button.connect_clicked(move |_| {
+            if let Some(popover) = weak_popover.upgrade() {
+                popover.popdown();
+            }
+            if let Some(window) = weak_window.upgrade() {
+                let _ = gtk::prelude::WidgetExt::activate_action(&window, &action, None);
+            }
+        });
+        list.append(&button);
+    }
+
+    popover.set_child(Some(&list));
 }
 
-fn update_app_menu_model(menu: &gio::Menu) {
-    menu.remove_all();
-    for (label, action, icon) in [
-        (
-            tr("menu-preferences"),
-            "win.preferences",
-            "preferences-system-symbolic",
-        ),
-        (tr("menu-about"), "win.about", "help-about-symbolic"),
-    ] {
-        let item = gio::MenuItem::new(Some(&label), Some(action));
-        item.set_icon(&gio::ThemedIcon::new(icon));
-        menu.append_item(&item);
-    }
+fn build_app_menu_popover(window: &adw::ApplicationWindow) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.add_css_class("ctx-menu");
+    update_app_menu_popover(&popover, window);
+    popover
 }
 
 /// One `win.*` action entry: name + function on the context.
@@ -588,8 +640,7 @@ fn build_window(
         .build();
     header_contents.append(&app_label);
 
-    let app_menu_model = app_menu_model();
-    let app_menu_popover = gtk::PopoverMenu::from_model(Some(&app_menu_model));
+    let app_menu_popover = build_app_menu_popover(&window);
     let app_menu_button = gtk::MenuButton::builder()
         .tooltip_text(tr("menu-application"))
         .popover(&app_menu_popover)
@@ -1077,7 +1128,8 @@ fn build_window(
         let path_stack = path_stack.downgrade();
         let path_completion_retranslator = path_completion_retranslator.clone();
         let app_menu_button = app_menu_button.downgrade();
-        let app_menu_model = app_menu_model.downgrade();
+        let app_menu_popover = app_menu_popover.downgrade();
+        let window = window.downgrade();
         let view_button = view_button.downgrade();
         let new_tab_button = new_tab_button.downgrade();
         let icons_btn = icons_btn.downgrade();
@@ -1112,8 +1164,8 @@ fn build_window(
                 button.set_tooltip_text(Some(&label));
                 button.update_property(&[gtk::accessible::Property::Label(&label)]);
             }
-            if let Some(menu) = app_menu_model.upgrade() {
-                update_app_menu_model(&menu);
+            if let (Some(popover), Some(window)) = (app_menu_popover.upgrade(), window.upgrade()) {
+                update_app_menu_popover(&popover, &window);
             }
             if let Some(button) = view_button.upgrade() {
                 let label = tr("view-selector");
