@@ -752,8 +752,8 @@ fn build_window(
 
     // Manager slot: needed by breadcrumbs (created before the manager).
     let manager_slot: Rc<RefCell<Option<Rc<tabs::TabManager>>>> = Rc::new(RefCell::new(None));
-    let path_completion_invalidator: Rc<RefCell<Option<Rc<dyn Fn()>>>> =
-        Rc::new(RefCell::new(None));
+    type PathCompletionInvalidator = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+    let path_completion_invalidator: PathCompletionInvalidator = Rc::new(RefCell::new(None));
     let slot_load: Rc<dyn Fn(&str)> = Rc::new({
         let manager_slot = manager_slot.clone();
         move |uri: &str| {

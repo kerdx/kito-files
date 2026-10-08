@@ -229,9 +229,9 @@ fn file_info_byte_string(info: &gio::FileInfo, attr: &std::ffi::CStr) -> Option<
 
 /// Restore destination from trash metadata: original directory
 /// + original name with suffix if taken. The original
-/// path is a byte string (`trash::orig-path`, not
-/// `standard::trash::orig-path`) and must be read as bytes to preserve
-/// spaces, special chars and non-UTF-8 names. Testable without backend.
+///   path is a byte string (`trash::orig-path`, not
+///   `standard::trash::orig-path`) and must be read as bytes to preserve
+///   spaces, special chars and non-UTF-8 names. Testable without backend.
 fn restore_destination(info: &gio::FileInfo) -> Result<gio::File, glib::Error> {
     let bytes = file_info_byte_string(info, c"trash::orig-path")
         .filter(|b| !b.is_empty())

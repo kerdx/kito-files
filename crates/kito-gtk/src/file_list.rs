@@ -357,6 +357,48 @@ fn single_click_activation(behavior: OpenItems) -> bool {
     behavior == OpenItems::SingleClick
 }
 
+/// View + empty store; populate with [`reload`].
+pub fn build_file_view() -> (gtk::ScrolledWindow, gio::ListStore) {
+    let store = gio::ListStore::new::<FileObject>();
+    let scrolled = gtk::ScrolledWindow::builder().vexpand(true).build();
+    (scrolled, store)
+}
+
+/// Rows created and inserted per main-loop turn during asynchronous loads.
+/// Keeps each pause short while staying near single-splice total time.
+pub const LOAD_CHUNK: usize = 500;
+
+/// Replaces the whole store content with `entries` in a single `splice`:
+/// one model notification instead of one per row.
+pub fn replace_all(store: &gio::ListStore, entries: &[kito_core::Entry]) {
+    let objs: Vec<FileObject> = entries.iter().map(FileObject::new).collect();
+    store.splice(0, store.n_items(), &objs);
+}
+
+/// Appends one chunk of entries with a single `splice` (one notification).
+/// The caller clears the store first for a fresh load.
+pub fn append_chunk(store: &gio::ListStore, chunk: &[kito_core::Entry]) {
+    if chunk.is_empty() {
+        return;
+    }
+    let objs: Vec<FileObject> = chunk.iter().map(FileObject::new).collect();
+    store.splice(store.n_items(), 0, &objs);
+}
+
+/// Fills the store with `dir_uri`. Returns the entry count.
+/// Test helper: the UI loads asynchronously (see `tabs`), sharing the same
+/// `list_dir` ordering and single-splice application.
+#[cfg(test)]
+pub fn reload(
+    store: &gio::ListStore,
+    dir_uri: &str,
+    show_hidden: bool,
+) -> Result<usize, glib::Error> {
+    let entries = kito_core::list_dir(dir_uri, show_hidden)?;
+    replace_all(store, &entries);
+    Ok(entries.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,46 +488,4 @@ mod tests {
         assert_eq!(store.n_items(), 0);
         assert_eq!(emissions.get(), 0);
     }
-}
-
-/// View + empty store; populate with [`reload`].
-pub fn build_file_view() -> (gtk::ScrolledWindow, gio::ListStore) {
-    let store = gio::ListStore::new::<FileObject>();
-    let scrolled = gtk::ScrolledWindow::builder().vexpand(true).build();
-    (scrolled, store)
-}
-
-/// Rows created and inserted per main-loop turn during asynchronous loads.
-/// Keeps each pause short while staying near single-splice total time.
-pub const LOAD_CHUNK: usize = 500;
-
-/// Replaces the whole store content with `entries` in a single `splice`:
-/// one model notification instead of one per row.
-pub fn replace_all(store: &gio::ListStore, entries: &[kito_core::Entry]) {
-    let objs: Vec<FileObject> = entries.iter().map(FileObject::new).collect();
-    store.splice(0, store.n_items(), &objs);
-}
-
-/// Appends one chunk of entries with a single `splice` (one notification).
-/// The caller clears the store first for a fresh load.
-pub fn append_chunk(store: &gio::ListStore, chunk: &[kito_core::Entry]) {
-    if chunk.is_empty() {
-        return;
-    }
-    let objs: Vec<FileObject> = chunk.iter().map(FileObject::new).collect();
-    store.splice(store.n_items(), 0, &objs);
-}
-
-/// Fills the store with `dir_uri`. Returns the entry count.
-/// Test helper: the UI loads asynchronously (see `tabs`), sharing the same
-/// `list_dir` ordering and single-splice application.
-#[cfg(test)]
-pub fn reload(
-    store: &gio::ListStore,
-    dir_uri: &str,
-    show_hidden: bool,
-) -> Result<usize, glib::Error> {
-    let entries = kito_core::list_dir(dir_uri, show_hidden)?;
-    replace_all(store, &entries);
-    Ok(entries.len())
 }

@@ -800,8 +800,10 @@ mod tests {
     #[test]
     fn default_view_is_read_for_new_tabs_only() {
         let existing_tab_mode = Cell::new(ViewMode::Compact);
-        let mut preferences = Preferences::default();
-        preferences.default_view = ViewMode::Details;
+        let preferences = Preferences {
+            default_view: ViewMode::Details,
+            ..Preferences::default()
+        };
 
         let new_tab_mode = mode_for_new_tab(&preferences);
         assert_eq!(existing_tab_mode.get(), ViewMode::Compact);

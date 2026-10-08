@@ -493,6 +493,7 @@ fn start_search(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_batch(
     state: Weak<RefCell<CompletionState>>,
     generation: u64,

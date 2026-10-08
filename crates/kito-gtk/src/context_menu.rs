@@ -417,20 +417,23 @@ fn refine_writability(
     );
 }
 
-/// The menu is short by construction: disable the internal scrolled
-/// window's scrollbars so no slider ever appears. With nothing to shrink,
-/// GTK fits the whole menu on screen by moving it instead.
-fn disable_menu_scrollbars(widget: &gtk::Widget) {
-    // No early return after a hit: nested submenu popovers live inside
-    // the main scrolled window's subtree (parented to their row button).
-    if let Some(scrolled) = widget.downcast_ref::<gtk::ScrolledWindow>() {
-        scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
-    }
-    let children = widget.observe_children();
-    for i in 0..children.n_items() {
-        if let Some(child) = children.item(i).and_downcast::<gtk::Widget>() {
-            disable_menu_scrollbars(&child);
-        }
+/// Vertical placement for the native menu: below the click when the
+/// menu's natural height fits there, above it otherwise, so GTK rarely
+/// needs to shrink it (shrinking is what draws the scrollbar). The window
+/// area is the only geometry known on Wayland; the compositor still keeps
+/// the menu inside the work area. The classic row popovers keep their own
+/// left/right logic below.
+fn vertical_side(anchor: &gtk::Widget, y: f64, natural_h: i32) -> gtk::PositionType {
+    // Without a measurement fall back to the roomier half.
+    let fits_below = if natural_h > 0 {
+        anchor.height() as f64 - y >= natural_h as f64
+    } else {
+        y <= anchor.height() as f64 / 2.0
+    };
+    if fits_below {
+        gtk::PositionType::Bottom
+    } else {
+        gtk::PositionType::Top
     }
 }
 
@@ -451,23 +454,23 @@ fn popup_native(
     // gtkmenusectionbox.c), so one call here covers every level.
     let popover = gtk::PopoverMenu::from_model_full(model, gtk::PopoverMenuFlags::NESTED);
     popover.set_has_arrow(false);
-    disable_menu_scrollbars(popover.upcast_ref());
-    // The menu tracker builds nested submenu popovers in a later idle:
-    // walk once more so late content is covered before first paint.
-    glib::idle_add_local_once({
-        let popover = popover.downgrade();
-        move || {
-            if let Some(popover) = popover.upgrade() {
-                disable_menu_scrollbars(popover.upcast_ref());
-            }
+    // Flush the menu tracker's build idles (rows, nested submenus,
+    // separators) before presenting, so the popover measures final content
+    // instead of growing after mapping, which would force a scrollbar.
+    // Bounded: drains only already-queued work, never waits or sleeps.
+    let context = glib::MainContext::default();
+    for _ in 0..100 {
+        if !context.iteration(false) {
+            break;
         }
-    });
+    }
     if let Some((name, group)) = group {
         popover.insert_action_group(name, Some(group));
     }
     popover.set_parent(anchor);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    popover.set_position(side_for(anchor, x));
+    let (_, natural_h, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
+    popover.set_position(vertical_side(anchor, y, natural_h));
     manager.track_bg_menu(&popover);
     let tracked = popover.clone();
     let manager_weak = Rc::downgrade(manager);
@@ -769,25 +772,6 @@ mod tests {
                 .expect("bg actions are simple actions");
             assert!(action.is_enabled(), "bg action {name} starts enabled");
         }
-        // No scrollbars anywhere inside the menu.
-        fn no_scrollbars(widget: &gtk::Widget) {
-            assert!(
-                widget
-                    .downcast_ref::<gtk::ScrolledWindow>()
-                    .is_none_or(|scrolled| {
-                        scrolled.hscrollbar_policy() == gtk::PolicyType::Never
-                            && scrolled.vscrollbar_policy() == gtk::PolicyType::Never
-                    }),
-                "menu scrolled window must not show scrollbars"
-            );
-            let children = widget.observe_children();
-            for i in 0..children.n_items() {
-                if let Some(child) = children.item(i).and_downcast::<gtk::Widget>() {
-                    no_scrollbars(&child);
-                }
-            }
-        }
-        no_scrollbars(popover.upcast_ref());
         popover.popdown();
         popover.unparent();
     }

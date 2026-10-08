@@ -116,9 +116,7 @@ pub fn detect_system() -> Option<AppLang> {
         .into_iter()
         .filter_map(|name| std::env::var(name).ok())
         .find(|value| !value.is_empty());
-    let Some(active_locale) = active_locale else {
-        return None;
-    };
+    let active_locale = active_locale?;
     if is_c_locale(&active_locale) {
         return None;
     }
