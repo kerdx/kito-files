@@ -510,7 +510,7 @@ pub struct TabManager {
     tabs: RefCell<Vec<Rc<FileTab>>>,
     /// Open background menu, if any: closed on tab switch and navigation so
     /// actions can never land on the wrong folder.
-    bg_menu: RefCell<Option<gtk::PopoverMenu>>,
+    bg_menu: RefCell<Option<gtk::Popover>>,
 }
 
 impl TabManager {
@@ -584,7 +584,7 @@ impl TabManager {
 
     /// Tracks the open background menu so tab switches and navigations can
     /// close it before its captured folder goes stale.
-    pub fn track_bg_menu(&self, menu: &gtk::PopoverMenu) {
+    pub fn track_bg_menu(&self, menu: &gtk::Popover) {
         *self.bg_menu.borrow_mut() = Some(menu.clone());
     }
 
@@ -596,7 +596,7 @@ impl TabManager {
     }
 
     /// Forgets a closed background menu, unless a newer one replaced it.
-    pub fn forget_bg_menu(&self, menu: &gtk::PopoverMenu) {
+    pub fn forget_bg_menu(&self, menu: &gtk::Popover) {
         let same = self
             .bg_menu
             .borrow()
@@ -755,7 +755,7 @@ impl TabManager {
                 };
                 let dest = tab.history.current_uri();
                 if dest.starts_with("trash:") {
-                    crate::context_menu::show_trash_background_for(&anchor, x, y, &dest, &manager);
+                    crate::context_menu::show_trash_background_for(&anchor, x, y, &ctx, &manager);
                 } else {
                     crate::context_menu::show_background_for(&anchor, x, y, &ctx, &dest, &manager);
                 }

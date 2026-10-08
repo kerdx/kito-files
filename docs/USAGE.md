@@ -74,9 +74,7 @@ supports one item at a time.
   files through collision suffixes
 - Empty the Trash (with confirmation)
 - Rename (`F2`) and new folder (`Ctrl+Shift+N`), both with input validation
-- Create empty files with suggested names for text, Word, spreadsheet and HTML files.
-  These are empty placeholders: `.docx` and `.xlsx` files are not valid Office
-  documents until created or saved in an appropriate application
+- Create empty files with suggested names for text and HTML files.
 - Open folders in the current tab and files with the system default application (`gio::AppInfo`)
 - Properties dialog with name, location, type, size and modification time
 - Context menus for files, empty space, and the Trash
