@@ -417,6 +417,23 @@ fn refine_writability(
     );
 }
 
+/// The menu is short by construction: disable the internal scrolled
+/// window's scrollbars so no slider ever appears. With nothing to shrink,
+/// GTK fits the whole menu on screen by moving it instead.
+fn disable_menu_scrollbars(widget: &gtk::Widget) {
+    // No early return after a hit: nested submenu popovers live inside
+    // the main scrolled window's subtree (parented to their row button).
+    if let Some(scrolled) = widget.downcast_ref::<gtk::ScrolledWindow>() {
+        scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+    }
+    let children = widget.observe_children();
+    for i in 0..children.n_items() {
+        if let Some(child) = children.item(i).and_downcast::<gtk::Widget>() {
+            disable_menu_scrollbars(&child);
+        }
+    }
+}
+
 /// Opens a native background menu for `dest` and tracks it for
 /// tab-switch/navigation invalidation. The popover unparents itself on
 /// close; repeated openings accumulate nothing.
@@ -434,6 +451,17 @@ fn popup_native(
     // gtkmenusectionbox.c), so one call here covers every level.
     let popover = gtk::PopoverMenu::from_model_full(model, gtk::PopoverMenuFlags::NESTED);
     popover.set_has_arrow(false);
+    disable_menu_scrollbars(popover.upcast_ref());
+    // The menu tracker builds nested submenu popovers in a later idle:
+    // walk once more so late content is covered before first paint.
+    glib::idle_add_local_once({
+        let popover = popover.downgrade();
+        move || {
+            if let Some(popover) = popover.upgrade() {
+                disable_menu_scrollbars(popover.upcast_ref());
+            }
+        }
+    });
     if let Some((name, group)) = group {
         popover.insert_action_group(name, Some(group));
     }
@@ -719,8 +747,14 @@ mod tests {
             });
             let opened =
                 show_background_for(window.upcast_ref(), 10.0, 10.0, &ctx, &dest_in, &manager);
-            *holder_in.borrow_mut() = Some(opened);
-            app.quit();
+            // Assert in a later idle: the tracker builds nested content
+            // asynchronously.
+            let holder_in = holder_in.clone();
+            let quit = app.clone();
+            glib::idle_add_local_once(move || {
+                *holder_in.borrow_mut() = Some(opened);
+                quit.quit();
+            });
         });
         app.run_with_args::<&str>(&[]);
         let Some((popover, group)) = holder.borrow().clone() else {
@@ -735,6 +769,25 @@ mod tests {
                 .expect("bg actions are simple actions");
             assert!(action.is_enabled(), "bg action {name} starts enabled");
         }
+        // No scrollbars anywhere inside the menu.
+        fn no_scrollbars(widget: &gtk::Widget) {
+            assert!(
+                widget
+                    .downcast_ref::<gtk::ScrolledWindow>()
+                    .is_none_or(|scrolled| {
+                        scrolled.hscrollbar_policy() == gtk::PolicyType::Never
+                            && scrolled.vscrollbar_policy() == gtk::PolicyType::Never
+                    }),
+                "menu scrolled window must not show scrollbars"
+            );
+            let children = widget.observe_children();
+            for i in 0..children.n_items() {
+                if let Some(child) = children.item(i).and_downcast::<gtk::Widget>() {
+                    no_scrollbars(&child);
+                }
+            }
+        }
+        no_scrollbars(popover.upcast_ref());
         popover.popdown();
         popover.unparent();
     }
