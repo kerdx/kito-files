@@ -67,8 +67,9 @@ the selected count.
 
 **Sorting and display**
 
-- Choose Name, Size, Type or Modified and ascending/descending order from the
-  view controls; folders stay ahead of files, and names use natural numeric order
+- Choose Name, Size, Type or Modified and reverse the order from the
+  background right-click menu under **Sorting**; folders stay ahead of files,
+  and names use natural numeric order
 - In Details, toggle Size, Type and Modified columns; Name is always present and
   column headers also change the sort
 - Icon zoom is controlled by the header-bar controls and persists globally. Use

@@ -119,20 +119,6 @@ fn preference_switch_row(label_id: &str, switch: &gtk::Switch) -> gtk::Box {
     row
 }
 
-fn sort_order_label(order: kito_core::SortOrder) -> String {
-    let field = tr(match order.field {
-        kito_core::SortField::Name => "sort-label-name",
-        kito_core::SortField::Size => "sort-label-size",
-        kito_core::SortField::Type => "sort-label-type",
-        kito_core::SortField::Modified => "sort-label-modified",
-    });
-    let direction = match order.direction {
-        kito_core::SortDirection::Ascending => "↑",
-        kito_core::SortDirection::Descending => "↓",
-    };
-    format!("{field} {direction}")
-}
-
 /// Applies the window-controls preference to a window's start/end controls
 /// with native decoration-layout APIs. Automatic mode clears the app
 /// override (`None`) so GTK/libadwaita follows the system layout live,
@@ -848,40 +834,6 @@ fn build_window(
         gtk::accessible::Property::Label(&view_selector_name),
         gtk::accessible::Property::Description(&current_view),
     ]);
-    let sort_menu = gio::Menu::new();
-    for (label, action) in [
-        ("sort-menu-name", "win.sort-name"),
-        ("sort-menu-size", "win.sort-size"),
-        ("sort-menu-type", "win.sort-type"),
-        ("sort-menu-modified", "win.sort-modified"),
-    ] {
-        sort_menu.append(Some(&tr(label)), Some(action));
-    }
-    let direction_menu = gio::Menu::new();
-    direction_menu.append(
-        Some(&tr("sort-menu-toggle-direction")),
-        Some("win.sort-direction"),
-    );
-    sort_menu.append_section(None, &direction_menu);
-    let sort_popover = gtk::PopoverMenu::from_model(Some(&sort_menu));
-    let sort_label = gtk::Label::builder()
-        .label(sort_order_label(kito_core::SortOrder::default()))
-        .build();
-    let sort_content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
-        .build();
-    let sort_icon = gtk::Image::from_icon_name("view-sort-ascending-symbolic");
-    sort_content.append(&sort_icon);
-    sort_content.append(&sort_label);
-    let sort_button = gtk::MenuButton::builder()
-        .tooltip_text(tr("sort-selector"))
-        .popover(&sort_popover)
-        .child(&sort_content)
-        .build();
-    let sort_accessible_name = tr("sort-selector");
-    sort_button.update_property(&[gtk::accessible::Property::Label(&sort_accessible_name)]);
-
     let zoom_controls = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(2)
@@ -900,7 +852,6 @@ fn build_window(
     let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], &tr("nav-new-tab"));
     header_contents.append(&new_tab_button);
     header_contents.append(&view_button);
-    header_contents.append(&sort_button);
     header_contents.append(&zoom_controls);
     let end_window_controls = gtk::WindowControls::new(gtk::PackType::End);
     end_window_controls.set_visible(!end_window_controls.is_empty());
@@ -1106,21 +1057,7 @@ fn build_window(
             forward_button.set_sensitive(can_forward);
         }
     });
-    let on_sort: tabs::OnSort = Rc::new({
-        let label = sort_label.downgrade();
-        let icon = sort_icon.downgrade();
-        move |order| {
-            if let Some(label) = label.upgrade() {
-                label.set_text(&sort_order_label(order));
-            }
-            if let Some(icon) = icon.upgrade() {
-                icon.set_icon_name(Some(match order.direction {
-                    kito_core::SortDirection::Ascending => "view-sort-ascending-symbolic",
-                    kito_core::SortDirection::Descending => "view-sort-descending-symbolic",
-                }));
-            }
-        }
-    });
+    let on_sort: tabs::OnSort = Rc::new(|_| {});
     // Hidden files (those starting with `.`): state shared with tabs.
     let show_hidden = Rc::new(Cell::new(false));
     let open_window: Rc<dyn Fn(Vec<String>)> = Rc::new({

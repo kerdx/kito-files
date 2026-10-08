@@ -346,7 +346,7 @@ const BG_CREATE_ROWS: [BgRow; 2] = [
     BgRow {
         icons: &["document-new", "document-new-symbolic"],
         label: "bg-new-file",
-        action: "",
+        action: "bg.can-create-file",
         sub: Some(&BG_NEW_FILE_ROWS),
     },
 ];
@@ -356,6 +356,49 @@ const BG_PASTE_ROWS: [BgRow; 1] = [BgRow {
     label: "menu-paste",
     action: "bg.paste",
     sub: None,
+}];
+
+const BG_SORT_ROWS: [BgRow; 5] = [
+    BgRow {
+        icons: &[
+            "format-text-direction-ltr-symbolic",
+            "format-text-direction-ltr",
+        ],
+        label: "sort-menu-name",
+        action: "win.sort-name",
+        sub: None,
+    },
+    BgRow {
+        icons: &["view-sort-descending-symbolic"],
+        label: "sort-menu-size",
+        action: "win.sort-size",
+        sub: None,
+    },
+    BgRow {
+        icons: &["application-x-executable", "application-x-generic"],
+        label: "sort-menu-type",
+        action: "win.sort-type",
+        sub: None,
+    },
+    BgRow {
+        icons: &["document-properties", "document-edit"],
+        label: "sort-menu-modified",
+        action: "win.sort-modified",
+        sub: None,
+    },
+    BgRow {
+        icons: &["view-sort-descending-symbolic"],
+        label: "sort-menu-toggle-direction",
+        action: "win.sort-direction",
+        sub: None,
+    },
+];
+
+const BG_SORT_SECTION: [BgRow; 1] = [BgRow {
+    icons: &["view-sort-ascending-symbolic"],
+    label: "sort-selector",
+    action: "",
+    sub: Some(&BG_SORT_ROWS),
 }];
 
 const BG_TERM_ROWS: [BgRow; 2] = [
@@ -414,6 +457,7 @@ pub(crate) fn bg_sections(local: bool) -> Vec<&'static [BgRow]> {
     let mut sections: Vec<&'static [BgRow]> = vec![
         &BG_CREATE_ROWS[..],
         &BG_PASTE_ROWS[..],
+        &BG_SORT_SECTION[..],
         &BG_SELECTION_ROWS[..],
     ];
     if local {
@@ -601,13 +645,15 @@ fn append_bg_widget(
         button.set_hexpand(true);
         button.add_css_class("ctx-row");
         button.set_child(Some(&bg_row_content(row, true)));
-        button.set_sensitive(create_file_action.is_enabled());
-        let weak_button = button.downgrade();
-        create_file_action.connect_notify_local(Some("enabled"), move |action, _| {
-            if let Some(button) = weak_button.upgrade() {
-                button.set_sensitive(action.is_enabled());
-            }
-        });
+        if row.action == "bg.can-create-file" {
+            button.set_sensitive(create_file_action.is_enabled());
+            let weak_button = button.downgrade();
+            create_file_action.connect_notify_local(Some("enabled"), move |action, _| {
+                if let Some(button) = weak_button.upgrade() {
+                    button.set_sensitive(action.is_enabled());
+                }
+            });
+        }
 
         let submenu = gtk::Popover::new();
         submenu.insert_action_group("bg", Some(group));
@@ -620,29 +666,45 @@ fn append_bg_widget(
             child_button.add_css_class("ctx-row");
             child_button.set_hexpand(true);
             child_button.set_child(Some(&bg_row_content(child, false)));
-            let action_name = child
+            let local_action = child
                 .action
                 .strip_prefix("bg.")
-                .expect("submenu actions use the captured bg group");
-            let action = group
-                .lookup_action(action_name)
-                .and_downcast::<gio::SimpleAction>()
-                .expect("submenu action is registered");
-            child_button.set_sensitive(action.is_enabled());
-            let weak_button = child_button.downgrade();
-            action.connect_notify_local(Some("enabled"), move |action, _| {
-                if let Some(button) = weak_button.upgrade() {
-                    button.set_sensitive(action.is_enabled());
-                }
-            });
+                .and_then(|name| group.lookup_action(name))
+                .and_downcast::<gio::SimpleAction>();
+            if let Some(action) = local_action {
+                child_button.set_sensitive(action.is_enabled());
+                let weak_button = child_button.downgrade();
+                action.connect_notify_local(Some("enabled"), move |action, _| {
+                    if let Some(button) = weak_button.upgrade() {
+                        button.set_sensitive(action.is_enabled());
+                    }
+                });
+            } else {
+                assert!(
+                    child.action.starts_with("win."),
+                    "submenu action must be registered in bg or win"
+                );
+            }
             let weak_submenu = submenu.downgrade();
             let group = group.clone();
-            let action_name = action_name.to_string();
+            let manager = Rc::downgrade(manager);
+            let window = window.downgrade();
+            let action_name = child.action.to_string();
             child_button.connect_clicked(move |_| {
                 if let Some(submenu) = weak_submenu.upgrade() {
                     submenu.popdown();
                 }
-                group.activate_action(&action_name, None);
+                if let Some(action_name) = action_name.strip_prefix("bg.") {
+                    group.activate_action(action_name, None);
+                } else {
+                    if let Some(manager) = manager.upgrade() {
+                        manager.close_bg_menu();
+                    }
+                    if let Some(window) = window.upgrade() {
+                        let _ =
+                            gtk::prelude::WidgetExt::activate_action(&window, &action_name, None);
+                    }
+                }
             });
             submenu_list.append(&child_button);
         }
@@ -870,8 +932,8 @@ pub fn show_trash_background_for(
 mod tests {
     use super::*;
 
-    /// Row actions per section, in order. The submenu parent carries no
-    /// action of its own.
+    /// Row actions per section, in order. A submenu parent may carry an
+    /// action used only to control its sensitivity.
     fn section_actions(section: &[BgRow]) -> Vec<&str> {
         section.iter().map(|row| row.action).collect()
     }
@@ -879,35 +941,53 @@ mod tests {
     #[test]
     fn background_structure_matches_the_spec() {
         let sections = bg_sections(true);
-        // Sections: create, paste, selection, terminal, properties.
+        // Sections: create, paste, sort, selection, terminal, properties.
         assert_eq!(
             sections
                 .iter()
                 .map(|section| section.len())
                 .collect::<Vec<_>>(),
-            vec![2, 1, 3, 2, 1]
+            vec![2, 1, 1, 3, 2, 1]
         );
-        assert_eq!(section_actions(sections[0]), vec!["bg.new-folder", ""]);
+        assert_eq!(
+            section_actions(sections[0]),
+            vec!["bg.new-folder", "bg.can-create-file"]
+        );
         assert_eq!(section_actions(sections[1]), vec!["bg.paste"]);
         assert_eq!(
-            section_actions(sections[2]),
+            section_actions(sections[3]),
             vec!["win.select-all", "win.invert-selection", "win.deselect-all"]
         );
         assert_eq!(
-            section_actions(sections[3]),
+            section_actions(sections[4]),
             vec!["bg.open-terminal", "bg.open-terminal-root"]
         );
         // Last section is folder properties: separators only sit between.
-        assert_eq!(section_actions(sections[4]), vec!["bg.folder-properties"]);
+        assert_eq!(section_actions(sections[5]), vec!["bg.folder-properties"]);
+        assert_eq!(
+            sections[2][0]
+                .sub
+                .expect("sort submenu")
+                .iter()
+                .map(|row| row.action)
+                .collect::<Vec<_>>(),
+            vec![
+                "win.sort-name",
+                "win.sort-size",
+                "win.sort-type",
+                "win.sort-modified",
+                "win.sort-direction"
+            ]
+        );
     }
 
     #[test]
     fn background_hides_terminal_off_local_paths() {
         let sections = bg_sections(false);
-        // Remote: create, paste, selection, properties.
-        assert_eq!(sections.len(), 4);
+        // Remote: create, paste, sort, selection, properties.
+        assert_eq!(sections.len(), 5);
         assert_eq!(
-            sections[3].iter().map(|row| row.action).collect::<Vec<_>>(),
+            sections[4].iter().map(|row| row.action).collect::<Vec<_>>(),
             vec!["bg.folder-properties"]
         );
     }
