@@ -1,6 +1,6 @@
 # Developing Kito Files
 
-[Project overview](../README.md) · [User guide](USAGE.md)
+[Project overview](../README.md) · [User guide](USAGE.md) · [Verification guide](VERIFICATION.md)
 
 ## Build and checks
 
@@ -10,11 +10,15 @@ cargo build --release
 ```
 
 ```bash
-cargo test --workspace        # backend, localization and UI logic unit tests
-cargo clippy -- -D warnings    # lints
-cargo fmt --check              # formatting
+./scripts/check.sh            # formatting, compilation, workspace tests, Clippy
 cargo run                     # manual testing in the current graphical session
 ```
+
+The check script works from any directory, stops on the first failure and uses
+the lockfile for compilation, tests and Clippy. It excludes the integration test
+that uses the session Trash; `--with-trash-test` includes it in a disposable test
+session. GUI tests may skip without a display. Follow the
+[verification guide](VERIFICATION.md) for fixtures, manual cases and coverage reporting.
 
 Manual testing is done on Wayland (GNOME, sway, Hyprland). GTK selects the available
 Wayland or X11 backend automatically; X11 has not been part of development testing.
