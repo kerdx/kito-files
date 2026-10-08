@@ -20,8 +20,12 @@ pub struct Entry {
     pub size: i64,
     /// MIME content type (files only), e.g. `text/plain`.
     pub content_type: Option<String>,
-    /// Theme icon (content type, special folders, symlinks...).
-    pub icon: Option<gio::Icon>,
+    /// Theme icon in `g_icon_to_string` form (parse back with
+    /// `gio::Icon::for_string`). Plain strings keep `Entry` thread-safe
+    /// so enumeration can run in a worker; parsing is lossless for the
+    /// icons enumerators return, and unparsable values fall back to the
+    /// generic icon in the view.
+    pub icon: Option<String>,
 }
 
 /// Lists the contents of `dir_uri` (e.g. `file:///home/user`).
@@ -53,15 +57,14 @@ pub fn list_dir(dir_uri: &str, show_hidden: bool) -> Result<Vec<Entry>, glib::Er
                 .then(|| info.content_type())
                 .flatten()
                 .map(|s| s.into()),
-            icon: info.icon(),
+            icon: info
+                .icon()
+                .and_then(|icon| icon.to_string())
+                .map(|s| s.to_string()),
         });
     }
 
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
     Ok(entries)
 }
 
@@ -486,6 +489,72 @@ mod tests {
     #[test]
     fn list_dir_missing_returns_error() {
         assert!(list_dir("file:///non/esiste/sicuramente", true).is_err());
+    }
+
+    #[test]
+    fn list_dir_icons_survive_string_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("docs")).unwrap();
+        std::fs::write(tmp.path().join("note.txt"), b"hello").unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        for entry in list_dir(&uri, true).unwrap() {
+            let icon_str = entry.icon.expect("enumerator provides an icon");
+            assert!(!icon_str.is_empty(), "{}", entry.name);
+            // The worker stores strings; the view parses them back.
+            assert!(
+                gio::Icon::for_string(&icon_str).is_ok(),
+                "{}: {icon_str}",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn list_dir_sorts_case_insensitive_with_dirs_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "zebra-dir",
+            "Alpha-dir",
+            "BETA",
+            "beta",
+            "café ☃",
+            "CAFÉ",
+            "100%",
+            "a#b",
+        ] {
+            if name.ends_with("-dir") {
+                std::fs::create_dir(tmp.path().join(name)).unwrap();
+            } else {
+                std::fs::write(tmp.path().join(name), b"x").unwrap();
+            }
+        }
+        let uri = format!("file://{}", tmp.path().display());
+        let names: Vec<(String, bool)> = list_dir(&uri, true)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.is_dir))
+            .collect();
+        // Directories first, then case-insensitive name order.
+        let dirs: Vec<&str> = names
+            .iter()
+            .filter(|(_, d)| *d)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(dirs, vec!["Alpha-dir", "zebra-dir"]);
+        let files: Vec<&str> = names
+            .iter()
+            .filter(|(_, d)| !*d)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let mut sorted = files.clone();
+        sorted.sort_by_key(|n| n.to_lowercase());
+        assert_eq!(files, sorted);
+        // Equal keys keep enumeration order (stable): BETA before beta.
+        let beta: Vec<&&str> = files
+            .iter()
+            .filter(|n| n.to_lowercase() == "beta")
+            .collect();
+        assert_eq!(beta, vec![&"BETA", &"beta"]);
     }
 
     fn tree_fixture() -> tempfile::TempDir {

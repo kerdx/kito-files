@@ -22,13 +22,18 @@ pub struct FileTab {
     page: adw::TabPage,
     store: gio::ListStore,
     scrolled: gtk::ScrolledWindow,
-    /// List or "empty folder" page.
+    /// List, "empty folder" or loading page.
     stack: gtk::Stack,
     empty_page: adw::StatusPage,
+    loading_label: gtk::Label,
     selection: RefCell<gtk::SingleSelection>,
     mode: Cell<ViewMode>,
     open_items: Cell<OpenItems>,
     history: NavHistory,
+    /// Async load generation: bumped on every navigation; only the latest
+    /// worker result may touch history, store and chrome. Older results are
+    /// discarded, so a slow folder can never overwrite a newer one.
+    load_gen: LoadGen,
     /// Hidden-view sync: the view is fresh only for the global value it
     /// was last successfully filled with.
     hidden_sync: HiddenSync,
@@ -37,6 +42,43 @@ pub struct FileTab {
     on_navigate: OnNavigate,
     on_history: OnHistory,
     on_status: OnStatus,
+}
+
+/// Generation protocol for asynchronous loads. The tab bumps the counter
+/// on every navigation and each worker result carries the id it started
+/// with; only `id == current` results are applied. Tab closure drops the
+/// tab, so the weak upgrade fails and nothing is applied. No GTK, no GIO:
+/// fully headless-testable.
+#[derive(Default)]
+struct LoadGen {
+    next: Cell<u64>,
+    current: Cell<u64>,
+}
+
+impl LoadGen {
+    /// Starts a load: invalidates every previous one and returns the new id.
+    fn start(&self) -> u64 {
+        let id = self.next.get().wrapping_add(1);
+        self.next.set(id);
+        self.current.set(id);
+        id
+    }
+
+    /// Whether the result with `id` is still the latest load.
+    fn is_current(&self, id: u64) -> bool {
+        self.current.get() == id
+    }
+}
+
+/// Visible stack child after a load settles. Success shows the empty page
+/// only for a confirmed empty folder; a failed very first load keeps the
+/// plain list look it had before async loading existed.
+fn settled_child(item_count: usize, ever_loaded: bool) -> &'static str {
+    if item_count == 0 && ever_loaded {
+        "empty"
+    } else {
+        "list"
+    }
 }
 
 /// How the target was chosen: drives the history update on success.
@@ -117,8 +159,11 @@ impl NavHistory {
 
 /// Runs one navigation: resolves the target, loads it, and commits the
 /// history change only on success. Returns whether anything was
-/// committed. The loader is injectable so successes and failures are
-/// testable without widgets or GIO.
+/// committed. Headless mirror of `FileTab::navigate`'s async discipline
+/// (resolve target, commit only on successful load): the loader is
+/// injectable so successes and failures are testable without widgets,
+/// threads or GIO.
+#[cfg(test)]
 fn run_navigation(
     history: &NavHistory,
     kind: NavKind,
@@ -225,6 +270,8 @@ impl FileTab {
     fn retranslate(self: &Rc<Self>) {
         let selected_uri = self.selected_objects().first().map(|obj| obj.uri());
         self.empty_page.set_title(&crate::l10n::tr("empty-folder"));
+        self.loading_label
+            .set_text(&crate::l10n::tr("loading-folder"));
         rebuild_view(self);
         if let Some(uri) = selected_uri {
             self.select_uri(&uri);
@@ -238,57 +285,132 @@ impl FileTab {
         }
     }
 
-    pub fn load(&self, uri: &str) {
+    pub fn load(self: &Rc<Self>, uri: &str) {
         self.navigate(NavKind::Visit, uri);
     }
 
-    /// Single navigation path: resolves the target, loads it, and only
-    /// on success commits the history change and refreshes the buttons.
-    /// A failed load leaves current URI, view content and both stacks
-    /// untouched; the error dialog comes from `load_raw`.
-    fn navigate(&self, kind: NavKind, uri: &str) {
-        if run_navigation(&self.history, kind, uri, |target| self.load_raw(target)) {
-            self.emit_history();
-        }
+    /// Single navigation path: resolves the target, then enumerates and
+    /// sorts it off the UI thread. History is committed only when the latest
+    /// worker result succeeds; a failed load leaves current URI, view
+    /// content and both stacks untouched and shows a dialog instead.
+    /// Store and current URI always move together, so path, selection and
+    /// file actions never refer to different folders, not even mid-load:
+    /// stale results (newer navigation, closed tab) are discarded.
+    fn navigate(self: &Rc<Self>, kind: NavKind, uri: &str) {
+        let Some(target) = self.history.target(kind, uri) else {
+            return;
+        };
+        let previous = self.history.current_uri();
+        let id = self.load_gen.start();
+        let show_hidden = self.show_hidden.get();
+        // Discreet loading state, distinct from the "empty folder" page.
+        // The store keeps the previous folder until the new one succeeds.
+        self.stack.set_visible_child_name("loading");
+        let weak = Rc::downgrade(self);
+        let (tx, rx) = async_channel::bounded::<Result<Vec<kito_core::Entry>, String>>(1);
+        let worker_target = target.clone();
+        std::thread::spawn(move || {
+            let result =
+                kito_core::list_dir(&worker_target, show_hidden).map_err(|e| e.to_string());
+            let _ = tx.send_blocking(result);
+        });
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            let Some(tab) = weak.upgrade() else {
+                return;
+            };
+            if !tab.load_gen.is_current(id) {
+                return;
+            }
+            match result {
+                Ok(entries) => tab.apply_loaded(id, kind, &previous, &target, entries, show_hidden),
+                Err(message) => tab.apply_load_error(message),
+            }
+        });
     }
 
-    /// Loads `uri` into the view, updating current URI, title, view and
-    /// chrome on success. Returns whether it worked; shows a dialog on
-    /// failure without touching any state.
-    fn load_raw(&self, uri: &str) -> bool {
-        match self.fill_store(uri) {
-            Ok(n) => {
-                self.page.set_title(&Self::title_for(uri));
-                self.stack
-                    .set_visible_child_name(if n == 0 { "empty" } else { "list" });
-                (self.on_navigate)(uri, n, self.mode.get());
-                let selected = usize::from(self.selection.borrow().selected_item().is_some());
-                (self.on_status)(n, selected);
-                true
-            }
-            Err(e) => {
-                let dialog = adw::AlertDialog::builder()
-                    .heading(crate::l10n::tr("error-open-folder"))
-                    .body(e.to_string())
-                    .build();
-                dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
-                dialog.present(Some(&self.window));
-                false
-            }
-        }
-    }
-
-    /// Refills the store for `uri` with the current global setting,
-    /// restoring the selection when its entry is still listed. Shared by
-    /// navigation and quiet refresh: no chrome, no dialog.
-    fn fill_store(&self, uri: &str) -> Result<usize, glib::Error> {
+    /// Commits a successful load and streams its rows in bounded chunks.
+    fn apply_loaded(
+        self: &Rc<Self>,
+        id: u64,
+        kind: NavKind,
+        previous: &str,
+        target: &str,
+        entries: Vec<kito_core::Entry>,
+        show_hidden: bool,
+    ) {
+        self.history.commit(kind, previous, target);
+        self.emit_history();
+        self.page.set_title(&Self::title_for(target));
+        // The previous folder's selection is restored only if still listed
+        // (refresh of the same folder); navigating elsewhere clears it.
         let keep = self.selected_objects().first().map(|obj| obj.uri());
-        let n = file_list::reload(&self.store, uri, self.show_hidden.get())?;
+        if entries.is_empty() {
+            self.store.remove_all();
+            self.finish_loaded(target, keep, show_hidden, 0);
+            return;
+        }
+        // Small folders skip the idle round-trip: one bulk replace.
+        if entries.len() <= file_list::LOAD_CHUNK {
+            file_list::replace_all(&self.store, &entries);
+            self.finish_loaded(target, keep, show_hidden, entries.len());
+            return;
+        }
+        self.store.remove_all();
+        let entries = Rc::new(entries);
+        let offset = Rc::new(Cell::new(0usize));
+        let weak = Rc::downgrade(self);
+        let target = target.to_string();
+        glib::idle_add_local(move || {
+            let Some(tab) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !tab.load_gen.is_current(id) {
+                return glib::ControlFlow::Break;
+            }
+            let start = offset.get();
+            let end = (start + file_list::LOAD_CHUNK).min(entries.len());
+            if start < end {
+                file_list::append_chunk(&tab.store, &entries[start..end]);
+                offset.set(end);
+            }
+            if end >= entries.len() {
+                tab.finish_loaded(&target, keep.clone(), show_hidden, entries.len());
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+
+    /// Final chrome for a completed load: selection, freshness, stack page,
+    /// pathbar and status bar.
+    fn finish_loaded(&self, target: &str, keep: Option<String>, show_hidden: bool, n: usize) {
         if let Some(uri) = keep {
             self.select_uri(&uri);
         }
-        self.hidden_sync.mark_refreshed(self.show_hidden.get());
-        Ok(n)
+        self.hidden_sync.mark_refreshed(show_hidden);
+        self.stack.set_visible_child_name(settled_child(n, true));
+        (self.on_navigate)(target, n, self.mode.get());
+        let selected = usize::from(self.selection.borrow().selected_item().is_some());
+        (self.on_status)(n, selected);
+    }
+
+    /// Failed load: history, current URI and store are untouched (the store
+    /// still shows the previous folder); only the loading page is reverted
+    /// and the error is reported.
+    fn apply_load_error(&self, message: String) {
+        let ever_loaded = !self.history.current_uri().is_empty();
+        self.stack
+            .set_visible_child_name(settled_child(self.store.n_items() as usize, ever_loaded));
+        let dialog = adw::AlertDialog::builder()
+            .heading(crate::l10n::tr("error-open-folder"))
+            .body(message)
+            .build();
+        dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
+        dialog.present(Some(&self.window));
     }
 
     /// Selects the entry with `uri`, if listed. No-op otherwise.
@@ -310,11 +432,11 @@ impl FileTab {
         (self.on_history)(self.history.can_go_back(), self.history.can_go_forward());
     }
 
-    pub fn go_back(&self) {
+    pub fn go_back(self: &Rc<Self>) {
         self.navigate(NavKind::Back, "");
     }
 
-    pub fn go_forward(&self) {
+    pub fn go_forward(self: &Rc<Self>) {
         self.navigate(NavKind::Forward, "");
     }
 
@@ -331,34 +453,20 @@ impl FileTab {
     }
 
     /// Reloads the tab's current folder.
-    pub fn reload(&self) {
+    pub fn reload(self: &Rc<Self>) {
         let uri = self.history.current_uri();
         if !uri.is_empty() {
             self.load(&uri);
         }
     }
 
-    /// Applies a pending show_hidden change on selection, quietly: no
-    /// title, crumbs, buttons or status updates (the caller re-syncs the
-    /// active tab right after). Stays stale and silent on failure, so a
-    /// later selection retries.
-    fn sync_hidden_if_stale(&self) {
+    /// Applies a pending show_hidden change on selection: reloads with the
+    /// current global setting through the normal async path (same-URI visit
+    /// leaves history untouched). Stays stale on failure, so a later
+    /// selection retries.
+    fn sync_hidden_if_stale(self: &Rc<Self>) {
         if self.hidden_sync.needs_refresh(self.show_hidden.get()) {
-            self.refresh_hidden();
-        }
-    }
-
-    /// Reloads content for the current global setting. Marks the view
-    /// fresh only on success; leaves everything else (directory,
-    /// history, mode) alone.
-    fn refresh_hidden(&self) {
-        let uri = self.history.current_uri();
-        if uri.is_empty() {
-            return;
-        }
-        if let Ok(n) = self.fill_store(&uri) {
-            self.stack
-                .set_visible_child_name(if n == 0 { "empty" } else { "list" });
+            self.reload();
         }
     }
 
@@ -373,7 +481,7 @@ impl FileTab {
     }
 
     /// Double-click / Enter / "Open" item: enters or launches.
-    pub fn activate_entry(&self, uri: &str, is_dir: bool) {
+    pub fn activate_entry(self: &Rc<Self>, uri: &str, is_dir: bool) {
         if is_dir {
             self.load(uri);
         } else {
@@ -550,9 +658,30 @@ impl TabManager {
             .icon_name("folder")
             .title(crate::l10n::tr("empty-folder"))
             .build();
+        // Discreet loading page, distinct from the empty-folder page.
+        let spinner = gtk::Spinner::builder()
+            .spinning(true)
+            .width_request(48)
+            .height_request(48)
+            .halign(gtk::Align::Center)
+            .build();
+        let loading_label = gtk::Label::builder()
+            .label(crate::l10n::tr("loading-folder"))
+            .halign(gtk::Align::Center)
+            .css_classes(["dim-label"])
+            .build();
+        let loading_page = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build();
+        loading_page.append(&spinner);
+        loading_page.append(&loading_label);
         let stack = gtk::Stack::new();
         stack.add_named(&scrolled, Some("list"));
         stack.add_named(&empty, Some("empty"));
+        stack.add_named(&loading_page, Some("loading"));
         stack.set_visible_child_name("list");
         let page = self.tab_view.append(&stack);
         // Dummy selection: replaced by rebuild_view.
@@ -562,12 +691,14 @@ impl TabManager {
             scrolled,
             stack,
             empty_page: empty,
+            loading_label,
             selection: RefCell::new(gtk::SingleSelection::new(Some(gio::ListStore::new::<
                 FileObject,
             >()))),
             mode: Cell::new(mode_for_new_tab(&preferences)),
             open_items: Cell::new(preferences.open_items),
             history: NavHistory::default(),
+            load_gen: LoadGen::default(),
             hidden_sync: HiddenSync::new(self.show_hidden.get()),
             show_hidden: self.show_hidden.clone(),
             window: self.window.clone(),
@@ -756,6 +887,88 @@ mod tests {
         assert_eq!(snapshot(&second), (c.clone(), vec![], vec![]));
         assert!(!run_navigation(&second, NavKind::Back, "", |_| true));
         assert_eq!(snapshot(&first), (b.clone(), vec![a.clone()], vec![]));
+    }
+
+    #[test]
+    fn superseded_loads_are_discarded() {
+        let gen = LoadGen::default();
+        let first = gen.start();
+        assert!(gen.is_current(first));
+        let second = gen.start();
+        // The first navigation is superseded before its worker finishes.
+        assert!(!gen.is_current(first));
+        assert!(gen.is_current(second));
+        // Rapid retargeting keeps only the latest.
+        let third = gen.start();
+        assert!(!gen.is_current(second));
+        assert!(gen.is_current(third));
+    }
+
+    /// Async mirror of the failure tests above: a Back load is superseded
+    /// by a visit, the stale worker then finishes late (discarded), and the
+    /// newer visit fails (no commit). History, stacks and content stay put.
+    #[test]
+    fn out_of_order_and_failed_results_keep_state() {
+        let (_tmp, a, b, c) = fixture();
+        let history = NavHistory::default();
+        assert!(run_navigation(&history, NavKind::Visit, &a, |_| true));
+        assert!(run_navigation(&history, NavKind::Visit, &b, |_| true));
+        assert_eq!(snapshot(&history), (b.clone(), vec![a.clone()], vec![]));
+        let gen = LoadGen::default();
+
+        // Back to A starts...
+        let back_id = gen.start();
+        let back_target = history.target(NavKind::Back, "").unwrap();
+        let back_previous = history.current_uri();
+        assert_eq!(back_target, a);
+        // ...but a visit to C supersedes it before any worker finishes.
+        let visit_id = gen.start();
+        let visit_target = history.target(NavKind::Visit, &c).unwrap();
+        let visit_previous = history.current_uri();
+        assert!(!gen.is_current(back_id));
+        assert!(gen.is_current(visit_id));
+
+        // Back worker finishes late with success: stale, must not commit.
+        if gen.is_current(back_id) {
+            history.commit(NavKind::Back, &back_previous, &back_target);
+            panic!("stale load must not commit");
+        }
+        assert_eq!(snapshot(&history), (b.clone(), vec![a.clone()], vec![]));
+
+        // Visit worker fails: no commit, stacks untouched.
+        let visit_ok = false;
+        if visit_ok && gen.is_current(visit_id) {
+            history.commit(NavKind::Visit, &visit_previous, &visit_target);
+        }
+        assert_eq!(snapshot(&history), (b.clone(), vec![a.clone()], vec![]));
+
+        // Retried visit succeeds and commits exactly once.
+        assert!(run_navigation(&history, NavKind::Visit, &c, |_| true));
+        assert_eq!(
+            snapshot(&history),
+            (c.clone(), vec![a.clone(), b.clone()], vec![])
+        );
+    }
+
+    #[test]
+    fn settled_pages_keep_loading_and_empty_distinct() {
+        // Confirmed content: empty page only for a confirmed empty folder.
+        assert_eq!(settled_child(0, true), "empty");
+        assert_eq!(settled_child(5, true), "list");
+        // Failed very first load: the plain list look, never the empty page.
+        assert_eq!(settled_child(0, false), "list");
+        assert_eq!(settled_child(3, false), "list");
+    }
+
+    #[test]
+    fn closed_tab_results_are_dropped() {
+        // apply_loaded/apply_load_error upgrade a weak tab reference first;
+        // a closed tab upgrades to nothing, so late results touch no widget.
+        let tab = Rc::new(7u32);
+        let weak = Rc::downgrade(&tab);
+        assert!(weak.upgrade().is_some());
+        drop(tab);
+        assert!(weak.upgrade().is_none());
     }
 }
 

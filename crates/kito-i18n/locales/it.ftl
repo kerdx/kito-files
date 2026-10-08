@@ -84,6 +84,7 @@ status-selected =
 error-open-folder = Impossibile aprire la cartella
 error-invalid-path = Inserisci un percorso locale o un URI da aprire.
 empty-folder = Questa cartella è vuota
+loading-folder = Caricamento…
 error-open-file = Impossibile aprire il file
 error-open-file-detail = Kito Files non è riuscito ad avviare l’applicazione predefinita: { $error }
 

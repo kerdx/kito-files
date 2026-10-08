@@ -29,6 +29,7 @@ for Wayland or X11. Development testing is done on Wayland.
 - [Languages](#languages)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Architecture](#architecture)
+- [Performance](#performance)
 - [Development](#development)
 - [License](#license)
 
@@ -393,9 +394,12 @@ Design rules:
 - **`kito-gtk` owns the UI and integration** — it calls `kito-core` for file operations
   and also handles configuration-directory setup and terminal executable detection.
   Copy/move during paste, permanent deletion, restore and emptying the Trash
-  run in background threads, with results delivered to the main loop. Directory
-  listing, moving items to the Trash and some smaller operations still run
-  synchronously on the UI thread. The sidebar checks Trash contents asynchronously.
+  run in background threads, with results delivered to the main loop through a
+  bounded async channel (no polling). Directory listing also runs in a worker
+  thread with generation-guarded, chunked insertion into the view; only the
+  newest navigation touches history and widgets. Moving items to the Trash and
+  some smaller operations still run synchronously on the UI thread.
+  The sidebar checks Trash contents asynchronously.
 - **No GNOME desktop coupling** — libadwaita is used as a widget library only: no
   GSettings/dconf, no libpanel, no Tracker, no desktop portals required.
 - **Localization** — the `kito-i18n` crate resolves the system locale through
@@ -403,6 +407,21 @@ Design rules:
   Fluent catalogs with English fallback. No runtime catalog path or `msgfmt` is needed.
 - **Freedesktop, not GNOME** — GIO/GVfs for files, freedesktop bookmarks, icon themes
   and `gio::AppInfo` for launching default applications.
+
+---
+
+## Performance
+
+Folder loading never blocks the interface: enumeration and sorting run in a
+worker thread, rows stream into the view in bounded chunks (500 per main-loop
+turn) behind a loading indicator, and only the latest navigation applies
+(stale results are discarded, failed loads keep folder, history and content).
+Sorting precomputes one lowercase key per entry (5–8× faster on unsorted
+folders, identical order); the model updates in bulk `splice` calls
+(1001 → 1 notifications per 1000 rows). Worker results wake the main loop
+once through a channel instead of polling it. The release profile stays at
+`opt-level = "z"` (measured: `3` adds 31% size with no speedup here).
+Details and reproduction commands: [docs/perf-report.md](docs/perf-report.md).
 
 ---
 

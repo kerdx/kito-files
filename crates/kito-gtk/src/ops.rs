@@ -207,26 +207,24 @@ impl Ctx {
 
     /// Runs `job` in a thread; `done` runs on the main loop.
     /// `done` touches GTK widgets, so it stays on the main thread: the worker
-    /// sends the result via channel and a local idle delivers it.
+    /// sends the result through a bounded async channel and a main-loop future
+    /// delivers it. The main loop sleeps until the result arrives (no polling,
+    /// no sleeps on the UI thread). Dropping without delivery (worker panic)
+    /// simply runs nothing, as before.
     fn run_in_thread<F, R>(job: F, done: impl FnOnce(R) + 'static)
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = async_channel::bounded::<R>(1);
         std::thread::spawn(move || {
-            let _ = tx.send(job());
+            let result = job();
+            let _ = tx.send_blocking(result);
         });
-        let mut done = Some(done);
-        glib::idle_add_local(move || match rx.try_recv() {
-            Ok(result) => {
-                if let Some(done) = done.take() {
-                    done(result);
-                }
-                glib::ControlFlow::Break
+        glib::spawn_future_local(async move {
+            if let Ok(result) = rx.recv().await {
+                done(result);
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(_) => glib::ControlFlow::Break,
         });
     }
 
@@ -923,6 +921,44 @@ fn prop_row(label: &str, value: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Delivery through the channel future. One test (not two) so parallel
+    /// test threads never contend for default-context ownership.
+    #[test]
+    fn run_in_thread_delivers_values_and_errors_on_the_main_loop() {
+        use std::time::{Duration, Instant};
+
+        let context = glib::MainContext::default();
+        let pump = |slot: &Rc<RefCell<Option<String>>>| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while slot.borrow().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "worker result was never delivered"
+                );
+                context.iteration(true);
+            }
+        };
+
+        let done = Rc::new(RefCell::new(None));
+        let done2 = done.clone();
+        Ctx::run_in_thread(
+            || 41 + 1,
+            move |value: i32| *done2.borrow_mut() = Some(value.to_string()),
+        );
+        pump(&done);
+        assert_eq!(done.borrow().as_deref(), Some("42"));
+
+        let failed = Rc::new(RefCell::new(None));
+        let failed2 = failed.clone();
+        Ctx::run_in_thread(
+            || "boom".to_string(),
+            move |error: String| *failed2.borrow_mut() = Some(error),
+        );
+        pump(&failed);
+        assert_eq!(failed.borrow().as_deref(), Some("boom"));
+    }
 
     fn entries(uris: &[&str], cut: bool) -> Clipboard {
         Clipboard {

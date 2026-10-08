@@ -87,7 +87,12 @@ impl FileObject {
         imp.is_dir.set(entry.is_dir);
         imp.size.set(entry.size);
         *imp.content_type.borrow_mut() = entry.content_type.clone();
-        *imp.icon.borrow_mut() = entry.icon.clone();
+        // Serialized in the worker; parsed here on the main thread.
+        // Unparsable values fall back to the generic icon in the factories.
+        *imp.icon.borrow_mut() = entry
+            .icon
+            .as_deref()
+            .and_then(|s| gio::Icon::for_string(s).ok());
         obj
     }
 
@@ -363,6 +368,84 @@ mod tests {
         // wire_activate remains the only activation-signal hookup for both
         // view types; changing this flag never attaches another handler.
     }
+
+    fn listed_uris(store: &gio::ListStore) -> Vec<String> {
+        (0..store.n_items())
+            .filter_map(|i| {
+                store
+                    .item(i)
+                    .and_downcast::<FileObject>()
+                    .map(|obj| obj.uri())
+            })
+            .collect()
+    }
+
+    fn fixture_entries(n: usize) -> Vec<kito_core::Entry> {
+        (0..n)
+            .map(|i| kito_core::Entry {
+                name: format!("file-{i:05}"),
+                uri: format!("file:///tmp/file-{i:05}"),
+                is_dir: i % 7 == 0,
+                size: i as i64,
+                content_type: None,
+                icon: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replace_all_fills_in_order_with_one_notification() {
+        let store = gio::ListStore::new::<FileObject>();
+        let emissions = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        store.connect_items_changed({
+            let emissions = emissions.clone();
+            move |_, _, _, _| emissions.set(emissions.get() + 1)
+        });
+        let entries = fixture_entries(1000);
+        replace_all(&store, &entries);
+        assert_eq!(store.n_items(), 1000);
+        assert_eq!(listed_uris(&store).len(), 1000);
+        assert_eq!(listed_uris(&store)[7], "file:///tmp/file-00007");
+        // Bulk: a single model notification, not one per row.
+        assert_eq!(emissions.get(), 1);
+
+        // Refill replaces without growing: same count, new content, still one shot.
+        emissions.set(0);
+        let mut again = fixture_entries(1000);
+        again[0].uri = "file:///tmp/changed".to_string();
+        replace_all(&store, &again);
+        assert_eq!(store.n_items(), 1000);
+        assert_eq!(listed_uris(&store)[0], "file:///tmp/changed");
+        assert_eq!(emissions.get(), 1);
+    }
+
+    #[test]
+    fn chunked_append_matches_replace_all() {
+        let entries = fixture_entries(1234);
+        let full = gio::ListStore::new::<FileObject>();
+        replace_all(&full, &entries);
+
+        let chunked = gio::ListStore::new::<FileObject>();
+        chunked.remove_all();
+        for chunk in entries.chunks(LOAD_CHUNK) {
+            append_chunk(&chunked, chunk);
+        }
+        assert_eq!(chunked.n_items(), full.n_items());
+        assert_eq!(listed_uris(&chunked), listed_uris(&full));
+    }
+
+    #[test]
+    fn append_chunk_empty_is_noop() {
+        let store = gio::ListStore::new::<FileObject>();
+        let emissions = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        store.connect_items_changed({
+            let emissions = emissions.clone();
+            move |_, _, _, _| emissions.set(emissions.get() + 1)
+        });
+        append_chunk(&store, &[]);
+        assert_eq!(store.n_items(), 0);
+        assert_eq!(emissions.get(), 0);
+    }
 }
 
 /// View + empty store; populate with [`reload`].
@@ -372,16 +455,37 @@ pub fn build_file_view() -> (gtk::ScrolledWindow, gio::ListStore) {
     (scrolled, store)
 }
 
+/// Rows created and inserted per main-loop turn during asynchronous loads.
+/// Keeps each pause short while staying near single-splice total time.
+pub const LOAD_CHUNK: usize = 500;
+
+/// Replaces the whole store content with `entries` in a single `splice`:
+/// one model notification instead of one per row.
+pub fn replace_all(store: &gio::ListStore, entries: &[kito_core::Entry]) {
+    let objs: Vec<FileObject> = entries.iter().map(FileObject::new).collect();
+    store.splice(0, store.n_items(), &objs);
+}
+
+/// Appends one chunk of entries with a single `splice` (one notification).
+/// The caller clears the store first for a fresh load.
+pub fn append_chunk(store: &gio::ListStore, chunk: &[kito_core::Entry]) {
+    if chunk.is_empty() {
+        return;
+    }
+    let objs: Vec<FileObject> = chunk.iter().map(FileObject::new).collect();
+    store.splice(store.n_items(), 0, &objs);
+}
+
 /// Fills the store with `dir_uri`. Returns the entry count.
+/// Test helper: the UI loads asynchronously (see `tabs`), sharing the same
+/// `list_dir` ordering and single-splice application.
+#[cfg(test)]
 pub fn reload(
     store: &gio::ListStore,
     dir_uri: &str,
     show_hidden: bool,
 ) -> Result<usize, glib::Error> {
     let entries = kito_core::list_dir(dir_uri, show_hidden)?;
-    store.remove_all();
-    for entry in &entries {
-        store.append(&FileObject::new(entry));
-    }
+    replace_all(store, &entries);
     Ok(entries.len())
 }

@@ -85,6 +85,7 @@ status-selected =
 error-open-folder = Could not open folder
 error-invalid-path = Enter a local path or URI to open.
 empty-folder = This folder is empty
+loading-folder = Loading…
 error-open-file = Could not open file
 error-open-file-detail = Kito Files could not start the default application: { $error }
 
