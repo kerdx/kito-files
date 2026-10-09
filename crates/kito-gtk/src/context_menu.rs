@@ -117,8 +117,10 @@ const ROWS: [Row; 11] = [
     ),
     row(
         &[
+            "document-properties-symbolic",
             "dialog-information-symbolic",
             "help-about-symbolic",
+            "document-properties",
             "dialog-information",
             "help-about",
         ],
@@ -151,8 +153,10 @@ const TRASH_ROWS: [Row; 5] = [
     ),
     row(
         &[
+            "document-properties-symbolic",
             "dialog-information-symbolic",
             "help-about-symbolic",
+            "document-properties",
             "dialog-information",
             "help-about",
         ],
@@ -559,8 +563,10 @@ const BG_TERM_ROWS: [BgRow; 2] = [
 
 const BG_PROPS_ROWS: [BgRow; 1] = [BgRow {
     icons: &[
+        "document-properties-symbolic",
         "dialog-information-symbolic",
         "help-about-symbolic",
+        "document-properties",
         "dialog-information",
         "help-about",
     ],
@@ -1249,6 +1255,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn folder_properties_menus_prefer_the_document_properties_icon() {
+        assert_eq!(ROWS.last().unwrap().action, "properties");
+        assert_eq!(
+            ROWS.last().unwrap().icons[0],
+            "document-properties-symbolic"
+        );
+        assert_eq!(
+            TRASH_ROWS.last().unwrap().icons[0],
+            "document-properties-symbolic"
+        );
+        assert_eq!(BG_PROPS_ROWS[0].icons[0], "document-properties-symbolic");
     }
 
     #[test]
