@@ -1,7 +1,14 @@
 //! Freedesktop-style bookmarks (`~/.config/gtk-3.0/bookmarks`, lines
 //! `uri name...`). Same file as Nautilus: pins are shared.
 
+use gio::prelude::*;
 use std::path::PathBuf;
+
+fn default_name(uri: &str) -> String {
+    crate::uri_file_name(uri)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| gio::File::for_uri(uri).parse_name().to_string())
+}
 
 pub fn path() -> PathBuf {
     glib::user_config_dir().join("gtk-3.0/bookmarks")
@@ -26,8 +33,8 @@ pub fn read_from(path: &std::path::Path) -> Vec<(String, String)> {
                 .next()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .unwrap_or(uri)
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| default_name(uri));
             Some((name, uri.to_string()))
         })
         .collect()
@@ -107,6 +114,28 @@ mod tests {
         assert!(unpin_from(&file, "file:///tmp/docs").unwrap());
         assert!(!unpin_from(&file, "file:///tmp/docs").unwrap());
         assert!(read_from(&file).is_empty());
+    }
+
+    #[test]
+    fn unlabeled_bookmarks_use_a_readable_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bookmarks");
+        let uri = gio::File::for_path(&dir.path().join("Project Files")).uri();
+        std::fs::write(&file, format!("{uri}\n")).unwrap();
+
+        assert_eq!(read_from(&file), [("Project Files".to_string(), uri.to_string())]);
+    }
+
+    #[test]
+    fn explicit_bookmark_labels_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bookmarks");
+        std::fs::write(&file, "file:///tmp/project Project Files\n").unwrap();
+
+        assert_eq!(
+            read_from(&file),
+            [("Project Files".to_string(), "file:///tmp/project".to_string())]
+        );
     }
 
     fn is_pinned_in(path: &std::path::Path, uri: &str) -> bool {

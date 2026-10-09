@@ -10,6 +10,17 @@ use crate::dnd::{self, DropHandler};
 use crate::preferences::model::OpenItems;
 pub use crate::preferences::model::ViewMode;
 
+const ICON_VIEW_BASE_SIZE: i32 = 96;
+const ICON_VIEW_BASE_CELL_WIDTH: i32 = 160;
+
+fn icon_pixel_size(zoom: u8) -> i32 {
+    (ICON_VIEW_BASE_SIZE * i32::from(zoom) / 100).max(24)
+}
+
+fn icon_cell_width(zoom: u8) -> i32 {
+    (ICON_VIEW_BASE_CELL_WIDTH * i32::from(zoom) / 100).max(96)
+}
+
 #[derive(Clone, Copy)]
 pub struct ViewDisplay {
     pub icon_zoom: u8,
@@ -569,9 +580,10 @@ fn build_icons(
             .margin_top(8)
             .margin_bottom(8)
             .build();
+        cell.set_size_request(icon_cell_width(zoom), -1);
         cell.add_css_class("file-item");
         let image = gtk::Image::new();
-        image.set_pixel_size((48 * i32::from(zoom) / 100).max(24));
+        image.set_pixel_size(icon_pixel_size(zoom));
         cell.append(&image);
         cell.append(
             &gtk::Label::builder()
@@ -755,6 +767,16 @@ mod tests {
         assert!(single_click_activation(OpenItems::SingleClick));
         // wire_activate remains the only activation-signal hookup for both
         // view types; changing this flag never attaches another handler.
+    }
+
+    #[test]
+    fn icon_zoom_matches_the_larger_grid_reference() {
+        assert_eq!(icon_pixel_size(60), 57);
+        assert_eq!(icon_pixel_size(100), 96);
+        assert_eq!(icon_pixel_size(180), 172);
+        assert_eq!(icon_cell_width(60), 96);
+        assert_eq!(icon_cell_width(100), 160);
+        assert_eq!(icon_cell_width(180), 288);
     }
 
     fn listed_uris(store: &gio::ListStore) -> Vec<String> {

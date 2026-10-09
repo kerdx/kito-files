@@ -398,7 +398,6 @@ fn load_pathbar_css() {
         .app-title {\
             font-weight: 700;\
             font-size: 1.05em;\
-            margin-right: 6px;\
         }\
         .path-pill {\
             background-color: alpha(@window_fg_color, 0.06);\
@@ -469,16 +468,23 @@ fn load_pathbar_css() {
             background-color: alpha(@window_fg_color, 0.07);\
         }\
         .side-row.active {\
-            background-color: alpha(@accent_bg_color, 0.16);\
+            background-color: alpha(@window_fg_color, 0.17);\
         }\
         .side-row.active:hover {\
-            background-color: alpha(@accent_bg_color, 0.26);\
+            background-color: alpha(@window_fg_color, 0.24);\
         }\
         .side-label {\
             color: alpha(@window_fg_color, 0.85);\
+            font-weight: 400;\
         }\
         .side-label.active {\
             color: @window_fg_color;\
+        }\
+        .side-device-action {\
+            min-width: 32px;\
+            min-height: 32px;\
+            padding: 0;\
+            border-radius: 8px;\
         }\
         .status-bar {\
             background-color: alpha(@window_fg_color, 0.025);\
@@ -672,14 +678,26 @@ fn build_window(
         .build();
     let preferences_dialog: preferences_dialog::SharedDialog = Rc::new(RefCell::new(None));
 
-    let content = gtk::Box::builder()
+    // One shared split owns both header and body columns. This keeps the
+    // sidebar/header boundary aligned while the user resizes the divider.
+    let layout = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .build();
+    layout.set_shrink_start_child(true);
+    layout.set_resize_start_child(false);
+    let sidebar_column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
+    let right = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .build();
+    layout.set_start_child(Some(&sidebar_column));
+    layout.set_end_child(Some(&right));
 
     // Path: clickable breadcrumbs <-> writable entry (Ctrl+L).
-    // The expandable path bar must share one row with New Tab so it can end
-    // immediately before it. Window controls are placed in that row too, so
-    // the title slot can fill the width without centering the app controls.
+    // The expandable path bar shares the right header row with New Tab and
+    // the end-side window controls; it shrinks before those controls do.
     let path_stack = gtk::Stack::builder()
         .hexpand(true)
         .halign(gtk::Align::Fill)
@@ -718,8 +736,13 @@ fn build_window(
     path_stack.add_named(&path_entry, Some("edit"));
     path_stack.set_visible_child_name("crumbs");
 
-    // Single Nautilus-style bar: left (name + menu + navigation),
-    // expanding path, view and tabs on the right. No second row.
+    // Both header sections live in the same Paned columns as the sidebar and
+    // file view below, so their vertical boundary is never independently sized.
+    let sidebar_header = adw::HeaderBar::new();
+    sidebar_header.set_show_start_title_buttons(false);
+    sidebar_header.set_show_end_title_buttons(false);
+    sidebar_column.append(&sidebar_header);
+
     let header = adw::HeaderBar::new();
     let header_contents = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -730,21 +753,34 @@ fn build_window(
     header.set_show_start_title_buttons(false);
     header.set_show_end_title_buttons(false);
     header.set_title_widget(Some(&header_contents));
-    content.append(&header);
+    right.append(&header);
 
     let start_window_controls = gtk::WindowControls::new(gtk::PackType::Start);
     start_window_controls.set_visible(!start_window_controls.is_empty());
     start_window_controls.connect_empty_notify(|controls| {
         controls.set_visible(!controls.is_empty());
     });
-    header_contents.append(&start_window_controls);
+
+    let search_name = tr("sidebar-search");
+    let search_description = tr("sidebar-search-unavailable");
+    let search_icon = gtk::Image::from_gicon(&icons::control_icon(&[
+        "system-search-symbolic",
+        "edit-find-symbolic",
+        "system-search",
+        "edit-find",
+    ]));
+    search_icon.set_pixel_size(18);
+    search_icon.set_margin_start(17);
+    search_icon.set_tooltip_text(Some(&search_description));
+    search_icon.update_property(&[
+        gtk::accessible::Property::Label(&search_name),
+        gtk::accessible::Property::Description(&search_description),
+    ]);
 
     let app_label = gtk::Label::builder()
         .label("Kito Files")
-        .margin_start(4)
         .css_classes(["app-title"])
         .build();
-    header_contents.append(&app_label);
 
     let app_menu_popover = build_app_menu_popover(&window);
     let app_menu_button = gtk::MenuButton::builder()
@@ -761,7 +797,21 @@ fn build_window(
     app_menu_button.set_child(Some(&app_menu_icon));
     let app_menu_name = tr("menu-application");
     app_menu_button.update_property(&[gtk::accessible::Property::Label(&app_menu_name)]);
-    header_contents.append(&app_menu_button);
+    let sidebar_header_start = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    sidebar_header_start.append(&start_window_controls);
+    sidebar_header_start.append(&search_icon);
+    let sidebar_header_contents = gtk::CenterBox::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .start_widget(&sidebar_header_start)
+        .center_widget(&app_label)
+        .end_widget(&app_menu_button)
+        .build();
+    sidebar_header.set_title_widget(Some(&sidebar_header_contents));
 
     // Navigation: separate flat round arrows, like Nautilus (no linked).
     let nav = gtk::Box::builder()
@@ -940,20 +990,7 @@ fn build_window(
         })
     });
 
-    // Body: sidebar on the left, tabs + status on the right.
-    let paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .build();
-    paned.set_shrink_start_child(true);
-    paned.set_resize_start_child(false);
-    content.append(&paned);
-
-    let right = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .hexpand(true)
-        .build();
-    paned.set_end_child(Some(&right));
-
+    // Body of the right column: tabs, file view and status.
     let tab_view = adw::TabView::new();
     tab_view.set_vexpand(true);
     let tab_bar = adw::TabBar::builder().view(&tab_view).build();
@@ -1447,8 +1484,8 @@ fn build_window(
         })
     };
     let sidebar = sidebar::build_sidebar(load.clone(), window.clone(), sidebar_drop);
-    paned.set_start_child(Some(sidebar.widget()));
-    paned.set_position(170);
+    sidebar_column.append(sidebar.widget());
+    layout.set_position(178);
     *sidebar_slot.borrow_mut() = Some(sidebar);
 
     // Preferences are shared process-wide. Each window keeps only weak
@@ -1464,6 +1501,7 @@ fn build_window(
         let path_entry = path_entry.downgrade();
         let path_stack = path_stack.downgrade();
         let path_completion_retranslator = path_completion_retranslator.clone();
+        let search_icon = search_icon.downgrade();
         let app_menu_button = app_menu_button.downgrade();
         let app_menu_popover = app_menu_popover.downgrade();
         let window = window.downgrade();
@@ -1496,6 +1534,15 @@ fn build_window(
                 ]);
             }
             path_completion_retranslator();
+            if let Some(image) = search_icon.upgrade() {
+                let label = tr("sidebar-search");
+                let description = tr("sidebar-search-unavailable");
+                image.set_tooltip_text(Some(&description));
+                image.update_property(&[
+                    gtk::accessible::Property::Label(&label),
+                    gtk::accessible::Property::Description(&description),
+                ]);
+            }
             if let Some(button) = app_menu_button.upgrade() {
                 let label = tr("menu-application");
                 button.set_tooltip_text(Some(&label));
@@ -1565,7 +1612,7 @@ fn build_window(
             gesture.set_state(gtk::EventSequenceState::Claimed);
             go(&manager);
         });
-        content.add_controller(gesture);
+        layout.add_controller(gesture);
     }
     up_button.connect_clicked({
         let load = load.clone();
@@ -1590,7 +1637,7 @@ fn build_window(
         }
     });
 
-    toast_overlay.set_child(Some(&content));
+    toast_overlay.set_child(Some(&layout));
     window.set_content(Some(&toast_overlay));
 
     window.present();

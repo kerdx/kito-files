@@ -17,6 +17,7 @@ The header bar separates navigation, view controls and app settings:
   Click its empty area or press `Ctrl+L` to edit; local directory suggestions appear
   as you type, with relative paths based on the active tab. Tab completes the selected
   suggestion (or the common prefix), and Enter accepts a suggestion or opens the path.
+  Click outside the editor to return to the breadcrumbs.
 - **View selector**, at the top right: Icons, Compact, Details and Show Hidden Files.
   The popover stays open while changing view options.
 - **New tab** button: opens the current location in another tab.
@@ -99,13 +100,20 @@ the selected count.
 
 **Sidebar**
 
-- **Places** — XDG user directories (Home, Documents, Downloads, Pictures, Music, Videos, Desktop)
-- **Devices** — volumes discovered through `GVolumeMonitor`, with mounting when needed
-- **Network** — network browsing entry point
-- **Trash** — with dedicated context menu (empty / background actions) and an icon
-  that tracks whether the Trash is empty through asynchronous polling
-- Bookmarks / pins written to `~/.config/gtk-3.0/bookmarks`, the standard freedesktop
-  bookmarks file. Changes made by other apps are picked up live through a directory monitor.
+- **Quick access** — Home, Preferiti, Network and Trash. Preferiti expands to
+  show folder bookmarks; bookmarks duplicating Home or a listed personal folder are omitted.
+- **Personal folders** — available XDG user directories, including Documents,
+  Music, Pictures, Videos and Downloads. Desktop remains reachable from Home.
+- **Devices** — volumes discovered through `GVolumeMonitor`; click an unmounted
+  volume to mount it. Mounted volumes expose Eject or Unmount when GIO reports
+  that action is supported.
+- **Trash** — dedicated context menu (empty / background actions) and an icon
+  that tracks whether the Trash is empty through asynchronous polling.
+- Folder bookmarks / pins are read from `~/.config/gtk-3.0/bookmarks`, the
+  standard freedesktop bookmarks file. Unlabelled entries use their decoded
+  basename instead of displaying the URI. Changes made by other apps are
+  picked up live through a directory monitor. The active destination highlights
+  its closest matching sidebar location, including when browsing a subfolder.
 
 **File operations**
 

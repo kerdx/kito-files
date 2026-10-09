@@ -298,7 +298,9 @@ impl PathAutocomplete {
         outside_click.connect_pressed({
             let window = window.downgrade();
             let entry = entry.downgrade();
+            let stack = stack.downgrade();
             let popover = popover.downgrade();
+            let state = Rc::downgrade(&state);
             move |_, _, x, y| {
                 let (Some(window), Some(entry), Some(popover)) =
                     (window.upgrade(), entry.upgrade(), popover.upgrade())
@@ -315,7 +317,16 @@ impl PathAutocomplete {
                                 || target.is_ancestor(&popover)
                         });
                 if !inside_completion {
-                    popover.popdown();
+                    if let (Some(stack), Some(state)) = (stack.upgrade(), state.upgrade()) {
+                        if stack.visible_child_name().as_deref() == Some("edit") {
+                            state.borrow_mut().invalidate();
+                            stack.set_visible_child_name("crumbs");
+                        } else {
+                            popover.popdown();
+                        }
+                    } else {
+                        popover.popdown();
+                    }
                 }
             }
         });

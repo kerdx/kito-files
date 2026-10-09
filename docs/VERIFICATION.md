@@ -135,6 +135,43 @@ riporta Wayland/KDE e anche `GDK_BACKEND=x11`, quindi il backend effettivo di Ki
 resta sconosciuto. Le verifiche grafiche della tabella richiedono una sessione
 controllabile; non sono state dichiarate superate sulla base dei soli test.
 
+## UI03 — Composizione coordinata di intestazione e sidebar (2026-10-09)
+
+`cargo check --workspace --locked` and `cargo build --workspace --locked --release`
+passed. The final
+`cargo test --workspace --locked -- --skip restore_roundtrip_through_trash` run
+passed 46 `kito-core`, 117 `kito-gtk` and 11 `kito-i18n` tests; the session-Trash
+integration test was explicitly skipped. `rustfmt` and Clippy are not installed,
+so formatting and lint checks were unavailable.
+An earlier unfiltered test invocation also ran that integration test: it moved
+its own uniquely named temporary file into the session Trash and restored it to
+the temporary directory; it did not touch pre-existing Trash entries. The final
+test run excluded it as required for an isolated Trash check.
+
+The application was launched with its automatic backend in the current Wayland
+session and remained running. A separate launch with `GDK_BACKEND=x11` remained
+running on the session's XWayland server; screenshots were captured and visually
+inspected. They show the narrower shared split, aligned header/sidebar groups,
+search glyph aligned with the sidebar icon column, centered Kito Files title and
+menu at the right; the search glyph is informational and has no action until F14.
+They also show Home,
+Preferiti, Network, Trash, five personal-folder shortcuts, the mounted volume,
+and the four-column icon grid with larger tiles. The test used a temporary
+`XDG_CONFIG_HOME` with `user-dirs.dirs` and five unlabeled bookmarks copied into
+it; the collapsed group showed no raw URI rows or duplicate XDG locations. The
+actual expansion interaction and expanded empty state were not verified visually.
+The available volume did not support a visible eject/unmount action. X11 was not
+tested in a separate X11 desktop session; the Wayland session was not captured.
+The private D-Bus test sessions emitted portal/AT-SPI environment warnings; they
+did not stop the app from launching.
+
+| ID | Verifica richiesta | Esito | Evidenza e lavoro residuo |
+|---|---|---|---|
+| UI03-1 | Una sola divisione allineata tra intestazione sinistra/sidebar e intestazione di navigazione/contenuto, anche quando si sposta il divisore. | PARZIALE | Un unico `GtkPaned` e screenshot statici controllati su XWayland; il trascinamento non è stato provato. |
+| UI03-2 | Gruppi Home/Preferiti/rete/cestino, cartelle XDG, volumi; selezione della destinazione più vicina anche per sottocartelle e volumi. | PARZIALE | Test URI GIO e bookmark passati; screenshot mostra i gruppi e non espone URI grezzi. La lista espansa, la rimozione, le modifiche live e i comandi volume non sono stati provati graficamente. |
+| UI03-3 | Tema chiaro/scuro, lingue, finestre strette, schede, liste lunghe e accessibilità. | PARZIALE | Cataloghi inglese/italiano coperti dai test; tema scuro, interazioni, ridimensionamento, schede multiple e screen reader non verificati a schermo. |
+| UI03-4 | Clic fuori dall'editor del percorso torna ai breadcrumb; click nel campo o nei suggerimenti non chiude l'editor. | PARZIALE | Gestito dal controller click globale con esclusione del campo e del popover; flusso interattivo non provato manualmente. |
+
 ### GUI e performance
 
 La sessione espone `XDG_SESSION_TYPE=wayland`, `WAYLAND_DISPLAY=wayland-0` e
