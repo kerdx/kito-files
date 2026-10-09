@@ -9,7 +9,6 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc};
 type OpenItemsListener = Rc<dyn Fn(OpenItems)>;
 type LanguageListener = Rc<dyn Fn(kito_i18n::AppLang)>;
 type WindowControlsListener = Rc<dyn Fn(WindowControls)>;
-type ZoomListener = Rc<dyn Fn(u8)>;
 type DisplayListener = Rc<dyn Fn(Preferences)>;
 
 /// Process-wide settings state shared by every window.
@@ -19,7 +18,6 @@ pub struct PreferenceStore {
     open_items_listeners: RefCell<Vec<OpenItemsListener>>,
     language_listeners: RefCell<Vec<LanguageListener>>,
     window_controls_listeners: RefCell<Vec<WindowControlsListener>>,
-    zoom_listeners: RefCell<Vec<ZoomListener>>,
     display_listeners: RefCell<Vec<DisplayListener>>,
 }
 
@@ -33,7 +31,6 @@ impl PreferenceStore {
             open_items_listeners: RefCell::new(Vec::new()),
             language_listeners: RefCell::new(Vec::new()),
             window_controls_listeners: RefCell::new(Vec::new()),
-            zoom_listeners: RefCell::new(Vec::new()),
             display_listeners: RefCell::new(Vec::new()),
         })
     }
@@ -46,7 +43,6 @@ impl PreferenceStore {
             open_items_listeners: RefCell::new(Vec::new()),
             language_listeners: RefCell::new(Vec::new()),
             window_controls_listeners: RefCell::new(Vec::new()),
-            zoom_listeners: RefCell::new(Vec::new()),
             display_listeners: RefCell::new(Vec::new()),
         })
     }
@@ -116,9 +112,6 @@ impl PreferenceStore {
             return Ok(());
         }
         self.current.borrow_mut().icon_zoom = zoom;
-        for listener in self.zoom_listeners.borrow().iter() {
-            listener(zoom);
-        }
         self.notify_display();
         self.save()
     }
@@ -167,10 +160,6 @@ impl PreferenceStore {
 
     pub fn subscribe_window_controls(&self, listener: WindowControlsListener) {
         self.window_controls_listeners.borrow_mut().push(listener);
-    }
-
-    pub fn subscribe_icon_zoom(&self, listener: ZoomListener) {
-        self.zoom_listeners.borrow_mut().push(listener);
     }
 
     pub fn subscribe_display(&self, listener: DisplayListener) {

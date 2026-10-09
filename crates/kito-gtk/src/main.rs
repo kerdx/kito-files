@@ -5,11 +5,13 @@
 mod context_menu;
 mod dnd;
 mod file_list;
+mod icons;
 mod l10n;
 mod ops;
 mod path_completion;
 mod preferences;
 mod preferences_dialog;
+mod shortcuts;
 mod sidebar;
 mod tabs;
 mod terminal;
@@ -24,11 +26,26 @@ use std::{
     rc::Rc,
 };
 
-fn view_icon_name(mode: ViewMode) -> &'static str {
+fn view_icon_names(mode: ViewMode) -> &'static [&'static str] {
     match mode {
-        ViewMode::Icons => "view-grid-symbolic",
-        ViewMode::Compact => "view-list-symbolic",
-        ViewMode::Details => "view-list-bullet-symbolic",
+        ViewMode::Icons => &[
+            "view-grid-symbolic",
+            "view-list-symbolic",
+            "view-grid",
+            "view-list",
+        ],
+        ViewMode::Compact => &[
+            "view-list-symbolic",
+            "view-grid-symbolic",
+            "view-list",
+            "view-grid",
+        ],
+        ViewMode::Details => &[
+            "view-list-bullet-symbolic",
+            "view-list-symbolic",
+            "view-list-bullet",
+            "view-list",
+        ],
     }
 }
 
@@ -42,9 +59,14 @@ fn view_label(mode: ViewMode) -> String {
 
 fn view_choice_button(mode: ViewMode) -> gtk::ToggleButton {
     let label = view_label(mode);
-    let icon = gtk::Image::from_icon_name(view_icon_name(mode));
+    let icon = gtk::Image::from_gicon(&icons::control_icon(view_icon_names(mode)));
     icon.set_pixel_size(20);
-    let check = gtk::Image::from_icon_name("object-select-symbolic");
+    let check = gtk::Image::from_gicon(&icons::control_icon(&[
+        "object-select-symbolic",
+        "emblem-ok-symbolic",
+        "object-select",
+        "emblem-ok",
+    ]));
     check.set_pixel_size(12);
     check.set_opacity(0.0);
 
@@ -88,7 +110,7 @@ fn update_view_control(
     details.set_active(mode == ViewMode::Details);
     syncing.set(false);
 
-    icon.set_icon_name(Some(view_icon_name(mode)));
+    icon.set_from_gicon(&icons::control_icon(view_icon_names(mode)));
     let current = crate::l10n::tr_with_one("view-current", "view", &view_label(mode));
     button.set_tooltip_text(Some(&current));
     let selector = crate::l10n::tr("view-selector");
@@ -141,16 +163,34 @@ const APP_MENU_ITEMS: [(&str, &str, &[&str]); 2] = [
     (
         "menu-preferences",
         "win.preferences",
-        &["preferences-system", "preferences-system-symbolic"],
+        &[
+            "preferences-system-symbolic",
+            "applications-system-symbolic",
+            "preferences-system",
+            "preferences",
+        ],
     ),
     (
         "menu-about",
         "win.about",
-        &["help-about", "dialog-information"],
+        &[
+            "help-about-symbolic",
+            "dialog-information-symbolic",
+            "help-about",
+            "dialog-information",
+        ],
     ),
 ];
 
 fn update_app_menu_popover(popover: &gtk::Popover, window: &adw::ApplicationWindow) {
+    let Some(app) = window.application() else {
+        return;
+    };
+    let actions = APP_MENU_ITEMS
+        .iter()
+        .map(|(_, action, _)| (*action).to_string())
+        .collect::<Vec<_>>();
+    let shortcut_width = shortcuts::shortcut_column_width(&app, &actions);
     let list = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -166,23 +206,28 @@ fn update_app_menu_popover(popover: &gtk::Popover, window: &adw::ApplicationWind
         button.add_css_class("ctx-row");
         button.update_property(&[gtk::accessible::Property::Label(&label)]);
 
-        let content = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(10)
+        let content = gtk::Grid::builder()
+            .column_spacing(10)
             .margin_start(8)
             .margin_end(8)
             .margin_top(6)
             .margin_bottom(6)
             .build();
-        let image = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(icon_names));
+        let image = gtk::Image::from_gicon(&icons::control_icon(icon_names));
         image.set_pixel_size(18);
-        content.append(&image);
-        content.append(
-            &gtk::Label::builder()
-                .label(&label)
-                .halign(gtk::Align::Start)
-                .hexpand(true)
-                .build(),
+        content.attach(&image, 0, 0, 1, 1);
+        let text = gtk::Label::builder()
+            .label(&label)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .build();
+        content.attach(&text, 1, 0, 1, 1);
+        content.attach(
+            &shortcuts::shortcut_cell(&app, Some(action), shortcut_width),
+            2,
+            0,
+            1,
+            1,
         );
         button.set_child(Some(&content));
 
@@ -208,6 +253,13 @@ fn build_app_menu_popover(window: &adw::ApplicationWindow) -> gtk::Popover {
     popover.set_has_arrow(false);
     popover.add_css_class("ctx-menu");
     update_app_menu_popover(&popover, window);
+    let weak_popover = popover.downgrade();
+    let weak_window = window.downgrade();
+    popover.connect_show(move |_| {
+        if let (Some(popover), Some(window)) = (weak_popover.upgrade(), weak_window.upgrade()) {
+            update_app_menu_popover(&popover, &window);
+        }
+    });
     popover
 }
 
@@ -302,25 +354,14 @@ fn register_actions(
     group.add_action(&action);
     window.insert_action_group("win", Some(&group));
 
-    app.set_accels_for_action("win.copy", &["<Control>c"]);
-    app.set_accels_for_action("win.cut", &["<Control>x"]);
-    app.set_accels_for_action("win.paste", &["<Control>v"]);
-    app.set_accels_for_action("win.trash", &["Delete"]);
-    app.set_accels_for_action("win.delete", &["<Shift>Delete"]);
-    app.set_accels_for_action("win.rename", &["F2"]);
-    app.set_accels_for_action("win.edit-path", &["<Control>l"]);
-    app.set_accels_for_action("win.reload", &["F5", "<Control>r"]);
-    app.set_accels_for_action("win.new-folder", &["<Control><Shift>n"]);
-    app.set_accels_for_action("win.preferences", &["<Control>comma"]);
+    shortcuts::register_application_accelerators(app);
 }
 
-/// Button with a system-theme icon: base name first (full theme style,
-/// e.g. Papirus/Breeze), `-symbolic` variant as fallback.
+/// Button with ordered system-theme icon candidates. Callers put symbolic
+/// names before semantic symbolic fallbacks and regular variants.
 fn themed_button(names: &[&str], tooltip: &str) -> gtk::Button {
     let button = gtk::Button::builder().tooltip_text(tooltip).build();
-    button.set_child(Some(&gtk::Image::from_gicon(&gio::ThemedIcon::from_names(
-        names,
-    ))));
+    button.set_child(Some(&gtk::Image::from_gicon(&icons::control_icon(names))));
     button
 }
 
@@ -444,6 +485,16 @@ fn load_pathbar_css() {
             border-top-width: 1px;\
             border-top-style: solid;\
             border-top-color: alpha(@window_fg_color, 0.08);\
+        }\
+        .zoom-button {\
+            min-width: 24px;\
+            min-height: 24px;\
+            padding: 0;\
+        }\
+        .zoom-slider {\
+            min-width: 92px;\
+            min-height: 18px;\
+            margin: 0 2px;\
         }";
     let provider = gtk::CssProvider::new();
     provider.load_from_string(css);
@@ -700,7 +751,12 @@ fn build_window(
         .tooltip_text(tr("menu-application"))
         .popover(&app_menu_popover)
         .build();
-    let app_menu_icon = gtk::Image::from_icon_name("open-menu-symbolic");
+    let app_menu_icon = gtk::Image::from_gicon(&icons::control_icon(&[
+        "open-menu-symbolic",
+        "view-more-symbolic",
+        "open-menu",
+        "view-more",
+    ]));
     app_menu_icon.set_pixel_size(18);
     app_menu_button.set_child(Some(&app_menu_icon));
     let app_menu_name = tr("menu-application");
@@ -713,11 +769,25 @@ fn build_window(
         .spacing(4)
         .margin_start(4)
         .build();
-    let back_button = nav_button(&["go-previous", "go-previous-symbolic"], &tr("nav-back"));
+    let back_button = nav_button(
+        &[
+            "go-previous-symbolic",
+            "pan-start-symbolic",
+            "go-previous",
+            "pan-start",
+        ],
+        &tr("nav-back"),
+    );
     back_button.set_sensitive(false);
-    let forward_button = nav_button(&["go-next", "go-next-symbolic"], &tr("nav-forward"));
+    let forward_button = nav_button(
+        &["go-next-symbolic", "pan-end-symbolic", "go-next", "pan-end"],
+        &tr("nav-forward"),
+    );
     forward_button.set_sensitive(false);
-    let up_button = nav_button(&["go-up", "go-up-symbolic"], &tr("nav-up"));
+    let up_button = nav_button(
+        &["go-up-symbolic", "folder-symbolic", "go-up", "folder"],
+        &tr("nav-up"),
+    );
     nav.append(&back_button);
     nav.append(&forward_button);
     nav.append(&up_button);
@@ -813,9 +883,10 @@ fn build_window(
     let view_popover = gtk::Popover::new();
     view_popover.set_child(Some(&view_contents));
 
-    let view_icon = gtk::Image::from_icon_name(view_icon_name(initial_view));
+    let view_icon = gtk::Image::from_gicon(&icons::control_icon(view_icon_names(initial_view)));
     view_icon.set_pixel_size(18);
-    let view_arrow = gtk::Image::from_icon_name("pan-down-symbolic");
+    let view_arrow =
+        gtk::Image::from_gicon(&icons::control_icon(&["pan-down-symbolic", "pan-down"]));
     view_arrow.set_pixel_size(12);
     let view_button_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -834,25 +905,17 @@ fn build_window(
         gtk::accessible::Property::Label(&view_selector_name),
         gtk::accessible::Property::Description(&current_view),
     ]);
-    let zoom_controls = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(2)
-        .css_classes(["toolbar"])
-        .build();
-    let zoom_out_button = themed_button(&["zoom-out-symbolic", "zoom-out"], &tr("zoom-out"));
-    let zoom_label = gtk::Label::builder()
-        .label(format!("{}%", preferences.snapshot().icon_zoom))
-        .width_chars(4)
-        .css_classes(["numeric"])
-        .build();
-    let zoom_in_button = themed_button(&["zoom-in-symbolic", "zoom-in"], &tr("zoom-in"));
-    zoom_controls.append(&zoom_out_button);
-    zoom_controls.append(&zoom_label);
-    zoom_controls.append(&zoom_in_button);
-    let new_tab_button = themed_button(&["tab-new", "tab-new-symbolic"], &tr("nav-new-tab"));
+    let new_tab_button = themed_button(
+        &[
+            "tab-new-symbolic",
+            "document-new-symbolic",
+            "tab-new",
+            "document-new",
+        ],
+        &tr("nav-new-tab"),
+    );
     header_contents.append(&new_tab_button);
     header_contents.append(&view_button);
-    header_contents.append(&zoom_controls);
     let end_window_controls = gtk::WindowControls::new(gtk::PackType::End);
     end_window_controls.set_visible(!end_window_controls.is_empty());
     end_window_controls.connect_empty_notify(|controls| {
@@ -897,20 +960,61 @@ fn build_window(
     right.append(&tab_bar);
     right.append(&tab_view);
 
-    // Status bar: item + selection counter, thin row.
+    // Status bar: item + selection counter on the left, compact zoom control
+    // on the right.
     let status = gtk::Label::builder()
         .halign(gtk::Align::Start)
+        .hexpand(true)
         .margin_start(14)
         .margin_end(14)
         .margin_top(7)
         .margin_bottom(7)
         .css_classes(["dim-label", "caption"])
         .build();
+    let zoom_initial = preferences.snapshot().icon_zoom;
+    let zoom_label = gtk::Label::builder()
+        .label(format!("{zoom_initial}%"))
+        .width_chars(4)
+        .css_classes(["numeric", "dim-label", "caption"])
+        .build();
+    let zoom_out_button = themed_button(&["zoom-out-symbolic", "zoom-out"], &tr("zoom-out"));
+    zoom_out_button.add_css_class("flat");
+    zoom_out_button.add_css_class("zoom-button");
+    let zoom_in_button = themed_button(&["zoom-in-symbolic", "zoom-in"], &tr("zoom-in"));
+    zoom_in_button.add_css_class("flat");
+    zoom_in_button.add_css_class("zoom-button");
+    let zoom_scale = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        crate::preferences::model::ICON_ZOOM_MIN as f64,
+        crate::preferences::model::ICON_ZOOM_MAX as f64,
+        crate::preferences::model::ICON_ZOOM_STEP as f64,
+    );
+    zoom_scale.set_draw_value(false);
+    zoom_scale.set_value(zoom_initial as f64);
+    zoom_scale.set_width_request(100);
+    zoom_scale.add_css_class("zoom-slider");
+    let zoom_selector = tr("zoom-selector");
+    zoom_scale.set_tooltip_text(Some(&zoom_selector));
+    zoom_scale.update_property(&[gtk::accessible::Property::Label(&zoom_selector)]);
+    let zoom_controls = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(3)
+        .valign(gtk::Align::Center)
+        .margin_end(10)
+        .build();
+    zoom_controls.append(&zoom_out_button);
+    zoom_controls.append(&zoom_scale);
+    zoom_controls.append(&zoom_in_button);
+    zoom_controls.append(&zoom_label);
+    let syncing_zoom = Rc::new(Cell::new(false));
+    let zoom_generation = Rc::new(Cell::new(0_u64));
+    let synced_zoom = Rc::new(Cell::new(zoom_initial));
     let status_bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .css_classes(["status-bar"])
         .build();
     status_bar.append(&status);
+    status_bar.append(&zoom_controls);
     right.append(&status_bar);
 
     // Manager slot: needed by breadcrumbs (created before the manager).
@@ -1079,13 +1183,26 @@ fn build_window(
     *manager_slot.borrow_mut() = Some(manager.clone());
     preferences.subscribe_display({
         let manager = Rc::downgrade(&manager);
+        let zoom_scale = zoom_scale.downgrade();
         let zoom_label = zoom_label.downgrade();
+        let syncing_zoom = syncing_zoom.clone();
+        let zoom_generation = zoom_generation.clone();
+        let synced_zoom = synced_zoom.clone();
         let size_switch = size_column_switch.downgrade();
         let type_switch = type_column_switch.downgrade();
         let modified_switch = modified_column_switch.downgrade();
         Rc::new(move |prefs| {
-            if let Some(label) = zoom_label.upgrade() {
-                label.set_text(&format!("{}%", prefs.icon_zoom));
+            if prefs.icon_zoom != synced_zoom.get() {
+                zoom_generation.set(zoom_generation.get().wrapping_add(1));
+                syncing_zoom.set(true);
+                if let Some(scale) = zoom_scale.upgrade() {
+                    scale.set_value(prefs.icon_zoom as f64);
+                }
+                if let Some(label) = zoom_label.upgrade() {
+                    label.set_text(&format!("{}%", prefs.icon_zoom));
+                }
+                syncing_zoom.set(false);
+                synced_zoom.set(prefs.icon_zoom);
             }
             if let Some(switch) = size_switch.upgrade() {
                 if switch.is_active() != prefs.show_size_column {
@@ -1130,14 +1247,6 @@ fn build_window(
                 eprintln!("save modified-column preference: {error}");
             }
         }
-    });
-    preferences.subscribe_icon_zoom({
-        let label = zoom_label.downgrade();
-        Rc::new(move |zoom| {
-            if let Some(label) = label.upgrade() {
-                label.set_text(&format!("{zoom}%"));
-            }
-        })
     });
     let autocomplete = path_completion::PathAutocomplete::new(
         &path_entry,
@@ -1263,6 +1372,35 @@ fn build_window(
         focus_path: select_path_entry,
     });
     manager.setup_tab_bar(&tab_bar, &ctx);
+    zoom_scale.connect_value_changed({
+        let preferences = preferences.clone();
+        let syncing_zoom = syncing_zoom.clone();
+        let zoom_generation = zoom_generation.clone();
+        let zoom_label = zoom_label.downgrade();
+        move |scale| {
+            if syncing_zoom.get() {
+                return;
+            }
+            let zoom = scale.value().round().clamp(
+                crate::preferences::model::ICON_ZOOM_MIN as f64,
+                crate::preferences::model::ICON_ZOOM_MAX as f64,
+            ) as u8;
+            if let Some(label) = zoom_label.upgrade() {
+                label.set_text(&format!("{zoom}%"));
+            }
+            let generation = zoom_generation.get().wrapping_add(1);
+            zoom_generation.set(generation);
+            let zoom_generation = zoom_generation.clone();
+            let preferences = preferences.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                if zoom_generation.get() == generation {
+                    if let Err(error) = preferences.set_icon_zoom(zoom) {
+                        eprintln!("save icon zoom preference: {error}");
+                    }
+                }
+            });
+        }
+    });
     zoom_out_button.connect_clicked({
         let ctx = ctx.clone();
         move |_| ctx.zoom_out()

@@ -212,6 +212,8 @@ fn obj_of(list_item: &gtk::ListItem) -> FileObject {
     list_item.item().and_downcast::<FileObject>().unwrap()
 }
 
+/// Content fallback only. File and folder icons in the main views keep the
+/// normal GIO theme icons; do not route them through interface-control helpers.
 fn fallback_icon(is_dir: bool) -> gio::ThemedIcon {
     gio::ThemedIcon::new(if is_dir { "folder" } else { "text-x-generic" })
 }
@@ -647,27 +649,12 @@ pub fn build_view(
     (widget, selection)
 }
 
-/// Attaches a view-local Ctrl+A binding so text entries and dialogs keep
-/// their normal select-all behavior.
+/// Attaches file-view-local shortcuts so text entries and dialogs keep their
+/// normal keyboard behavior.
 pub fn add_file_shortcuts(widget: &gtk::Widget) {
     let controller = gtk::ShortcutController::new();
     controller.set_scope(gtk::ShortcutScope::Local);
-    for (accelerator, name) in [
-        ("<Control>a", "win.select-all"),
-        ("<Control>t", "win.new-tab"),
-        ("<Control>w", "win.close-tab"),
-        ("<Control><Shift>t", "win.reopen-tab"),
-        ("<Control>Tab", "win.next-tab"),
-        ("<Control><Shift>Tab", "win.previous-tab"),
-        ("<Alt>Left", "win.back"),
-        ("<Alt>Right", "win.forward"),
-        ("<Alt>Up", "win.up"),
-        ("<Control>plus", "win.zoom-in"),
-        ("<Control>KP_Add", "win.zoom-in"),
-        ("<Control>minus", "win.zoom-out"),
-        ("<Control>KP_Subtract", "win.zoom-out"),
-        ("<Control>0", "win.zoom-reset"),
-    ] {
+    for (accelerator, name) in crate::shortcuts::FILE_VIEW_SHORTCUTS {
         if let (Some(trigger), Some(action)) = (
             gtk::ShortcutTrigger::parse_string(accelerator),
             gtk::ShortcutAction::parse_string(name),

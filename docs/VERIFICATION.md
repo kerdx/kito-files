@@ -61,6 +61,80 @@ test); no other test was skipped. The isolated run used generated fixtures only.
 | E-01 | GDK negozia solo Copy/Move offerti e supportati; Link rifiutato; URI list interoperabile esposto. | Automatica, grafica | Test headless Linux | PARZIALE | Test di negoziazione e formati `FileList`/`text/uri-list` passati; scambio reale con altre app e drop su viste/sidebar non provati. |
 | E-02 | Drop interno su scheda usa la sua cartella; drop esterno Copy su scheda e Move esterno solo dopo completamento. | Sorgenti, grafica | Nessuna sessione GUI osservabile | PARZIALE | Drop interno ed esterno Copy sono collegati; Move esterno sulla barra schede è rifiutato perché il callback libadwaita è sincrono e non può confermare il risultato asincrono. |
 
+## UI01 — Icone coerenti (2026-10-08)
+
+`./scripts/check.sh` passed formatting, workspace compilation, all 44
+`kito-core`, 109 `kito-gtk` and 11 `kito-i18n` tests, and Clippy. One
+session-Trash integration test was filtered by the script; no other tests were
+skipped. The icon helper tests cover symbolic-before-regular candidate order,
+GIO device-name fallback order, menu candidates, place/bookmark fallbacks, and
+the empty/full Trash icon state logic. These checks do not render GTK widgets.
+
+Source inspection confirms that the Icon, Compact and Details file views still
+pass each file's normal GIO icon directly to `GtkImage`; the normal `folder` and
+`text-x-generic` content fallbacks are unchanged. Control icons use ordered
+`GThemedIcon` names and GTK resolves them through the active icon theme. This
+supports theme changes without caching a previously selected fallback, but a
+live theme change was not exercised in this verification.
+
+The host has icon theme directories for Adwaita, AdwaitaLegacy, Bluecurve,
+Breeze, Breeze Light, McMojave-circle (light and dark), Papirus, Papirus-Dark,
+Papirus-Light, Oxygen, hicolor, locolor and default. The desktop settings report
+Papirus-Dark and `prefer-dark`; these are environment observations, not proof
+that Kito was rendered with those settings. The session reports Wayland/KDE,
+while `GDK_BACKEND=x11` is also set. No controllable Kito window was available,
+so the backend actually used by the app is unknown.
+
+| ID | Verifica grafica richiesta | Esito | Evidenza e lavoro residuo |
+|---|---|---|---|
+| UI01-1 | Sidebar, toolbar, pulsanti e menu; simboli leggibili con dimensioni e allineamenti coerenti. | BLOCKED | Nessuna finestra controllabile nella sessione. Le liste di nomi e i fallback sono coperti dai test automatici, non dalla resa a schermo. |
+| UI01-2 | Cestino vuoto/pieno e relativi aggiornamenti, in una sessione isolata. | BLOCKED | La logica asincrona e gli stati sono coperti da unit test. Non è stata avviata una sessione isolata con cestino generato; il test d’integrazione che usa il cestino della sessione è stato escluso. |
+| UI01-3 | Tema chiaro/scuro e stati normale, selezionato, hover e disabilitato. | BLOCKED | Non è stata aperta l’app né cambiato il tema durante l’esecuzione. Il valore `prefer-dark` è solo la preferenza riportata dall’ambiente. |
+| UI01-4 | Temi icone installati e cambio tema mentre Kito è aperto. | BLOCKED | Le directory dei temi sono state rilevate, ma non è stata osservata la resa di Kito su nessuno di essi né il cambio a runtime. |
+| UI01-5 | Fallback quando manca il nome specifico, senza icone vuote. | BLOCKED (grafica) | L’ordine specifico-simbolico, simbolico-generico e normale è verificato nei test delle candidate; non è stata simulata a schermo l’assenza di un’icona in un tema. |
+| UI01-6 | File e cartelle conservano le icone normali nelle viste Icone, Compatta e Dettagli. | PARZIALE | Sorgente delle tre viste e fallback verificati: le icone GIO dei contenuti non passano dall’helper dei controlli. Conferma visiva non eseguita. |
+
+Il controllo UI disponibile non esponeva app o finestre; non erano disponibili
+un server X virtuale o un compositore Wayland avviabile per questa prova. Le
+verifiche elencate come BLOCKED restano da eseguire in una sessione grafica
+controllabile, registrando il backend effettivo e usando un ambiente isolato
+per il cestino.
+
+## UI02 — Scorciatoie visibili nei menu (2026-10-08)
+
+The final `./scripts/check.sh` run passed formatting, workspace compilation,
+44 `kito-core`, 112 `kito-gtk` and 11 `kito-i18n` tests, plus Clippy. The script
+filtered the session-Trash integration test (one filtered test); no other tests
+were skipped. An earlier run stopped at formatting, and the next reached
+Clippy, which reported two new helpers with too many parameters; both issues
+were corrected before the passing run. No unrelated pre-existing failure was
+observed.
+
+The new tests cover the shared view-controller binding for Ctrl+A, preservation
+of the registered primary/alternate order, and the background action mapping:
+Paste and New Folder receive the corresponding window shortcut only while the
+captured destination equals the active folder. Select All uses the same
+`win.select-all` action. Copy/cut shortcuts are not mapped onto background
+actions. Application menu labels query the current `GtkApplication` registry;
+file and background popovers resolve associations when rebuilt, and the app
+menu refreshes when opened. GTK formats the accelerator labels. Sidebar menus
+currently contain only Remove Bookmark and Empty Trash, which have no registered
+shortcut; the New File submenu likewise has no shortcut-bearing action.
+
+| ID | Verifica richiesta | Esito | Evidenza e lavoro residuo |
+|---|---|---|---|
+| UI02-1 | La combinazione mostrata attiva la stessa azione nel menu file, sfondo, cestino e app. | PARZIALE | Associazioni da `win.*` e guardia della destinazione per le azioni dello sfondo coperte da test; equivalenza interattiva non provata. |
+| UI02-2 | Menu app, file, sfondo, cestino, sidebar e sottomenu mostrano solo scorciatoie realmente disponibili. | PARZIALE | Il menu app può mostrare Ctrl+, per Preferenze; i menu file/cestino risolvono le azioni `win.*`; lo sfondo mostra solo Paste, New Folder e Select All quando equivalenti. Le voci sidebar e Nuovo file non hanno scorciatoie. Resa grafica non verificata. |
+| UI02-3 | Righe disabilitate, righe senza scorciatoia e tooltip delle alternative. | BLOCKED (grafica) | Celle vuote sono riservate solo nei menu con scorciatoie; label è figlia della riga, così eredita lo stato disabilitato. Le alternative usano il primo acceleratore come indicazione e gli altri nel tooltip. Contrasto e interazione non provati. |
+| UI02-4 | Menu riaperti, cambio lingua e aggiornamento delle associazioni. | PARZIALE | Menu contestuali ricostruiti all’apertura; menu app aggiornato all’apertura e nel callback di lingua. Nessun cambio lingua o acceleratori osservato a runtime. |
+| UI02-5 | Scorciatoie dopo il testo, allineate al bordo destro del menu; larghezza, contrasto chiaro/scuro e assenza di scrollbar. | BLOCKED | La colonna è stata spostata dopo il testo e allineata a destra nel layout; nessuna finestra dell’app controllabile nella sessione, quindi il risultato renderizzato non è verificato. |
+| UI02-6 | Focus nei campi di testo, funzionamento delle conferme e navigazione dei menu. | BLOCKED | Le scorciatoie locali restano `GtkShortcutController` con scope Local; azioni e conferme non sono state cambiate. Focus, Escape, clic esterno e conferme non verificati graficamente. |
+
+La sessione grafica non ha esposto app o finestre controllabili. L’ambiente
+riporta Wayland/KDE e anche `GDK_BACKEND=x11`, quindi il backend effettivo di Kito
+resta sconosciuto. Le verifiche grafiche della tabella richiedono una sessione
+controllabile; non sono state dichiarate superate sulla base dei soli test.
+
 ### GUI e performance
 
 La sessione espone `XDG_SESSION_TYPE=wayland`, `WAYLAND_DISPLAY=wayland-0` e

@@ -53,6 +53,7 @@ sort-menu-modified = Modified
 sort-menu-toggle-direction = Reverse sort order
 zoom-out = Zoom out
 zoom-in = Zoom in
+zoom-selector = Icon size
 menu-about = About Kito Files
 menu-preferences = Preferences…
 

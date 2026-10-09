@@ -5,7 +5,7 @@
 //! so dismissing it leaves the main menu open. No timers or pointer grabs are
 //! used.
 
-use crate::{ops, tabs::TabManager};
+use crate::{icons, ops, shortcuts, tabs::TabManager};
 use adw::prelude::*;
 use gtk::{gdk, gio};
 use std::rc::Rc;
@@ -43,26 +43,85 @@ const fn danger_row(
 
 /// Menu on a selected entry (row or cell).
 const ROWS: [Row; 11] = [
-    row(&["document-open"], "menu-open", "open"),
-    row(&["tab-new"], "menu-open-new-tab", "open-in-new-tab"),
     row(
-        &["window-new"],
+        &[
+            "document-open-symbolic",
+            "folder-open-symbolic",
+            "document-open",
+            "folder-open",
+        ],
+        "menu-open",
+        "open",
+    ),
+    row(
+        &[
+            "tab-new-symbolic",
+            "document-open-symbolic",
+            "tab-new",
+            "document-open",
+        ],
+        "menu-open-new-tab",
+        "open-in-new-tab",
+    ),
+    row(
+        &["window-new-symbolic", "window-new"],
         "menu-open-new-window",
         "open-in-new-window",
     ),
-    row(&["bookmark-new", "list-add"], "menu-pin", "pin"),
-    row(&["edit-cut"], "menu-cut", "cut"),
-    row(&["edit-copy"], "menu-copy", "copy"),
-    row(&["edit-paste"], "menu-paste", "paste"),
     row(
-        &["document-edit", "document-edit-symbolic"],
+        &[
+            "bookmark-new-symbolic",
+            "list-add-symbolic",
+            "bookmark-new",
+            "list-add",
+        ],
+        "menu-pin",
+        "pin",
+    ),
+    row(&["edit-cut-symbolic", "edit-cut"], "menu-cut", "cut"),
+    row(&["edit-copy-symbolic", "edit-copy"], "menu-copy", "copy"),
+    row(
+        &["edit-paste-symbolic", "edit-paste"],
+        "menu-paste",
+        "paste",
+    ),
+    row(
+        &[
+            "document-edit-symbolic",
+            "edit-rename-symbolic",
+            "document-edit",
+            "edit-rename",
+        ],
         "menu-rename",
         "rename",
     ),
-    row(&["user-trash"], "menu-trash", "trash"),
-    danger_row(&["edit-delete"], "menu-delete", "delete"),
     row(
-        &["dialog-information", "help-about"],
+        &[
+            "user-trash-symbolic",
+            "user-trash-full-symbolic",
+            "user-trash",
+            "user-trash-full",
+        ],
+        "menu-trash",
+        "trash",
+    ),
+    danger_row(
+        &[
+            "edit-delete-symbolic",
+            "user-trash-symbolic",
+            "edit-delete",
+            "user-trash",
+        ],
+        "menu-delete",
+        "delete",
+    ),
+    row(
+        &[
+            "dialog-information-symbolic",
+            "help-about-symbolic",
+            "dialog-information",
+            "help-about",
+        ],
         "menu-properties",
         "properties",
     ),
@@ -73,12 +132,30 @@ const SEPARATORS_AFTER: [usize; 3] = [2, 6, 9];
 
 /// Menu on an entry inside the trash: restore and delete.
 const TRASH_ROWS: [Row; 5] = [
-    row(&["document-revert", "edit-undo"], "menu-restore", "restore"),
-    row(&["edit-cut"], "menu-cut", "cut"),
-    row(&["edit-copy"], "menu-copy", "copy"),
-    danger_row(&["edit-delete"], "menu-delete", "delete"),
     row(
-        &["dialog-information", "help-about"],
+        &[
+            "document-revert-symbolic",
+            "edit-undo-symbolic",
+            "document-revert",
+            "edit-undo",
+        ],
+        "menu-restore",
+        "restore",
+    ),
+    row(&["edit-cut-symbolic", "edit-cut"], "menu-cut", "cut"),
+    row(&["edit-copy-symbolic", "edit-copy"], "menu-copy", "copy"),
+    danger_row(
+        &["edit-delete-symbolic", "edit-delete"],
+        "menu-delete",
+        "delete",
+    ),
+    row(
+        &[
+            "dialog-information-symbolic",
+            "help-about-symbolic",
+            "dialog-information",
+            "help-about",
+        ],
         "menu-properties",
         "properties",
     ),
@@ -101,29 +178,41 @@ fn menu_box() -> gtk::Box {
 }
 
 /// Menu row: flat button with icon and label.
-fn row_button(r: &Row) -> gtk::Button {
+fn row_button(r: &Row, app: &gtk::Application, shortcut_width: i32) -> gtk::Button {
     let button = gtk::Button::builder().has_frame(false).build();
     button.add_css_class("ctx-row");
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
+    let content = gtk::Grid::builder()
+        .column_spacing(10)
         .margin_start(8)
         .margin_end(8)
         .margin_top(6)
         .margin_bottom(6)
         .build();
-    let image = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(r.icons));
+    let image = gtk::Image::from_gicon(&icons::control_icon(r.icons));
     image.set_pixel_size(18);
-    content.append(&image);
+    content.attach(&image, 0, 0, 1, 1);
+    let label_column = 1;
+    let label = crate::l10n::tr(r.label);
+    button.update_property(&[gtk::accessible::Property::Label(&label)]);
     let text = gtk::Label::builder()
-        .label(crate::l10n::tr(r.label))
+        .label(&label)
         .halign(gtk::Align::Start)
         .hexpand(true)
         .build();
     if r.danger {
         text.add_css_class("error");
     }
-    content.append(&text);
+    content.attach(&text, label_column, 0, 1, 1);
+    if shortcut_width > 0 {
+        let action = format!("win.{}", r.action);
+        content.attach(
+            &shortcuts::shortcut_cell(app, Some(&action), shortcut_width),
+            2,
+            0,
+            1,
+            1,
+        );
+    }
     button.set_child(Some(&content));
     button
 }
@@ -140,9 +229,17 @@ fn build(
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
     popover.add_css_class("ctx-menu");
+    let app = window
+        .application()
+        .expect("context menu window belongs to a GTK application");
+    let actions = rows
+        .iter()
+        .map(|row| format!("win.{}", row.action))
+        .collect::<Vec<_>>();
+    let shortcut_width = shortcuts::shortcut_column_width(&app, &actions);
     let list = menu_box();
     for (i, r) in rows.iter().enumerate() {
-        let button = row_button(r);
+        let button = row_button(r, &app, shortcut_width);
         if matches!(r.action, "rename" | "properties") && selected_count != 1 {
             button.set_sensitive(false);
         }
@@ -191,14 +288,15 @@ fn popup(anchor: &gtk::Widget, x: f64, y: f64, options: PopupOptions<'_>) {
     );
     popover.connect_closed(|popover| popover.unparent());
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    popover.set_position(side_for(anchor, x));
+    let (_, natural_width, _, _) = popover.measure(gtk::Orientation::Horizontal, -1);
+    popover.set_position(side_for(anchor, x, natural_width));
     popover.popup();
 }
 
 /// Right of the click if the screen has room, otherwise left.
-fn side_for(anchor: &gtk::Widget, x: f64) -> gtk::PositionType {
-    /// Width of the main menu.
-    const NEEDED: f32 = 240.0;
+fn side_for(anchor: &gtk::Widget, x: f64, natural_width: i32) -> gtk::PositionType {
+    /// Previous minimum menu width, retained for rows without accelerator cells.
+    const MINIMUM_WIDTH: f32 = 240.0;
     let Some(root) = anchor.root() else {
         return gtk::PositionType::Right;
     };
@@ -207,7 +305,8 @@ fn side_for(anchor: &gtk::Widget, x: f64) -> gtk::PositionType {
         .map(|rect| rect.x() + x as f32)
         .unwrap_or(x as f32);
     let free = root.width() as f32 - x_root;
-    if free < NEEDED && x_root > free {
+    let needed = (natural_width as f32).max(MINIMUM_WIDTH);
+    if free < needed && x_root > free {
         gtk::PositionType::Left
     } else {
         gtk::PositionType::Right
@@ -317,19 +416,29 @@ pub(crate) struct BgRow {
 /// New-file entries: placeholders only, hence no Word/Spreadsheet rows.
 const BG_NEW_FILE_ROWS: [BgRow; 3] = [
     BgRow {
-        icons: &["document-new"],
+        icons: &["document-new-symbolic", "document-new"],
         label: "menu-new-empty-file",
         action: "bg.new-empty-file",
         sub: None,
     },
     BgRow {
-        icons: &["text-x-generic"],
+        icons: &[
+            "text-x-generic-symbolic",
+            "text-plain-symbolic",
+            "text-x-generic",
+            "text-plain",
+        ],
         label: "menu-new-text-file",
         action: "bg.new-text-file",
         sub: None,
     },
     BgRow {
-        icons: &["text-html"],
+        icons: &[
+            "text-html-symbolic",
+            "text-x-generic-symbolic",
+            "text-html",
+            "text-x-generic",
+        ],
         label: "menu-new-html",
         action: "bg.new-html-page",
         sub: None,
@@ -338,13 +447,23 @@ const BG_NEW_FILE_ROWS: [BgRow; 3] = [
 
 const BG_CREATE_ROWS: [BgRow; 2] = [
     BgRow {
-        icons: &["folder-new", "folder-new-symbolic"],
+        icons: &[
+            "folder-new-symbolic",
+            "folder-symbolic",
+            "folder-new",
+            "folder",
+        ],
         label: "bg-new-folder",
         action: "bg.new-folder",
         sub: None,
     },
     BgRow {
-        icons: &["document-new", "document-new-symbolic"],
+        icons: &[
+            "document-new-symbolic",
+            "document-symbolic",
+            "document-new",
+            "document",
+        ],
         label: "bg-new-file",
         action: "bg.can-create-file",
         sub: Some(&BG_NEW_FILE_ROWS),
@@ -352,7 +471,7 @@ const BG_CREATE_ROWS: [BgRow; 2] = [
 ];
 
 const BG_PASTE_ROWS: [BgRow; 1] = [BgRow {
-    icons: &["edit-paste"],
+    icons: &["edit-paste-symbolic", "edit-paste"],
     label: "menu-paste",
     action: "bg.paste",
     sub: None,
@@ -362,32 +481,44 @@ const BG_SORT_ROWS: [BgRow; 5] = [
     BgRow {
         icons: &[
             "format-text-direction-ltr-symbolic",
+            "view-sort-ascending-symbolic",
             "format-text-direction-ltr",
+            "view-sort-ascending",
         ],
         label: "sort-menu-name",
         action: "win.sort-name",
         sub: None,
     },
     BgRow {
-        icons: &["view-sort-descending-symbolic"],
+        icons: &["view-sort-descending-symbolic", "view-sort-descending"],
         label: "sort-menu-size",
         action: "win.sort-size",
         sub: None,
     },
     BgRow {
-        icons: &["application-x-executable", "application-x-generic"],
+        icons: &[
+            "application-x-executable-symbolic",
+            "application-x-generic-symbolic",
+            "application-x-executable",
+            "application-x-generic",
+        ],
         label: "sort-menu-type",
         action: "win.sort-type",
         sub: None,
     },
     BgRow {
-        icons: &["document-properties", "document-edit"],
+        icons: &[
+            "document-properties-symbolic",
+            "document-edit-symbolic",
+            "document-properties",
+            "document-edit",
+        ],
         label: "sort-menu-modified",
         action: "win.sort-modified",
         sub: None,
     },
     BgRow {
-        icons: &["view-sort-descending-symbolic"],
+        icons: &["view-sort-descending-symbolic", "view-sort-descending"],
         label: "sort-menu-toggle-direction",
         action: "win.sort-direction",
         sub: None,
@@ -395,7 +526,7 @@ const BG_SORT_ROWS: [BgRow; 5] = [
 ];
 
 const BG_SORT_SECTION: [BgRow; 1] = [BgRow {
-    icons: &["view-sort-ascending-symbolic"],
+    icons: &["view-sort-ascending-symbolic", "view-sort-ascending"],
     label: "sort-selector",
     action: "",
     sub: Some(&BG_SORT_ROWS),
@@ -403,13 +534,23 @@ const BG_SORT_SECTION: [BgRow; 1] = [BgRow {
 
 const BG_TERM_ROWS: [BgRow; 2] = [
     BgRow {
-        icons: &["utilities-terminal", "terminal"],
+        icons: &[
+            "utilities-terminal-symbolic",
+            "terminal-symbolic",
+            "utilities-terminal",
+            "terminal",
+        ],
         label: "menu-open-terminal",
         action: "bg.open-terminal",
         sub: None,
     },
     BgRow {
-        icons: &["utilities-terminal", "terminal"],
+        icons: &[
+            "utilities-terminal-symbolic",
+            "terminal-symbolic",
+            "utilities-terminal",
+            "terminal",
+        ],
         label: "menu-open-terminal-root",
         action: "bg.open-terminal-root",
         sub: None,
@@ -417,7 +558,12 @@ const BG_TERM_ROWS: [BgRow; 2] = [
 ];
 
 const BG_PROPS_ROWS: [BgRow; 1] = [BgRow {
-    icons: &["dialog-information", "help-about"],
+    icons: &[
+        "dialog-information-symbolic",
+        "help-about-symbolic",
+        "dialog-information",
+        "help-about",
+    ],
     label: "bg-folder-properties",
     action: "bg.folder-properties",
     sub: None,
@@ -425,19 +571,19 @@ const BG_PROPS_ROWS: [BgRow; 1] = [BgRow {
 
 const BG_SELECTION_ROWS: [BgRow; 3] = [
     BgRow {
-        icons: &["edit-select-all"],
+        icons: &["edit-select-all-symbolic", "edit-select-all"],
         label: "menu-select-all",
         action: "win.select-all",
         sub: None,
     },
     BgRow {
-        icons: &["edit-select-all"],
+        icons: &["edit-select-all-symbolic", "edit-select-all"],
         label: "menu-invert-selection",
         action: "win.invert-selection",
         sub: None,
     },
     BgRow {
-        icons: &["edit-clear"],
+        icons: &["edit-clear-symbolic", "edit-clear"],
         label: "menu-deselect-all",
         action: "win.deselect-all",
         sub: None,
@@ -445,7 +591,12 @@ const BG_SELECTION_ROWS: [BgRow; 3] = [
 ];
 
 const BG_TRASH_ROWS: [BgRow; 1] = [BgRow {
-    icons: &["user-trash-full", "user-trash"],
+    icons: &[
+        "user-trash-full-symbolic",
+        "user-trash-symbolic",
+        "user-trash-full",
+        "user-trash",
+    ],
     label: "menu-empty-trash",
     action: "win.empty-trash",
     sub: None,
@@ -605,28 +756,88 @@ fn vertical_side(anchor: &gtk::Widget, y: f64, natural_h: i32) -> gtk::PositionT
     }
 }
 
-fn bg_row_content(row: &BgRow, submenu: bool) -> gtk::Box {
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
+fn background_shortcut_action(
+    action: &str,
+    menu_dest: &str,
+    current_dest: Option<&str>,
+) -> Option<&'static str> {
+    if current_dest != Some(menu_dest) {
+        return None;
+    }
+    match action {
+        // These custom actions capture the background folder, while their
+        // window actions use the active tab. They are equivalent only while
+        // the captured and active folders are still the same.
+        "bg.new-folder" => Some("win.new-folder"),
+        "bg.paste" => Some("win.paste"),
+        // Ctrl+A is local to the file view and selects the same listing.
+        "win.select-all" => Some("win.select-all"),
+        _ => None,
+    }
+}
+
+fn background_shortcut_actions(
+    sections: &[&[BgRow]],
+    menu_dest: &str,
+    current_dest: Option<&str>,
+) -> Vec<String> {
+    sections
+        .iter()
+        .flat_map(|section| section.iter())
+        .flat_map(|row| std::iter::once(row).chain(row.sub.into_iter().flatten()))
+        .filter_map(|row| background_shortcut_action(row.action, menu_dest, current_dest))
+        .map(str::to_string)
+        .collect()
+}
+
+struct BackgroundShortcutLayout<'a> {
+    app: &'a gtk::Application,
+    width: i32,
+    menu_dest: &'a str,
+    current_dest: Option<&'a str>,
+}
+
+fn bg_row_content(
+    row: &BgRow,
+    submenu: bool,
+    shortcuts: &BackgroundShortcutLayout<'_>,
+) -> gtk::Grid {
+    let content = gtk::Grid::builder()
+        .column_spacing(10)
         .margin_start(8)
         .margin_end(8)
         .margin_top(6)
         .margin_bottom(6)
         .build();
-    let image = gtk::Image::from_gicon(&gio::ThemedIcon::from_names(row.icons));
+    let image = gtk::Image::from_gicon(&icons::control_icon(row.icons));
     image.set_pixel_size(18);
-    content.append(&image);
+    content.attach(&image, 0, 0, 1, 1);
+    let label_column = 1;
+    let label = crate::l10n::tr(row.label);
     let text = gtk::Label::builder()
-        .label(crate::l10n::tr(row.label))
+        .label(&label)
         .halign(gtk::Align::Start)
         .hexpand(true)
         .build();
-    content.append(&text);
+    content.attach(&text, label_column, 0, 1, 1);
+    let shortcut_column = if shortcuts.width > 0 {
+        let shortcut_action =
+            background_shortcut_action(row.action, shortcuts.menu_dest, shortcuts.current_dest);
+        content.attach(
+            &shortcuts::shortcut_cell(shortcuts.app, shortcut_action, shortcuts.width),
+            2,
+            0,
+            1,
+            1,
+        );
+        3
+    } else {
+        2
+    };
     if submenu {
-        let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
+        let arrow = gtk::Image::from_gicon(&icons::control_icon(&["pan-end-symbolic", "pan-end"]));
         arrow.add_css_class("dim-label");
-        content.append(&arrow);
+        content.attach(&arrow, shortcut_column, 0, 1, 1);
     }
     content
 }
@@ -638,13 +849,16 @@ fn append_bg_widget(
     create_file_action: &gio::SimpleAction,
     manager: &Rc<TabManager>,
     window: &adw::ApplicationWindow,
+    shortcuts: &BackgroundShortcutLayout<'_>,
 ) {
     if let Some(children) = row.sub {
         let button = gtk::MenuButton::new();
         button.set_has_frame(false);
         button.set_hexpand(true);
         button.add_css_class("ctx-row");
-        button.set_child(Some(&bg_row_content(row, true)));
+        let label = crate::l10n::tr(row.label);
+        button.update_property(&[gtk::accessible::Property::Label(&label)]);
+        button.set_child(Some(&bg_row_content(row, true, shortcuts)));
         if row.action == "bg.can-create-file" {
             button.set_sensitive(create_file_action.is_enabled());
             let weak_button = button.downgrade();
@@ -661,11 +875,25 @@ fn append_bg_widget(
         submenu.add_css_class("ctx-menu");
         submenu.set_position(gtk::PositionType::Right);
         let submenu_list = menu_box();
+        let child_sections = [children];
+        let child_actions = background_shortcut_actions(
+            &child_sections,
+            shortcuts.menu_dest,
+            shortcuts.current_dest,
+        );
+        let child_shortcuts = BackgroundShortcutLayout {
+            app: shortcuts.app,
+            width: shortcuts::shortcut_column_width(shortcuts.app, &child_actions),
+            menu_dest: shortcuts.menu_dest,
+            current_dest: shortcuts.current_dest,
+        };
         for child in children {
             let child_button = gtk::Button::builder().has_frame(false).build();
             child_button.add_css_class("ctx-row");
             child_button.set_hexpand(true);
-            child_button.set_child(Some(&bg_row_content(child, false)));
+            let label = crate::l10n::tr(child.label);
+            child_button.update_property(&[gtk::accessible::Property::Label(&label)]);
+            child_button.set_child(Some(&bg_row_content(child, false, &child_shortcuts)));
             let local_action = child
                 .action
                 .strip_prefix("bg.")
@@ -715,7 +943,9 @@ fn append_bg_widget(
         let button = gtk::Button::builder().has_frame(false).build();
         button.add_css_class("ctx-row");
         button.set_hexpand(true);
-        button.set_child(Some(&bg_row_content(row, false)));
+        let label = crate::l10n::tr(row.label);
+        button.update_property(&[gtk::accessible::Property::Label(&label)]);
+        button.set_child(Some(&bg_row_content(row, false, shortcuts)));
         if row.action.starts_with("bg.") {
             button.set_action_name(Some(row.action));
         } else {
@@ -738,19 +968,44 @@ fn append_bg_widget(
 /// Builds the same compact, icon-row layout as the file menu. The main
 /// popover contains no scrolled window. The child popover has separate icon
 /// rows and can be dismissed independently with Escape or an outside click.
-fn popup_bg(
-    anchor: &gtk::Widget,
+struct BackgroundPopupOptions<'a> {
+    anchor: &'a gtk::Widget,
     x: f64,
     y: f64,
-    sections: &[&[BgRow]],
-    group: &gio::SimpleActionGroup,
-    manager: &Rc<TabManager>,
-    window: &adw::ApplicationWindow,
-) -> gtk::Popover {
+    sections: &'a [&'a [BgRow]],
+    group: &'a gio::SimpleActionGroup,
+    manager: &'a Rc<TabManager>,
+    window: &'a adw::ApplicationWindow,
+    menu_dest: &'a str,
+    current_dest: Option<&'a str>,
+}
+
+fn popup_bg(options: BackgroundPopupOptions<'_>) -> gtk::Popover {
+    let BackgroundPopupOptions {
+        anchor,
+        x,
+        y,
+        sections,
+        group,
+        manager,
+        window,
+        menu_dest,
+        current_dest,
+    } = options;
     let menu = gtk::Popover::new();
     menu.set_has_arrow(false);
     menu.add_css_class("ctx-menu");
     menu.insert_action_group("bg", Some(group));
+    let app = window
+        .application()
+        .expect("background menu window belongs to a GTK application");
+    let actions = background_shortcut_actions(sections, menu_dest, current_dest);
+    let shortcut_layout = BackgroundShortcutLayout {
+        app: &app,
+        width: shortcuts::shortcut_column_width(&app, &actions),
+        menu_dest,
+        current_dest,
+    };
     let list = menu_box();
     let create_file_action = group
         .lookup_action("can-create-file")
@@ -761,7 +1016,15 @@ fn popup_bg(
             list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         }
         for row in *section {
-            append_bg_widget(&list, row, group, &create_file_action, manager, window);
+            append_bg_widget(
+                &list,
+                row,
+                group,
+                &create_file_action,
+                manager,
+                window,
+                &shortcut_layout,
+            );
         }
     }
     menu.set_child(Some(&list));
@@ -887,7 +1150,18 @@ pub fn show_background_for(
         ops::Ctx::show_folder_properties,
     );
     let sections = bg_sections(local);
-    let popover = popup_bg(anchor, x, y, &sections, &group, manager, &ctx.window);
+    let current_dest = manager.selected_uri();
+    let popover = popup_bg(BackgroundPopupOptions {
+        anchor,
+        x,
+        y,
+        sections: &sections,
+        group: &group,
+        manager,
+        window: &ctx.window,
+        menu_dest: dest,
+        current_dest: current_dest.as_deref(),
+    });
     refine_writability(
         dest,
         manager,
@@ -925,7 +1199,17 @@ pub fn show_trash_background_for(
     let sections = [&BG_TRASH_ROWS[..]];
     let group = gio::SimpleActionGroup::new();
     group.add_action(&gio::SimpleAction::new("can-create-file", None));
-    popup_bg(anchor, x, y, &sections, &group, manager, &ctx.window);
+    popup_bg(BackgroundPopupOptions {
+        anchor,
+        x,
+        y,
+        sections: &sections,
+        group: &group,
+        manager,
+        window: &ctx.window,
+        menu_dest: kito_core::TRASH_URI,
+        current_dest: None,
+    });
 }
 
 #[cfg(test)]
@@ -936,6 +1220,66 @@ mod tests {
     /// action used only to control its sensitivity.
     fn section_actions(section: &[BgRow]) -> Vec<&str> {
         section.iter().map(|row| row.action).collect()
+    }
+
+    fn assert_symbolic_candidates_precede_regular_icons(icons: &[&str]) {
+        let last_symbolic = icons
+            .iter()
+            .rposition(|name| name.ends_with("-symbolic"))
+            .expect("menu icons include a symbolic candidate");
+        let first_regular = icons
+            .iter()
+            .position(|name| !name.ends_with("-symbolic"))
+            .expect("menu icons keep a regular theme fallback");
+        assert!(last_symbolic < first_regular, "{icons:?}");
+    }
+
+    #[test]
+    fn menu_icons_try_symbolic_names_before_regular_fallbacks() {
+        for row in ROWS.iter().chain(TRASH_ROWS.iter()) {
+            assert_symbolic_candidates_precede_regular_icons(row.icons);
+        }
+        for section in bg_sections(true) {
+            for row in section {
+                assert_symbolic_candidates_precede_regular_icons(row.icons);
+                if let Some(children) = row.sub {
+                    for child in children {
+                        assert_symbolic_candidates_precede_regular_icons(child.icons);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn background_shortcuts_only_match_the_active_captured_folder_action() {
+        let destination = "file:///tmp/work";
+        assert_eq!(
+            background_shortcut_action("bg.new-folder", destination, Some(destination)),
+            Some("win.new-folder")
+        );
+        assert_eq!(
+            background_shortcut_action("bg.paste", destination, Some(destination)),
+            Some("win.paste")
+        );
+        assert_eq!(
+            background_shortcut_action("win.select-all", destination, Some(destination)),
+            Some("win.select-all")
+        );
+        assert_eq!(
+            background_shortcut_action("bg.paste", destination, Some("file:///tmp/other")),
+            None
+        );
+        assert_eq!(
+            background_shortcut_action("bg.new-text-file", destination, Some(destination)),
+            None
+        );
+        // A selection action never leaks a file-action shortcut onto a
+        // background-folder row merely because the same keyboard is present.
+        assert_eq!(
+            background_shortcut_action("win.copy", destination, Some(destination)),
+            None
+        );
     }
 
     #[test]
@@ -1005,7 +1349,11 @@ mod tests {
         );
         assert_eq!(
             sub.iter().map(|row| row.icons[0]).collect::<Vec<_>>(),
-            vec!["document-new", "text-x-generic", "text-html"]
+            vec![
+                "document-new-symbolic",
+                "text-x-generic-symbolic",
+                "text-html-symbolic"
+            ]
         );
         // No Word/Spreadsheet placeholders anywhere, submenu included.
         for section in bg_sections(true) {

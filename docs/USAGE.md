@@ -72,9 +72,10 @@ the selected count.
   and names use natural numeric order
 - In Details, toggle Size, Type and Modified columns; Name is always present and
   column headers also change the sort
-- Icon zoom is controlled by the header-bar controls and persists globally. Use
-  `Ctrl++` / `Ctrl+-` to change it and `Ctrl+0` to reset; visible columns are also
-  saved globally. Sort order remains attached to each tab
+- Icon zoom is controlled by the compact slider at the bottom right, with small
+  zoom-out / zoom-in buttons, and persists globally. Use `Ctrl++` / `Ctrl+-` to
+  change it and `Ctrl+0` to reset; visible columns are also saved globally. Sort
+  order remains attached to each tab
 - Changing view or sort keeps the selection by URI and retains the visible item
   when it still exists
 

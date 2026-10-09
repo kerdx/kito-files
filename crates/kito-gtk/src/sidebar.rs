@@ -1,7 +1,10 @@
 //! Places sidebar: Places (XDG + bookmarks) + Devices (volumes) + Network.
 //! UI labels use the app catalogs; names returned by GIO remain system data.
 
-use crate::dnd::{self, DropHandler};
+use crate::{
+    dnd::{self, DropHandler},
+    icons,
+};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::{cell::RefCell, rc::Rc};
@@ -9,6 +12,27 @@ use std::{cell::RefCell, rc::Rc};
 type LoadFn = Rc<dyn Fn(&str)>;
 /// Sidebar rows for highlighting the current folder.
 type Rows = Rc<RefCell<Vec<(String, gtk::Button)>>>;
+
+const PLACES: [(&str, &str, glib::UserDirectory); 6] = [
+    ("user-desktop", "side-desktop", glib::UserDirectory::Desktop),
+    (
+        "folder-documents",
+        "side-documents",
+        glib::UserDirectory::Documents,
+    ),
+    (
+        "folder-download",
+        "side-downloads",
+        glib::UserDirectory::Downloads,
+    ),
+    ("folder-music", "side-music", glib::UserDirectory::Music),
+    (
+        "folder-pictures",
+        "side-pictures",
+        glib::UserDirectory::Pictures,
+    ),
+    ("folder-videos", "side-videos", glib::UserDirectory::Videos),
+];
 
 /// Normalized URI: comparison without trailing slashes (`file:///` included).
 fn normalize(uri: &str) -> String {
@@ -42,10 +66,8 @@ fn nav_row(
         .margin_bottom(4)
         .build();
     row.append(&{
-        // 22px: at this size Papirus/Breeze have color icons,
-        // at 16px they are monochrome.
         let image = gtk::Image::from_gicon(icon);
-        image.set_pixel_size(22);
+        image.set_pixel_size(20);
         image
     });
     row.append(
@@ -91,13 +113,7 @@ fn row_label(button: &gtk::Button) -> Option<gtk::Label> {
 /// Bookmark row with right-click to remove it. The sidebar reloads
 /// on its own via monitor on the file (see `build_sidebar`).
 fn bookmark_row(name: &str, uri: &str, load: LoadFn, on_drop: &DropHandler) -> gtk::Button {
-    let button = nav_row(
-        &gio::ThemedIcon::new("user-bookmarks"),
-        name,
-        load,
-        uri.to_string(),
-        on_drop,
-    );
+    let button = nav_row(&bookmark_icon(uri), name, load, uri.to_string(), on_drop);
     let gesture = gtk::GestureClick::builder()
         .button(gtk::gdk::BUTTON_SECONDARY)
         .build();
@@ -131,7 +147,26 @@ fn bookmark_row(name: &str, uri: &str, load: LoadFn, on_drop: &DropHandler) -> g
 }
 
 fn place_icon(primary: &str) -> gio::ThemedIcon {
-    gio::ThemedIcon::from_names(&[primary, "folder"])
+    let symbolic = format!("{primary}-symbolic");
+    icons::control_icon(&[&symbolic, "folder-symbolic", primary, "folder"])
+}
+
+fn bookmark_icon(uri: &str) -> gio::ThemedIcon {
+    let generic_folder = || icons::control_icon(&["folder-symbolic", "folder"]);
+    let Some(path) = gio::File::for_uri(uri).path() else {
+        return generic_folder();
+    };
+    if path == glib::home_dir() {
+        return place_icon("user-home");
+    }
+    for (icon_name, _, directory) in PLACES {
+        if glib::user_special_dir(directory)
+            .is_some_and(|special| special.as_path() == path.as_path())
+        {
+            return place_icon(icon_name);
+        }
+    }
+    generic_folder()
 }
 
 /// Localized folder name from GIO (e.g. "Documents" on an Italian
@@ -167,30 +202,6 @@ fn xdg_places(
         );
         add_row(parent, rows, &home_uri, &button);
     }
-    const PLACES: [(&str, &str, glib::UserDirectory); 6] = [
-        (
-            "folder-desktop",
-            "side-desktop",
-            glib::UserDirectory::Desktop,
-        ),
-        (
-            "folder-documents",
-            "side-documents",
-            glib::UserDirectory::Documents,
-        ),
-        (
-            "folder-download",
-            "side-downloads",
-            glib::UserDirectory::Downloads,
-        ),
-        ("folder-music", "side-music", glib::UserDirectory::Music),
-        (
-            "folder-pictures",
-            "side-pictures",
-            glib::UserDirectory::Pictures,
-        ),
-        ("folder-videos", "side-videos", glib::UserDirectory::Videos),
-    ];
     for (icon_name, label_id, dir) in PLACES {
         let Some(path) = glib::user_special_dir(dir) else {
             continue;
@@ -221,13 +232,22 @@ fn xdg_places(
 
 /// Trash row in Places: opens `trash:///` and has the "Empty Trash…"
 /// menu on right-click (activates `win.empty-trash`, which asks first).
-/// Trash icon: `user-trash-full` if there is something inside, otherwise
-/// the empty variant. Papirus has both.
+/// Symbolic trash icon, with the current theme resolving fallbacks.
 fn trash_icon(full: bool) -> gio::ThemedIcon {
     if full {
-        gio::ThemedIcon::new("user-trash-full")
+        icons::control_icon(&[
+            "user-trash-full-symbolic",
+            "user-trash-symbolic",
+            "user-trash-full",
+            "user-trash",
+        ])
     } else {
-        gio::ThemedIcon::new("user-trash")
+        icons::control_icon(&[
+            "user-trash-symbolic",
+            "user-trash-full-symbolic",
+            "user-trash",
+            "user-trash-full",
+        ])
     }
 }
 
@@ -445,7 +465,10 @@ fn volume_row(
         .margin_top(4)
         .margin_bottom(4)
         .build();
-    row.append(&gtk::Image::from_gicon(&volume.icon()));
+    let volume_icon = icons::device_icon(&volume.icon());
+    let volume_image = gtk::Image::from_gicon(&volume_icon);
+    volume_image.set_pixel_size(20);
+    row.append(&volume_image);
     row.append(
         &gtk::Label::builder()
             .label(volume.name())
@@ -638,7 +661,12 @@ pub fn build_sidebar(
 
     let network_title = section_header(&crate::l10n::tr("side-network"));
     outer.append(&network_title);
-    let network = gio::ThemedIcon::new("network-workgroup");
+    let network = icons::control_icon(&[
+        "network-computer-symbolic",
+        "network-workgroup-symbolic",
+        "network-computer",
+        "network-workgroup",
+    ]);
     let network_row = nav_row(
         &network,
         &crate::l10n::tr("side-browse-network"),
@@ -664,9 +692,12 @@ pub fn build_sidebar(
             // No volumes: the root filesystem is reachable anyway.
             if devices.first_child().is_none() {
                 devices.append(&nav_row(
-                    &gio::ThemedIcon::from_names(&[
+                    &icons::control_icon(&[
+                        "drive-harddisk-root-symbolic",
+                        "drive-harddisk-symbolic",
                         "drive-harddisk-root",
                         "drive-harddisk",
+                        "folder-symbolic",
                         "folder",
                     ]),
                     &crate::l10n::tr("side-filesystem"),
@@ -709,6 +740,69 @@ pub fn build_sidebar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn icon_names(icon: gio::ThemedIcon) -> Vec<String> {
+        icon.names()
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn place_icons_prefer_specific_symbols_then_folder_fallbacks() {
+        assert_eq!(
+            icon_names(place_icon("folder-download")),
+            [
+                "folder-download-symbolic",
+                "folder-symbolic",
+                "folder-download",
+                "folder"
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            icon_names(place_icon("user-home")),
+            [
+                "user-home-symbolic",
+                "folder-symbolic",
+                "user-home",
+                "folder"
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn trash_icons_keep_empty_and_full_states_symbolic() {
+        assert_eq!(
+            icon_names(trash_icon(false)),
+            [
+                "user-trash-symbolic",
+                "user-trash-full-symbolic",
+                "user-trash",
+                "user-trash-full"
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            icon_names(trash_icon(true)),
+            [
+                "user-trash-full-symbolic",
+                "user-trash-symbolic",
+                "user-trash-full",
+                "user-trash"
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn unknown_bookmarks_use_a_symbolic_folder_icon() {
+        assert_eq!(
+            icon_names(bookmark_icon("smb://example.invalid/share")),
+            ["folder-symbolic", "folder"].map(str::to_string)
+        );
+    }
 
     #[test]
     fn initial_empty_and_full() {

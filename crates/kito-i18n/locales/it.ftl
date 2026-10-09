@@ -53,6 +53,7 @@ sort-menu-modified = Modificata
 sort-menu-toggle-direction = Inverti ordinamento
 zoom-out = Riduci icone
 zoom-in = Ingrandisci icone
+zoom-selector = Dimensione icone
 menu-about = Informazioni su Kito Files
 menu-preferences = Preferenze…
 
