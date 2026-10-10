@@ -4,7 +4,7 @@
 //! shell runs inside the terminal (`sudo -s`): `pkexec` would sanitize
 //! the environment and the terminal would not reach the Wayland display.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
 
@@ -57,7 +57,7 @@ fn joined(key: &str, dir: &Path) -> OsString {
     arg
 }
 
-const TERMINALS: [Terminal; 10] = [
+const TERMINALS: [Terminal; 11] = [
     Terminal {
         prog: "konsole",
         cwd: |d| vec![OsString::from("--workdir"), d.as_os_str().to_owned()],
@@ -76,6 +76,24 @@ const TERMINALS: [Terminal; 10] = [
         cwd: |d| vec![joined("--working-directory=", d)],
         root: Some(|d| {
             vec![
+                joined("--working-directory=", d),
+                OsString::from("--"),
+                OsString::from("sudo"),
+                OsString::from("-s"),
+            ]
+        }),
+    },
+    Terminal {
+        prog: "ptyxis",
+        cwd: |d| {
+            vec![
+                OsString::from("--new-window"),
+                joined("--working-directory=", d),
+            ]
+        },
+        root: Some(|d| {
+            vec![
+                OsString::from("--new-window"),
                 joined("--working-directory=", d),
                 OsString::from("--"),
                 OsString::from("sudo"),
@@ -180,11 +198,16 @@ const TERMINALS: [Terminal; 10] = [
 
 /// `true` if `prog` is an executable in PATH.
 fn which(prog: &str) -> bool {
-    let Ok(path) = std::env::var("PATH") else {
+    let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    path.split(':').any(|dir| {
-        let candidate = std::path::Path::new(dir).join(prog);
+    which_in_path(prog, &path)
+}
+
+/// Inspect the actual process PATH without requiring its directories to be UTF-8.
+fn which_in_path(prog: &str, path: &OsStr) -> bool {
+    std::env::split_paths(path).any(|dir| {
+        let candidate = dir.join(prog);
         use std::os::unix::fs::PermissionsExt as _;
         candidate
             .metadata()
@@ -206,6 +229,7 @@ pub fn display_name(program: &str) -> String {
     let pretty = match program {
         "konsole" => "Konsole",
         "gnome-terminal" => "GNOME Terminal",
+        "ptyxis" => "Ptyxis",
         "kgx" => "GNOME Console",
         "xfce4-terminal" => "Xfce Terminal",
         "tilix" => "Tilix",
@@ -411,6 +435,65 @@ mod tests {
                 OsString::from("-s"),
             ]
         );
+    }
+
+    #[test]
+    fn ptyxis_is_selectable_for_normal_and_root_launches() {
+        let dir = Path::new(OsStr::from_bytes(b"/tmp/My \xff Folder"));
+        let choice = TerminalChoice::Emulator("ptyxis".to_string());
+        let available = available_of(&["ptyxis"]);
+        for root in [false, true] {
+            let (prog, args) = select_command(dir, root, &TERMINALS, |p| p == "ptyxis").unwrap();
+            assert_eq!(prog, "ptyxis");
+            let mut expected = vec![
+                OsString::from("--new-window"),
+                joined("--working-directory=", dir),
+            ];
+            if root {
+                expected.extend(["--", "sudo", "-s"].map(OsString::from));
+            }
+            assert_eq!(args, expected);
+            let (preferred, preferred_args) =
+                select_preferred_command(dir, root, &choice, &TERMINALS, |p| p == "ptyxis")
+                    .unwrap();
+            assert_eq!(preferred, prog);
+            assert_eq!(preferred_args, args);
+            assert!(can_open(root, &TerminalChoice::Automatic, &available));
+            assert!(can_open(root, &choice, &available));
+        }
+        assert_eq!(display_name("ptyxis"), "Ptyxis (ptyxis)");
+    }
+
+    #[test]
+    fn path_detection_preserves_non_utf8_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join(OsStr::from_bytes(b"bin-\xff"));
+        std::fs::create_dir(&bin).unwrap();
+        let program = bin.join("ptyxis");
+        std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([tmp.path().join("missing"), bin]).unwrap();
+        assert!(which_in_path("ptyxis", &path));
+        assert!(!which_in_path("missing-terminal", &path));
+    }
+
+    #[test]
+    fn path_detection_requires_executable_files_and_follows_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program = tmp.path().join("ptyxis");
+        std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!which_in_path("ptyxis", tmp.path().as_os_str()));
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(which_in_path("ptyxis", tmp.path().as_os_str()));
+        symlink(&program, tmp.path().join("terminal-link")).unwrap();
+        assert!(which_in_path("terminal-link", tmp.path().as_os_str()));
+        std::fs::create_dir(tmp.path().join("terminal-directory")).unwrap();
+        assert!(!which_in_path("terminal-directory", tmp.path().as_os_str()));
     }
 
     #[test]
