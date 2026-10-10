@@ -94,6 +94,19 @@ side-music = Music
 side-pictures = Pictures
 side-videos = Videos
 side-filesystem = File System
+side-hide-in-kito = Hide in Kito
+side-restore-hidden = Restore Hidden Items
+side-custom = Custom Locations
+side-settings-error = Could not save sidebar settings: { $error }
+side-location-error = Could not add location: { $error }
+
+prefs-sidebar = Sidebar
+prefs-sidebar-custom-locations = Kito-only locations
+prefs-sidebar-add-location = Add Folder/Location…
+prefs-sidebar-remove = Remove
+prefs-sidebar-remove-accessible = Remove { $location } from Kito
+prefs-sidebar-hidden = Hidden sidebar items
+prefs-sidebar-hidden-note = Hide individual items from their context menu. Restoring makes all hidden items visible again.
 
 ## File list
 column-name = Name
@@ -114,6 +127,7 @@ status-selected =
 error-open-folder = Could not open folder
 error-invalid-path = Enter a local path or URI to open.
 empty-folder = This folder is empty
+empty-folder-description = Add files to this folder, or choose another location.
 loading-folder = Loading…
 loading-interrupt = Stop
 monitor-unavailable = Live updates are unavailable for this location. Press F5 to refresh.

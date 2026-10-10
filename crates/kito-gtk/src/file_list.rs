@@ -382,8 +382,16 @@ fn name_factory(
 }
 
 /// Label-only column (Size, Type in details).
+#[derive(Clone, Copy)]
+struct TextCellStyle {
+    xalign: f32,
+    dim: bool,
+    tabular: bool,
+}
+
 fn text_factory(
     get: fn(&FileObject) -> String,
+    style: TextCellStyle,
     on_secondary: &SecondaryHandler,
     on_middle: &MiddleHandler,
     on_drag_prepare: &DragPrepareHandler,
@@ -391,16 +399,27 @@ fn text_factory(
     on_external_move: &dnd::ExternalMoveHandler,
 ) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, list_item| {
+    factory.connect_setup(move |_, list_item| {
         let label = gtk::Label::builder()
             // Fills the cell (so the menu also arrives by clicking the
             // space right of the text), text still on the left.
-            .xalign(0.0)
+            .xalign(style.xalign)
+            .hexpand(true)
             .margin_start(8)
             .margin_end(8)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         label.add_css_class("file-item");
+        if style.dim {
+            // GTK's standard subdued-label styling remains theme-aware and
+            // keeps the selected-row foreground under the theme's control.
+            label.add_css_class("dim-label");
+        }
+        if style.tabular {
+            let attributes = gtk::pango::AttrList::new();
+            attributes.insert(gtk::pango::AttrFontFeatures::new("tnum"));
+            label.set_attributes(Some(&attributes));
+        }
         list_item
             .downcast_ref::<gtk::ListItem>()
             .unwrap()
@@ -480,6 +499,11 @@ fn build_details(
         Some(&crate::l10n::tr("props-size")),
         Some(text_factory(
             |o| human_size(o.size()),
+            TextCellStyle {
+                xalign: 1.0,
+                dim: false,
+                tabular: true,
+            },
             handlers.on_secondary,
             handlers.on_middle,
             handlers.on_drag_prepare,
@@ -495,6 +519,11 @@ fn build_details(
         Some(&crate::l10n::tr("props-type")),
         Some(text_factory(
             |o| o.type_label(),
+            TextCellStyle {
+                xalign: 0.0,
+                dim: false,
+                tabular: false,
+            },
             handlers.on_secondary,
             handlers.on_middle,
             handlers.on_drag_prepare,
@@ -510,6 +539,11 @@ fn build_details(
         Some(&crate::l10n::tr("props-modified")),
         Some(text_factory(
             |o| modified_label(o.modified()),
+            TextCellStyle {
+                xalign: 0.0,
+                dim: true,
+                tabular: false,
+            },
             handlers.on_secondary,
             handlers.on_middle,
             handlers.on_drag_prepare,

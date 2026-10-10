@@ -380,6 +380,23 @@ fn crumb_items(uri: &str) -> Vec<(String, String)> {
     let Some(path) = uri.strip_prefix("file://") else {
         return Vec::new();
     };
+    let file = gio::File::for_uri(uri);
+    let home = gio::File::for_path(glib::home_dir());
+    if let (Some(file_path), Some(home_path)) = (file.path(), home.path()) {
+        if let Ok(relative) = file_path.strip_prefix(&home_path) {
+            let home_uri = home.uri().to_string();
+            let mut out = vec![(tr("side-home"), home_uri.clone())];
+            let mut prefix = home_path;
+            for component in relative.components() {
+                prefix.push(component.as_os_str());
+                let target = gio::File::for_path(&prefix).uri().to_string();
+                let label = kito_core::uri_file_name(&target)
+                    .unwrap_or_else(|| component.as_os_str().to_string_lossy().into_owned());
+                out.push((label, target));
+            }
+            return out;
+        }
+    }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let mut out = Vec::with_capacity(segments.len() + 1);
     out.push(("/".to_string(), "file:///".to_string()));
@@ -536,6 +553,37 @@ fn crumb_button(
     button
 }
 
+fn home_crumb_button(current: bool, on_click: impl Fn() + 'static) -> gtk::Button {
+    themed_crumb_button(
+        &tr("side-home"),
+        &tr("side-home"),
+        current,
+        &[
+            "user-home-symbolic",
+            "user-home",
+            "go-home-symbolic",
+            "folder-symbolic",
+            "folder",
+        ],
+        on_click,
+    )
+}
+
+fn themed_crumb_button(
+    label: &str,
+    tooltip: &str,
+    current: bool,
+    icon_names: &[&str],
+    on_click: impl Fn() + 'static,
+) -> gtk::Button {
+    let button = crumb_button(label, tooltip, current, on_click);
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.append(&gtk::Image::from_gicon(&icons::control_icon(icon_names)));
+    content.append(&gtk::Label::new(Some(label)));
+    button.set_child(Some(&content));
+    button
+}
+
 /// Faint `›` separator between segments.
 fn crumb_sep() -> gtk::Label {
     gtk::Label::builder()
@@ -555,36 +603,79 @@ fn rebuild_crumbs(crumbs: &gtk::Box, uri: &str, load: &Rc<dyn Fn(&str)>, edit: &
     let Some(_path) = uri.strip_prefix("file://") else {
         // Non-file schemes (trash, network): readable name, clicking
         // opens path writing like for file:// paths.
-        let label: String = if uri.starts_with("trash:") {
-            tr("side-trash")
+        let special: Option<(String, &[&str])> = if uri.starts_with("trash:") {
+            Some((
+                tr("side-trash"),
+                &[
+                    "user-trash-symbolic",
+                    "user-trash-full-symbolic",
+                    "user-trash",
+                ],
+            ))
         } else if uri.starts_with("network:") {
-            tr("side-browse-network")
+            Some((
+                tr("side-network"),
+                &[
+                    "network-computer-symbolic",
+                    "network-workgroup-symbolic",
+                    "network-computer",
+                    "network-workgroup",
+                ],
+            ))
         } else {
-            kito_core::uri_to_display(uri)
+            None
         };
         let edit = edit.clone();
-        crumbs.append(&crumb_button(
-            &label,
-            &tr("crumb-edit-path"),
-            true,
-            move || edit(),
-        ));
+        if let Some((label, icons)) = special {
+            crumbs.append(&themed_crumb_button(
+                &label,
+                &tr("crumb-edit-path"),
+                true,
+                icons,
+                move || edit(),
+            ));
+        } else {
+            let label = kito_core::uri_to_display(uri);
+            crumbs.append(&crumb_button(
+                &label,
+                &tr("crumb-edit-path"),
+                true,
+                move || edit(),
+            ));
+        }
         return;
     };
     // `/` alone: already the current folder, so it edits.
     let items = crumb_items(uri);
+    let home_uri = gio::File::for_path(glib::home_dir()).uri().to_string();
+    let in_home = items.first().is_some_and(|(_, target)| target == &home_uri);
     if items.len() == 1 {
         let edit = edit.clone();
-        crumbs.append(&crumb_button(
-            "/",
-            &tr("crumb-edit-path"),
-            true,
-            move || edit(),
-        ));
+        if in_home {
+            crumbs.append(&home_crumb_button(true, move || edit()));
+        } else {
+            crumbs.append(&crumb_button(
+                "/",
+                &tr("crumb-edit-path"),
+                true,
+                move || edit(),
+            ));
+        }
         return;
     }
     let last = items.len() - 1;
     for (i, (label, target)) in items.iter().enumerate() {
+        if in_home && i == 0 {
+            if last == 0 {
+                let edit = edit.clone();
+                crumbs.append(&home_crumb_button(true, move || edit()));
+            } else {
+                let load = load.clone();
+                let target = target.clone();
+                crumbs.append(&home_crumb_button(false, move || load(&target)));
+            }
+            continue;
+        }
         if i == 0 {
             let load = load.clone();
             let target = target.clone();
@@ -1483,10 +1574,26 @@ fn build_window(
             }
         })
     };
-    let sidebar = sidebar::build_sidebar(load.clone(), window.clone(), sidebar_drop);
+    let sidebar = sidebar::build_sidebar(
+        load.clone(),
+        window.clone(),
+        sidebar_drop,
+        preferences.clone(),
+    );
     sidebar_column.append(sidebar.widget());
     layout.set_position(178);
     *sidebar_slot.borrow_mut() = Some(sidebar);
+
+    preferences.subscribe_sidebar({
+        let slot = Rc::downgrade(&sidebar_slot);
+        Rc::new(move |_| {
+            if let Some(slot) = slot.upgrade() {
+                if let Some(sidebar) = slot.borrow().as_ref() {
+                    sidebar.refresh_preferences();
+                }
+            }
+        })
+    });
 
     // Preferences are shared process-wide. Each window keeps only weak
     // references here so closing a window also releases its widgets.
@@ -1683,5 +1790,93 @@ mod tests {
         );
         assert!(crumb_items("trash:///").is_empty());
         assert!(crumb_items("network:///").is_empty());
+    }
+
+    #[test]
+    fn crumb_items_home_and_descendant() {
+        let home = gio::File::for_path(glib::home_dir());
+        let home_uri = home.uri().to_string();
+        assert_eq!(
+            crumb_items(&home_uri),
+            vec![(tr("side-home"), home_uri.clone())]
+        );
+
+        let child = gio::File::for_path(glib::home_dir().join("Progetti"));
+        let child_uri = child.uri();
+        assert_eq!(
+            crumb_items(child_uri.as_ref()),
+            vec![
+                (tr("side-home"), home_uri),
+                ("Progetti".to_string(), child_uri.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn home_breadcrumb_uses_icon_and_keeps_navigation_actions() {
+        gtk::test_synced(|| {
+            let home = gio::File::for_path(glib::home_dir());
+            let home_uri = home.uri().to_string();
+            let crumbs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let loaded = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let load: Rc<dyn Fn(&str)> = Rc::new({
+                let loaded = loaded.clone();
+                move |uri| loaded.borrow_mut().push(uri.to_string())
+            });
+            let edited = Rc::new(std::cell::Cell::new(0));
+            let edit: Rc<dyn Fn()> = Rc::new({
+                let edited = edited.clone();
+                move || edited.set(edited.get() + 1)
+            });
+
+            rebuild_crumbs(&crumbs, &home_uri, &load, &edit);
+            let home_button = crumbs.first_child().and_downcast::<gtk::Button>().unwrap();
+            let home_row = home_button.child().and_downcast::<gtk::Box>().unwrap();
+            assert!(home_row
+                .first_child()
+                .and_downcast::<gtk::Image>()
+                .is_some());
+            assert_eq!(
+                home_row
+                    .last_child()
+                    .and_downcast::<gtk::Label>()
+                    .unwrap()
+                    .text(),
+                tr("side-home")
+            );
+            home_button.emit_clicked();
+            assert_eq!(edited.get(), 1);
+            assert!(loaded.borrow().is_empty());
+
+            let child_uri = gio::File::for_path(home.path().unwrap().join("Progetti"))
+                .uri()
+                .to_string();
+            rebuild_crumbs(&crumbs, &child_uri, &load, &edit);
+            let home_button = crumbs.first_child().and_downcast::<gtk::Button>().unwrap();
+            home_button.emit_clicked();
+            assert_eq!(&*loaded.borrow(), &[home_uri]);
+            assert_eq!(edited.get(), 1);
+
+            for (uri, label) in [
+                ("trash:///", tr("side-trash")),
+                ("network:///", tr("side-network")),
+            ] {
+                rebuild_crumbs(&crumbs, uri, &load, &edit);
+                let button = crumbs.first_child().and_downcast::<gtk::Button>().unwrap();
+                let row = button.child().and_downcast::<gtk::Box>().unwrap();
+                assert!(row.first_child().and_downcast::<gtk::Image>().is_some());
+                assert_eq!(
+                    row.last_child()
+                        .and_downcast::<gtk::Label>()
+                        .unwrap()
+                        .text(),
+                    label
+                );
+                button.emit_clicked();
+                assert_eq!(edited.get(), if uri.starts_with("trash:") { 2 } else { 3 });
+                assert_eq!(&*loaded.borrow(), &[home.uri().to_string()]);
+            }
+        });
     }
 }

@@ -93,6 +93,19 @@ side-music = Musica
 side-pictures = Immagini
 side-videos = Video
 side-filesystem = File system
+side-hide-in-kito = Nascondi in Kito
+side-restore-hidden = Ripristina voci nascoste
+side-custom = Posizioni personalizzate
+side-settings-error = Impossibile salvare le impostazioni della barra laterale: { $error }
+side-location-error = Impossibile aggiungere la posizione: { $error }
+
+prefs-sidebar = Barra laterale
+prefs-sidebar-custom-locations = Posizioni solo di Kito
+prefs-sidebar-add-location = Aggiungi cartella/posizione…
+prefs-sidebar-remove = Rimuovi
+prefs-sidebar-remove-accessible = Rimuovi { $location } da Kito
+prefs-sidebar-hidden = Voci nascoste della barra laterale
+prefs-sidebar-hidden-note = Nascondi le singole voci dal rispettivo menu contestuale. Il ripristino rende visibili tutte le voci nascoste.
 
 ## Elenco dei file
 column-name = Nome
@@ -113,6 +126,7 @@ status-selected =
 error-open-folder = Impossibile aprire la cartella
 error-invalid-path = Inserisci un percorso locale o un URI da aprire.
 empty-folder = Questa cartella è vuota
+empty-folder-description = Aggiungi file a questa cartella oppure scegli un’altra posizione.
 loading-folder = Caricamento…
 loading-interrupt = Interrompi
 monitor-unavailable = Aggiornamenti live non disponibili per questa posizione. Premi F5 per aggiornare.

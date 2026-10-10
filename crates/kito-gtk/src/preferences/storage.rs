@@ -47,6 +47,7 @@ mod tests {
             show_size_column: false,
             show_type_column: true,
             show_modified_column: true,
+            ..Preferences::default()
         };
         save_to(&path, &preferences).unwrap();
         assert_eq!(load_from(&path), preferences);

@@ -11,6 +11,14 @@ pub struct PreferencesDialogState {
     pub dialog: adw::PreferencesDialog,
     general_page: adw::PreferencesPage,
     integration_page: adw::PreferencesPage,
+    sidebar_page: adw::PreferencesPage,
+    sidebar_locations_group: adw::PreferencesGroup,
+    sidebar_custom_rows: gtk::Box,
+    sidebar_add_button: gtk::Button,
+    sidebar_restore_group: adw::PreferencesGroup,
+    sidebar_restore_button: gtk::Button,
+    window: glib::WeakRef<adw::ApplicationWindow>,
+    store: std::rc::Weak<PreferenceStore>,
     default_view_row: adw::ComboRow,
     default_view_options: gtk::StringList,
     default_view_handler: glib::SignalHandlerId,
@@ -247,10 +255,104 @@ pub fn present(
     integration_page.add(&terminal_group);
     dialog.add(&integration_page);
 
+    let sidebar_page = adw::PreferencesPage::builder()
+        .title(crate::l10n::tr("prefs-sidebar"))
+        .icon_name("sidebar-show-symbolic")
+        .build();
+    let sidebar_locations_group = adw::PreferencesGroup::builder()
+        .title(crate::l10n::tr("prefs-sidebar-custom-locations"))
+        .build();
+    let sidebar_custom_rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_locations_group.add(&sidebar_custom_rows);
+    let add_location = gtk::Button::with_label(&crate::l10n::tr("prefs-sidebar-add-location"));
+    let window_weak = window.downgrade();
+    let add_preferences = store.clone();
+    add_location.connect_clicked(move |_| {
+        let Some(window) = window_weak.upgrade() else {
+            return;
+        };
+        let chooser = gtk::FileDialog::new();
+        let preferences = add_preferences.clone();
+        let error_window = window.clone();
+        chooser.select_folder(
+            Some(&window),
+            None::<&gtk::gio::Cancellable>,
+            move |result| match result {
+                Ok(file) => {
+                    if let Err(error) = preferences.add_sidebar_uri(file.uri().to_string()) {
+                        present_save_error(&error_window, &error);
+                    }
+                }
+                Err(error) if error.matches(gtk::DialogError::Dismissed) => {}
+                Err(error) => present_message(
+                    &error_window,
+                    crate::l10n::tr_with_one("side-location-error", "error", &error.to_string()),
+                ),
+            },
+        );
+    });
+    sidebar_locations_group.add(&add_location);
+    let sidebar_restore_group = adw::PreferencesGroup::builder()
+        .title(crate::l10n::tr("prefs-sidebar-hidden"))
+        .description(crate::l10n::tr("prefs-sidebar-hidden-note"))
+        .build();
+    let sidebar_restore_button = gtk::Button::with_label(&crate::l10n::tr("side-restore-hidden"));
+    let restore_store = store.clone();
+    let restore_window = window.downgrade();
+    sidebar_restore_button.connect_clicked(move |_| {
+        if let Err(error) = restore_store.restore_sidebar() {
+            if let Some(window) = restore_window.upgrade() {
+                present_save_error(&window, &error);
+            }
+        }
+    });
+    sidebar_restore_group.add(&sidebar_restore_button);
+    sidebar_page.add(&sidebar_locations_group);
+    sidebar_page.add(&sidebar_restore_group);
+    dialog.add(&sidebar_page);
+
+    refresh_sidebar_preferences(
+        &sidebar_custom_rows,
+        &sidebar_restore_button,
+        &store.snapshot(),
+        &Rc::downgrade(store),
+        &window.downgrade(),
+    );
+    let locations_weak = sidebar_locations_group.downgrade();
+    let custom_rows_weak = sidebar_custom_rows.downgrade();
+    let restore_weak = sidebar_restore_button.downgrade();
+    let weak_store = Rc::downgrade(store);
+    let window_weak = window.downgrade();
+    store.subscribe_sidebar(Rc::new(move |snapshot| {
+        let (Some(_group), Some(custom_rows), Some(restore), Some(store)) = (
+            locations_weak.upgrade(),
+            custom_rows_weak.upgrade(),
+            restore_weak.upgrade(),
+            weak_store.upgrade(),
+        ) else {
+            return;
+        };
+        refresh_sidebar_preferences(
+            &custom_rows,
+            &restore,
+            &snapshot,
+            &Rc::downgrade(&store),
+            &window_weak,
+        );
+    }));
+
     *existing.borrow_mut() = Some(PreferencesDialogState {
         dialog: dialog.clone(),
         general_page,
         integration_page,
+        sidebar_page,
+        sidebar_locations_group,
+        sidebar_custom_rows,
+        sidebar_add_button: add_location,
+        sidebar_restore_group,
+        sidebar_restore_button,
+        window: window.downgrade(),
+        store: Rc::downgrade(store),
         default_view_row,
         default_view_options,
         default_view_handler,
@@ -287,6 +389,31 @@ pub fn retranslate(state: &PreferencesDialogState, store: &PreferenceStore) {
     state
         .integration_page
         .set_title(&crate::l10n::tr("prefs-integration"));
+    state
+        .sidebar_page
+        .set_title(&crate::l10n::tr("prefs-sidebar"));
+    state
+        .sidebar_locations_group
+        .set_title(&crate::l10n::tr("prefs-sidebar-custom-locations"));
+    state
+        .sidebar_add_button
+        .set_label(&crate::l10n::tr("prefs-sidebar-add-location"));
+    state
+        .sidebar_restore_group
+        .set_title(&crate::l10n::tr("prefs-sidebar-hidden"));
+    state
+        .sidebar_restore_group
+        .set_description(Some(&crate::l10n::tr("prefs-sidebar-hidden-note")));
+    state
+        .sidebar_restore_button
+        .set_label(&crate::l10n::tr("side-restore-hidden"));
+    refresh_sidebar_preferences(
+        &state.sidebar_custom_rows,
+        &state.sidebar_restore_button,
+        &snapshot,
+        &state.store,
+        &state.window,
+    );
 
     state
         .default_view_row
@@ -402,6 +529,66 @@ pub fn retranslate(state: &PreferencesDialogState, store: &PreferenceStore) {
 fn replace_strings(model: &gtk::StringList, values: &[String]) {
     let refs = values.iter().map(String::as_str).collect::<Vec<_>>();
     model.splice(0, model.n_items(), &refs);
+}
+
+fn refresh_sidebar_preferences(
+    rows: &gtk::Box,
+    restore_button: &gtk::Button,
+    snapshot: &crate::preferences::model::Preferences,
+    store: &std::rc::Weak<PreferenceStore>,
+    window: &glib::WeakRef<adw::ApplicationWindow>,
+) {
+    while let Some(child) = rows.first_child() {
+        rows.remove(&child);
+    }
+    for uri in &snapshot.custom_sidebar_uris {
+        let file = gtk::gio::File::for_uri(uri);
+        let title = file
+            .basename()
+            .map(|name| name.to_string_lossy().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| uri.clone());
+        let row = adw::ActionRow::builder().title(title).subtitle(uri).build();
+        let remove = gtk::Button::with_label(&crate::l10n::tr("prefs-sidebar-remove"));
+        remove.add_css_class("flat");
+        remove.set_valign(gtk::Align::Center);
+        remove.update_property(
+            &[gtk::accessible::Property::Label(&crate::l10n::tr_with_one(
+                "prefs-sidebar-remove-accessible",
+                "location",
+                uri,
+            ))],
+        );
+        let uri = uri.clone();
+        let store = store.clone();
+        let window = window.clone();
+        remove.connect_clicked(move |_| {
+            let Some(store) = store.upgrade() else {
+                return;
+            };
+            if let Err(error) = store.remove_sidebar_uri(&uri) {
+                if let Some(window) = window.upgrade() {
+                    present_save_error(&window, &error);
+                }
+            }
+        });
+        row.add_suffix(&remove);
+        rows.append(&row);
+    }
+    restore_button.set_sensitive(!snapshot.hidden_sidebar_ids.is_empty());
+}
+
+fn present_save_error(window: &adw::ApplicationWindow, error: &std::io::Error) {
+    present_message(window, save_error(error));
+}
+
+fn present_message(window: &adw::ApplicationWindow, message: String) {
+    let alert = adw::AlertDialog::builder()
+        .heading(crate::l10n::tr("side-op-failed"))
+        .body(message)
+        .build();
+    alert.add_response("ok", &crate::l10n::tr("dialog-ok"));
+    alert.present(Some(window));
 }
 
 fn view_labels() -> Vec<String> {

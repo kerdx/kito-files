@@ -591,6 +591,8 @@ impl FileTab {
     /// current selection, folder, view mode, and navigation history.
     fn retranslate(self: &Rc<Self>) {
         self.empty_page.set_title(&crate::l10n::tr("empty-folder"));
+        self.empty_page
+            .set_description(Some(&crate::l10n::tr("empty-folder-description")));
         self.loading_label
             .set_text(&crate::l10n::tr("loading-folder"));
         self.loading_stop
@@ -1677,8 +1679,9 @@ impl TabManager {
         let (scrolled, store) = file_list::build_file_view();
         // Placeholder page when the folder has no visible entries.
         let empty = adw::StatusPage::builder()
-            .icon_name("folder")
+            .icon_name("folder-open-symbolic")
             .title(crate::l10n::tr("empty-folder"))
+            .description(crate::l10n::tr("empty-folder-description"))
             .build();
         // Loading is a small, delayed overlay so a fast directory never
         // flashes a full-page placeholder over the existing view.

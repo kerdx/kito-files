@@ -10,6 +10,7 @@ type OpenItemsListener = Rc<dyn Fn(OpenItems)>;
 type LanguageListener = Rc<dyn Fn(kito_i18n::AppLang)>;
 type WindowControlsListener = Rc<dyn Fn(WindowControls)>;
 type DisplayListener = Rc<dyn Fn(Preferences)>;
+type SidebarListener = Rc<dyn Fn(Preferences)>;
 
 /// Process-wide settings state shared by every window.
 pub struct PreferenceStore {
@@ -19,6 +20,7 @@ pub struct PreferenceStore {
     language_listeners: RefCell<Vec<LanguageListener>>,
     window_controls_listeners: RefCell<Vec<WindowControlsListener>>,
     display_listeners: RefCell<Vec<DisplayListener>>,
+    sidebar_listeners: RefCell<Vec<SidebarListener>>,
 }
 
 impl PreferenceStore {
@@ -32,6 +34,7 @@ impl PreferenceStore {
             language_listeners: RefCell::new(Vec::new()),
             window_controls_listeners: RefCell::new(Vec::new()),
             display_listeners: RefCell::new(Vec::new()),
+            sidebar_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -44,6 +47,7 @@ impl PreferenceStore {
             language_listeners: RefCell::new(Vec::new()),
             window_controls_listeners: RefCell::new(Vec::new()),
             display_listeners: RefCell::new(Vec::new()),
+            sidebar_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -143,6 +147,66 @@ impl PreferenceStore {
         self.save()
     }
 
+    pub fn set_sidebar_hidden(&self, id: &str, hidden: bool) -> io::Result<()> {
+        let previous = self.snapshot();
+        let mut prefs = self.current.borrow_mut();
+        if hidden && !prefs.hidden_sidebar_ids.iter().any(|item| item == id) {
+            prefs.hidden_sidebar_ids.push(id.to_string());
+        } else if !hidden {
+            prefs.hidden_sidebar_ids.retain(|item| item != id);
+        }
+        drop(prefs);
+        self.save_sidebar_change(previous)
+    }
+
+    pub fn restore_sidebar(&self) -> io::Result<()> {
+        let previous = self.snapshot();
+        self.current.borrow_mut().hidden_sidebar_ids.clear();
+        self.save_sidebar_change(previous)
+    }
+
+    pub fn add_sidebar_uri(&self, uri: String) -> io::Result<()> {
+        let previous = self.snapshot();
+        let mut prefs = self.current.borrow_mut();
+        if !prefs.custom_sidebar_uris.contains(&uri) {
+            prefs.custom_sidebar_uris.push(uri);
+        }
+        drop(prefs);
+        self.save_sidebar_change(previous)
+    }
+
+    pub fn remove_sidebar_uri(&self, uri: &str) -> io::Result<()> {
+        let previous = self.snapshot();
+        {
+            let mut preferences = self.current.borrow_mut();
+            preferences.custom_sidebar_uris.retain(|item| item != uri);
+            // Custom locations have their own namespace; do not unhide a
+            // bookmark that happens to point at the same URI.
+            let hidden_id = format!("custom:{uri}");
+            preferences
+                .hidden_sidebar_ids
+                .retain(|item| item != &hidden_id);
+        }
+        self.save_sidebar_change(previous)
+    }
+
+    fn save_sidebar_change(&self, previous: Preferences) -> io::Result<()> {
+        let result = self.save();
+        if result.is_ok() {
+            let snapshot = self.snapshot();
+            for listener in self.sidebar_listeners.borrow().iter() {
+                listener(snapshot.clone());
+            }
+        } else {
+            *self.current.borrow_mut() = previous;
+        }
+        result
+    }
+
+    pub fn subscribe_sidebar(&self, listener: SidebarListener) {
+        self.sidebar_listeners.borrow_mut().push(listener);
+    }
+
     fn notify_window_controls(&self) {
         let controls = self.current.borrow().window_controls;
         for listener in self.window_controls_listeners.borrow().iter() {
@@ -202,6 +266,65 @@ mod tests {
         store.set_open_items(OpenItems::SingleClick).unwrap();
         assert_eq!(store.shared().borrow().open_items, OpenItems::SingleClick);
         assert_eq!(*notified.borrow(), Some(OpenItems::SingleClick));
+    }
+
+    #[test]
+    fn sidebar_settings_persist_and_notify_all_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.conf");
+        let store = PreferenceStore::at_path(path.clone());
+        let a = Rc::new(RefCell::new(0));
+        let b = Rc::new(RefCell::new(0));
+        for target in [a.clone(), b.clone()] {
+            store.subscribe_sidebar({
+                let target = target.clone();
+                Rc::new(move |_| *target.borrow_mut() += 1)
+            });
+        }
+        store.set_sidebar_hidden("builtin:home", true).unwrap();
+        store
+            .add_sidebar_uri("smb://host/share/a,b".into())
+            .unwrap();
+        assert_eq!((*a.borrow(), *b.borrow()), (2, 2));
+        assert_eq!(
+            storage::load_from(&path).hidden_sidebar_ids,
+            vec!["builtin:home"]
+        );
+        assert_eq!(
+            storage::load_from(&path).custom_sidebar_uris,
+            vec!["smb://host/share/a,b"]
+        );
+        store.restore_sidebar().unwrap();
+        store.remove_sidebar_uri("smb://host/share/a,b").unwrap();
+        assert_eq!(storage::load_from(&path), Preferences::default());
+    }
+
+    #[test]
+    fn removing_custom_location_only_clears_its_namespaced_hidden_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.conf");
+        let store = PreferenceStore::at_path(path.clone());
+        let uri = "smb://host/share/custom";
+        store.add_sidebar_uri(uri.into()).unwrap();
+        store
+            .set_sidebar_hidden(&format!("custom:{uri}"), true)
+            .unwrap();
+        store
+            .set_sidebar_hidden(&format!("bookmark:{uri}"), true)
+            .unwrap();
+
+        store.remove_sidebar_uri(uri).unwrap();
+
+        let saved = storage::load_from(&path);
+        assert!(!saved.custom_sidebar_uris.iter().any(|item| item == uri));
+        assert!(!saved
+            .hidden_sidebar_ids
+            .iter()
+            .any(|item| item == &format!("custom:{uri}")));
+        assert!(saved
+            .hidden_sidebar_ids
+            .iter()
+            .any(|item| item == &format!("bookmark:{uri}")));
     }
 
     #[test]

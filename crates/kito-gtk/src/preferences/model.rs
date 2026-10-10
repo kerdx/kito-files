@@ -171,6 +171,10 @@ pub struct Preferences {
     pub show_size_column: bool,
     pub show_type_column: bool,
     pub show_modified_column: bool,
+    /// Stable, non-localized sidebar row identifiers hidden in this app.
+    pub hidden_sidebar_ids: Vec<String>,
+    /// GIO URIs added to the sidebar; these never touch shared GTK bookmarks.
+    pub custom_sidebar_uris: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -185,6 +189,8 @@ impl Default for Preferences {
             show_size_column: true,
             show_type_column: true,
             show_modified_column: false,
+            hidden_sidebar_ids: Vec::new(),
+            custom_sidebar_uris: Vec::new(),
         }
     }
 }
@@ -249,13 +255,15 @@ impl Preferences {
                     result.show_modified_column =
                         WindowControls::parse_bool(value).unwrap_or(false);
                 }
+                "sidebar-hidden" => result.hidden_sidebar_ids = decode_list(value),
+                "sidebar-custom" => result.custom_sidebar_uris = decode_list(value),
                 _ => {}
             }
         }
         result
     }
 
-    pub fn config_entries(&self) -> [(&'static str, String); 12] {
+    pub fn config_entries(&self) -> [(&'static str, String); 14] {
         [
             (
                 "default-view",
@@ -293,7 +301,55 @@ impl Preferences {
                 "show-modified-column",
                 WindowControls::as_config_bool(self.show_modified_column).to_string(),
             ),
+            ("sidebar-hidden", encode_list(&self.hidden_sidebar_ids)),
+            ("sidebar-custom", encode_list(&self.custom_sidebar_uris)),
         ]
+    }
+}
+
+// Hex encoding makes commas, newlines and arbitrary UTF-8 safe in the
+// line-oriented settings file. Empty lists encode as an empty value.
+fn encode_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_list(value: &str) -> Vec<String> {
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    value
+        .trim()
+        .split(',')
+        .filter_map(|item| {
+            let encoded = item.as_bytes();
+            if encoded.len() % 2 != 0 {
+                return None;
+            }
+            let bytes = (0..encoded.len())
+                .step_by(2)
+                .map(|i| Some(hex_digit(encoded[i])? * 16 + hex_digit(encoded[i + 1])?))
+                .collect::<Option<Vec<_>>>()?;
+            String::from_utf8(bytes).ok()
+        })
+        .collect()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -320,6 +376,29 @@ mod tests {
         assert_eq!(preferences.icon_zoom, 100);
         assert!(preferences.show_size_column && preferences.show_type_column);
         assert!(!preferences.show_modified_column);
+        assert!(preferences.hidden_sidebar_ids.is_empty());
+        assert!(preferences.custom_sidebar_uris.is_empty());
+    }
+
+    #[test]
+    fn sidebar_lists_round_trip_delimiters_newlines_and_unicode_and_ignore_bad_items() {
+        let preferences = Preferences {
+            hidden_sidebar_ids: vec!["builtin:home".into(), "comma,\n🚀".into()],
+            custom_sidebar_uris: vec!["smb://host/share/a,b".into()],
+            ..Preferences::default()
+        };
+        let text = preferences
+            .config_entries()
+            .iter()
+            .map(|(k, v)| format!("{k} = {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(Preferences::from_config_text(&text), preferences);
+        assert_eq!(
+            Preferences::from_config_text("future=value\n").hidden_sidebar_ids,
+            Vec::<String>::new()
+        );
+        assert_eq!(decode_list("ff,61,ø"), vec!["a"]);
     }
 
     #[test]
