@@ -12,6 +12,11 @@ pub use crate::preferences::model::ViewMode;
 
 const ICON_VIEW_BASE_SIZE: i32 = 96;
 const ICON_VIEW_BASE_CELL_WIDTH: i32 = 160;
+const NAME_ICON_MIN_SIZE: i32 = 26;
+
+fn name_icon_pixel_size(base_size: i32, zoom: u8) -> i32 {
+    (base_size * i32::from(zoom) / 100).max(NAME_ICON_MIN_SIZE)
+}
 
 fn icon_pixel_size(zoom: u8) -> i32 {
     (ICON_VIEW_BASE_SIZE * i32::from(zoom) / 100).max(24)
@@ -42,8 +47,6 @@ pub struct ViewHandlers<'a> {
     pub on_drop: &'a DropHandler,
     pub on_external_move: &'a dnd::ExternalMoveHandler,
 }
-
-type HeaderLabels = Rc<std::cell::RefCell<Vec<(String, glib::WeakRef<gtk::Label>)>>>;
 
 /// Binds right-click to the row for the current object. Called on every
 /// bind (rows are recycled): removes the previous gesture.
@@ -229,6 +232,86 @@ fn fallback_icon(is_dir: bool) -> gio::ThemedIcon {
     gio::ThemedIcon::new(if is_dir { "folder" } else { "text-x-generic" })
 }
 
+/// Resolve file-list icons as regular artwork. GtkImage's default GIcon lookup
+/// can select a symbolic companion from a GThemedIcon's name/fallback list;
+/// the symbolic variants in some themes are monochrome even when the regular
+/// icon is not. Keep this scoped to the name column: the grid retains GTK's
+/// normal GIcon selection behavior.
+fn set_file_list_icon(image: &gtk::Image, icon: &impl IsA<gio::Icon>) {
+    let key = glib::Quark::from_str("kito-file-list-icon-state");
+    let current_icon = unsafe { image.qdata::<Rc<std::cell::RefCell<Option<gio::Icon>>>>(key) }
+        .map(|value| unsafe { value.as_ref().clone() });
+    let state = current_icon.unwrap_or_else(|| {
+        let state = Rc::new(std::cell::RefCell::new(None));
+        unsafe {
+            image.set_qdata(key, state.clone());
+        }
+        install_icon_refresh(image, state.clone());
+        state
+    });
+    *state.borrow_mut() = Some(icon.as_ref().clone());
+    refresh_file_list_icon(image, &state);
+}
+
+fn refresh_file_list_icon(image: &gtk::Image, state: &Rc<std::cell::RefCell<Option<gio::Icon>>>) {
+    let Some(icon) = state.borrow().clone() else {
+        return;
+    };
+    let theme = gtk::IconTheme::for_display(&image.display());
+    let paintable = theme.lookup_by_gicon(
+        &icon,
+        image.pixel_size().max(1),
+        image.scale_factor(),
+        image.direction(),
+        gtk::IconLookupFlags::FORCE_REGULAR,
+    );
+    image.set_paintable(Some(&paintable));
+}
+
+fn install_icon_refresh(image: &gtk::Image, state: Rc<std::cell::RefCell<Option<gio::Icon>>>) {
+    let weak_image = image.downgrade();
+    let scale_state = state.clone();
+    image.connect_notify_local(Some("scale-factor"), move |_, _| {
+        if let Some(image) = weak_image.upgrade() {
+            refresh_file_list_icon(&image, &scale_state);
+        }
+    });
+
+    let handler = Rc::new(std::cell::RefCell::new(None::<glib::SignalHandlerId>));
+    let on_realize = {
+        let weak_image = image.downgrade();
+        let state = state.clone();
+        let handler = handler.clone();
+        move |_: &gtk::Image| {
+            let Some(image) = weak_image.upgrade() else {
+                return;
+            };
+            let theme = gtk::IconTheme::for_display(&image.display());
+            if handler.borrow().is_none() {
+                let weak_image = image.downgrade();
+                let state = state.clone();
+                let id = theme.connect_changed(move |_| {
+                    if let Some(image) = weak_image.upgrade() {
+                        refresh_file_list_icon(&image, &state);
+                    }
+                });
+                *handler.borrow_mut() = Some(id);
+            }
+            refresh_file_list_icon(&image, &state);
+        }
+    };
+    image.connect_realize(on_realize);
+    let weak_image = image.downgrade();
+    let unrealize_handler = handler.clone();
+    image.connect_unrealize(move |_| {
+        if let Some(id) = unrealize_handler.borrow_mut().take() {
+            if let Some(image) = weak_image.upgrade() {
+                gtk::IconTheme::for_display(&image.display()).disconnect(id);
+            }
+        }
+    });
+}
+
 /// Icon + name row (used by compact and details).
 fn name_factory(
     pixel_size: i32,
@@ -249,7 +332,6 @@ fn name_factory(
             .margin_bottom(4)
             .build();
         row.add_css_class("file-item");
-        // 22px: at 16px Papirus/Breeze are monochrome.
         let image = gtk::Image::new();
         image.set_pixel_size(pixel_size);
         row.append(&image);
@@ -279,8 +361,8 @@ fn name_factory(
             let label = row.last_child().and_downcast::<gtk::Label>().unwrap();
             label.set_text(&obj.name());
             match obj.icon() {
-                Some(gicon) => icon.set_from_gicon(&gicon),
-                None => icon.set_from_gicon(&fallback_icon(obj.is_dir())),
+                Some(gicon) => set_file_list_icon(&icon, &gicon),
+                None => set_file_list_icon(&icon, &fallback_icon(obj.is_dir())),
             }
             set_secondary(&row, &obj, &on_secondary);
             set_middle(&row, &obj, &on_middle);
@@ -359,7 +441,7 @@ fn build_compact(
     let column = gtk::ColumnViewColumn::new(
         Some(&crate::l10n::tr("column-name")),
         Some(name_factory(
-            (22 * i32::from(zoom) / 100).max(12),
+            name_icon_pixel_size(22, zoom),
             handlers.on_secondary,
             handlers.on_middle,
             handlers.on_drag_prepare,
@@ -383,7 +465,7 @@ fn build_details(
     let name = gtk::ColumnViewColumn::new(
         Some(&crate::l10n::tr("column-name")),
         Some(name_factory(
-            (20 * i32::from(display.icon_zoom) / 100).max(12),
+            name_icon_pixel_size(20, display.icon_zoom),
             handlers.on_secondary,
             handlers.on_middle,
             handlers.on_drag_prepare,
@@ -440,92 +522,60 @@ fn build_details(
     modified.set_visible(display.show_modified);
     view.append_column(&modified);
 
-    let headers: HeaderLabels = Rc::new(std::cell::RefCell::new(Vec::new()));
-    let header_factory = gtk::SignalListItemFactory::new();
-    header_factory.connect_setup({
-        let headers = headers.clone();
-        let sort_order = sort_order.clone();
-        let on_sort = on_sort.clone();
-        move |_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap().clone();
-            let button = gtk::Button::builder()
-                .has_frame(false)
-                .halign(gtk::Align::Start)
-                .build();
-            let label = gtk::Label::builder()
-                .halign(gtk::Align::Start)
-                .margin_start(8)
-                .margin_end(8)
-                .build();
-            button.set_child(Some(&label));
-            let weak_item = list_item.downgrade();
-            let headers = headers.clone();
+    // ColumnView's own headers are the clickable, localized column titles.
+    // The view-level `header_factory` is for GtkListHeader section rows, not
+    // column titles; using it here passes a non-ListItem to its callbacks.
+    // Give each column a sorter so GTK enables the native header click and
+    // arrow indicator. The app sorts its ListStore asynchronously via
+    // `on_sort`, rather than installing GTK's sorter on a SortListModel.
+    let click_sorter = gtk::CustomSorter::new(|_, _| gtk::Ordering::Equal);
+    name.set_sorter(Some(&click_sorter));
+    size.set_sorter(Some(&click_sorter));
+    kind.set_sorter(Some(&click_sorter));
+    modified.set_sorter(Some(&click_sorter));
+
+    let initial = sort_order.get();
+    let initial_column = match initial.field {
+        kito_core::SortField::Name => &name,
+        kito_core::SortField::Size => &size,
+        kito_core::SortField::Type => &kind,
+        kito_core::SortField::Modified => &modified,
+    };
+    view.sort_by_column(Some(initial_column), gtk_sort_type(initial.direction));
+
+    if let Some(sorter) = view.sorter().and_downcast::<gtk::ColumnViewSorter>() {
+        sorter.connect_changed({
             let sort_order = sort_order.clone();
-            let on_sort = on_sort.clone();
-            button.connect_clicked(move |_| {
-                let Some(column) = weak_item
-                    .upgrade()
-                    .and_then(|item| item.item())
-                    .and_downcast::<gtk::ColumnViewColumn>()
-                else {
+            move |sorter, _| {
+                let Some(column) = sorter.primary_sort_column() else {
                     return;
                 };
                 let Some(field) = column.id().as_deref().and_then(sort_field_for_column) else {
                     return;
                 };
-                let current = sort_order.get();
-                let direction = if current.field == field {
-                    match current.direction {
-                        kito_core::SortDirection::Ascending => kito_core::SortDirection::Descending,
-                        kito_core::SortDirection::Descending => kito_core::SortDirection::Ascending,
-                    }
+                let direction = if sorter.primary_sort_order() == gtk::SortType::Descending {
+                    kito_core::SortDirection::Descending
                 } else {
                     kito_core::SortDirection::Ascending
                 };
                 let next = kito_core::SortOrder { field, direction };
-                sort_order.set(next);
-                on_sort(next);
-                for (id, weak_label) in headers.borrow().iter() {
-                    if let Some(label) = weak_label.upgrade() {
-                        let title = label.tooltip_text().unwrap_or_default();
-                        label.set_text(&sort_header_text(&title, sort_field_for_column(id), next));
-                    }
+                // Let the owner update this shared state and kick off its
+                // asynchronous re-sort; setting it first would make that
+                // callback treat the requested order as already applied.
+                if sort_order.get() != next {
+                    on_sort(next);
                 }
-            });
-            list_item.set_child(Some(&button));
-        }
-    });
-    header_factory.connect_bind({
-        let headers = headers.clone();
-        let sort_order = sort_order.clone();
-        move |_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-            let Some(column) = list_item.item().and_downcast::<gtk::ColumnViewColumn>() else {
-                return;
-            };
-            let Some(button) = list_item.child().and_downcast::<gtk::Button>() else {
-                return;
-            };
-            let Some(label) = button.child().and_downcast::<gtk::Label>() else {
-                return;
-            };
-            let title = column.title().unwrap_or_default().to_string();
-            label.set_tooltip_text(Some(&title));
-            label.set_text(&sort_header_text(
-                &title,
-                column.id().as_deref().and_then(sort_field_for_column),
-                sort_order.get(),
-            ));
-            let weak = glib::WeakRef::new();
-            weak.set(Some(&label));
-            let id = column.id().map(|id| id.to_string()).unwrap_or_default();
-            if !headers.borrow().iter().any(|(known, _)| known == &id) {
-                headers.borrow_mut().push((id, weak));
             }
-        }
-    });
-    view.set_header_factory(Some(&header_factory));
+        });
+    }
     view
+}
+
+fn gtk_sort_type(direction: kito_core::SortDirection) -> gtk::SortType {
+    match direction {
+        kito_core::SortDirection::Ascending => gtk::SortType::Ascending,
+        kito_core::SortDirection::Descending => gtk::SortType::Descending,
+    }
 }
 
 fn sort_field_for_column(id: &str) -> Option<kito_core::SortField> {
@@ -535,25 +585,6 @@ fn sort_field_for_column(id: &str) -> Option<kito_core::SortField> {
         "type" => Some(kito_core::SortField::Type),
         "modified" => Some(kito_core::SortField::Modified),
         _ => None,
-    }
-}
-
-fn sort_header_text(
-    title: &str,
-    field: Option<kito_core::SortField>,
-    order: kito_core::SortOrder,
-) -> String {
-    if field == Some(order.field) {
-        format!(
-            "{title} {}",
-            if order.direction == kito_core::SortDirection::Ascending {
-                "↑"
-            } else {
-                "↓"
-            }
-        )
-    } else {
-        title.to_string()
     }
 }
 
@@ -779,6 +810,44 @@ mod tests {
         assert_eq!(icon_cell_width(180), 288);
     }
 
+    #[test]
+    fn name_view_icons_keep_theme_asset_size_floor_and_follow_zoom() {
+        for base_size in [22, 20] {
+            // Compact and Details
+            assert_eq!(name_icon_pixel_size(base_size, 100), 26);
+            assert!(name_icon_pixel_size(base_size, 150) > 26);
+            assert!(name_icon_pixel_size(base_size, 200) > name_icon_pixel_size(base_size, 150));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn file_list_icon_lookup_uses_regular_theme_paintable() {
+        gtk::test_synced(|| {
+            let image = gtk::Image::new();
+            image.set_pixel_size(name_icon_pixel_size(20, 100));
+            let icon = gio::ThemedIcon::from_names(&["folder-documents", "folder"]);
+            set_file_list_icon(&image, &icon);
+
+            let paintable = image
+                .paintable()
+                .and_downcast::<gtk::IconPaintable>()
+                .expect("theme lookup should install an icon paintable");
+            let resolved_file = paintable
+                .file()
+                .and_then(|file| file.path())
+                .expect("theme icon should resolve to an asset");
+            assert!(resolved_file.exists(), "resolved asset: {resolved_file:?}");
+            assert!(
+                !resolved_file
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with("-symbolic")),
+                "file-list icons must resolve to regular theme assets: {resolved_file:?}"
+            );
+        });
+    }
+
     fn listed_uris(store: &gio::ListStore) -> Vec<String> {
         (0..store.n_items())
             .filter_map(|i| {
@@ -802,6 +871,157 @@ mod tests {
                 icon: None,
             })
             .collect()
+    }
+
+    fn widget_contains_label(widget: &gtk::Widget, expected: &str) -> bool {
+        if widget
+            .clone()
+            .downcast::<gtk::Label>()
+            .is_ok_and(|label| label.text() == expected)
+        {
+            return true;
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if widget_contains_label(&current, expected) {
+                return true;
+            }
+            child = current.next_sibling();
+        }
+        false
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn details_cells_bind_and_native_column_headers_sort_both_directions() {
+        gtk::test_synced(|| {
+            let store = gio::ListStore::new::<FileObject>();
+            replace_all(&store, &fixture_entries(3));
+            let on_secondary: SecondaryHandler = Rc::new(|_, _, _, _| {});
+            let on_middle: MiddleHandler = Rc::new(|_| {});
+            let on_drag_prepare: DragPrepareHandler = Rc::new(|_| None);
+            let on_drop: DropHandler = Rc::new(|_, _, _, _, _| {});
+            let on_external_move: dnd::ExternalMoveHandler = Rc::new(|_| {});
+            let handlers = ViewHandlers {
+                on_secondary: &on_secondary,
+                on_middle: &on_middle,
+                on_drag_prepare: &on_drag_prepare,
+                on_drop: &on_drop,
+                on_external_move: &on_external_move,
+            };
+            let display = ViewDisplay {
+                icon_zoom: 100,
+                show_size: false,
+                show_type: true,
+                show_modified: false,
+            };
+            let sort_order = Rc::new(std::cell::Cell::new(kito_core::SortOrder::default()));
+            let observed_orders = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let on_sort: Rc<dyn Fn(kito_core::SortOrder)> = Rc::new({
+                let sort_order = sort_order.clone();
+                let observed_orders = observed_orders.clone();
+                move |order| {
+                    sort_order.set(order);
+                    observed_orders.borrow_mut().push(order);
+                }
+            });
+
+            let (widget, selection) = build_view(
+                ViewMode::Details,
+                &store,
+                &handlers,
+                OpenItems::DoubleClick,
+                display,
+                sort_order,
+                on_sort,
+            );
+            let view = widget.clone().downcast::<gtk::ColumnView>().unwrap();
+            // ColumnView.header_factory configures section headers, not the
+            // column titles. GTK's real ColumnViewCells still run the row factory.
+            assert!(view.header_factory().is_none());
+
+            let columns = view.columns();
+            let column = |id: &str| {
+                (0..columns.n_items())
+                    .filter_map(|index| columns.item(index).and_downcast::<gtk::ColumnViewColumn>())
+                    .find(|column| column.id().as_deref() == Some(id))
+                    .unwrap()
+            };
+            let name = column("name");
+            let size = column("size");
+            let kind = column("type");
+            let modified = column("modified");
+            assert!(name.sorter().is_some());
+            assert!(size.sorter().is_some());
+            assert!(kind.sorter().is_some());
+            assert!(modified.sorter().is_some());
+            assert!(name.is_visible());
+            assert!(!size.is_visible());
+            assert!(kind.is_visible());
+            assert!(!modified.is_visible());
+            let localized_name = crate::l10n::tr("column-name");
+            assert_eq!(name.title().as_deref(), Some(localized_name.as_str()));
+
+            // Map the real ColumnView so GTK invokes the row factory's setup and
+            // bind callbacks on its ColumnViewCell objects.
+            let window = gtk::Window::new();
+            window.set_default_size(640, 240);
+            window.set_child(Some(&widget));
+            window.present();
+            let context = glib::MainContext::default();
+            for _ in 0..10 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+            }
+            assert!(widget_contains_label(&widget, "file-00000"));
+
+            selection.select_item(1, false);
+            let view_sorter = view
+                .sorter()
+                .and_downcast::<gtk::ColumnViewSorter>()
+                .unwrap();
+            assert_eq!(
+                view_sorter
+                    .primary_sort_column()
+                    .and_then(|column| column.id())
+                    .as_deref(),
+                Some("name")
+            );
+            assert_eq!(view_sorter.primary_sort_order(), gtk::SortType::Ascending);
+
+            // `sort_by_column` is the same GTK sorter path used by clicking the
+            // native column header. It verifies first-click ascending, repeated
+            // clicks toggling direction, and the app's sort callback.
+            view.sort_by_column(Some(&name), gtk::SortType::Descending);
+            view.sort_by_column(Some(&name), gtk::SortType::Ascending);
+            view.sort_by_column(Some(&size), gtk::SortType::Ascending);
+            view.sort_by_column(Some(&size), gtk::SortType::Descending);
+            assert_eq!(
+                *observed_orders.borrow(),
+                vec![
+                    kito_core::SortOrder {
+                        field: kito_core::SortField::Name,
+                        direction: kito_core::SortDirection::Descending,
+                    },
+                    kito_core::SortOrder {
+                        field: kito_core::SortField::Name,
+                        direction: kito_core::SortDirection::Ascending,
+                    },
+                    kito_core::SortOrder {
+                        field: kito_core::SortField::Size,
+                        direction: kito_core::SortDirection::Ascending,
+                    },
+                    kito_core::SortOrder {
+                        field: kito_core::SortField::Size,
+                        direction: kito_core::SortDirection::Descending,
+                    },
+                ]
+            );
+            assert!(selection.is_selected(1));
+            assert_eq!(view_sorter.primary_sort_order(), gtk::SortType::Descending);
+            window.close();
+        });
     }
 
     #[test]
