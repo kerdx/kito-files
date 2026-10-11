@@ -4,7 +4,180 @@
 use glib::subclass::prelude::ObjectSubclassIsExt as _;
 use gtk::prelude::*;
 use gtk::{gio, glib};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+
+const THUMB_MAX_INPUT: u64 = 20 * 1024 * 1024;
+const THUMB_MAX_DIMENSION: i32 = 4096;
+const THUMB_MAX_PIXELS: i64 = 16 * 1024 * 1024;
+const THUMB_CACHE_LIMIT: usize = 128;
+// Bound decoded pixel memory as well as entry count (negative entries use zero bytes).
+const THUMB_CACHE_BYTE_LIMIT: usize = 32 * 1024 * 1024;
+const THUMB_MAX_ACTIVE: usize = 4;
+const THUMB_MAX_WAITING: usize = 256;
+
+#[derive(Clone)]
+struct ThumbnailPixels {
+    data: glib::Bytes,
+    width: i32,
+    height: i32,
+    rowstride: i32,
+    alpha: bool,
+}
+
+#[derive(Default)]
+struct ThumbnailBinding {
+    generation: std::cell::Cell<u64>,
+    uri: std::cell::RefCell<String>,
+}
+
+#[derive(Clone)]
+struct ThumbnailTarget {
+    image: glib::WeakRef<gtk::Image>,
+    binding: Rc<ThumbnailBinding>,
+    generation: u64,
+    uri: String,
+    max_size: i32,
+}
+
+impl ThumbnailTarget {
+    fn current_image(&self) -> Option<gtk::Image> {
+        let image = self.image.upgrade()?;
+        current_binding(&self.binding, self.generation, &self.uri).then_some(image)
+    }
+}
+
+struct ThumbnailQueue<T> {
+    active: usize,
+    order: VecDeque<String>,
+    waiting: HashMap<String, Vec<T>>,
+    running: HashMap<String, Vec<T>>,
+}
+
+trait ThumbnailQueueTarget {
+    fn same_widget(&self, other: &Self) -> bool;
+    fn is_live(&self) -> bool;
+}
+
+impl ThumbnailQueueTarget for ThumbnailTarget {
+    fn same_widget(&self, other: &Self) -> bool {
+        match (self.image.upgrade(), other.image.upgrade()) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.current_image().is_some()
+    }
+}
+
+impl<T> Default for ThumbnailQueue<T> {
+    fn default() -> Self {
+        Self {
+            active: 0,
+            order: VecDeque::new(),
+            waiting: HashMap::new(),
+            running: HashMap::new(),
+        }
+    }
+}
+
+impl<T> ThumbnailQueue<T> {
+    fn enqueue(&mut self, key: String, target: T) -> bool
+    where
+        T: ThumbnailQueueTarget,
+    {
+        // Remove dead/recycled targets across every key before accepting another
+        // request. Running jobs remain active even if no consumer remains.
+        for targets in self.waiting.values_mut().chain(self.running.values_mut()) {
+            targets.retain(ThumbnailQueueTarget::is_live);
+        }
+        let empty_waiting: Vec<_> = self
+            .waiting
+            .iter()
+            .filter_map(|(key, targets)| targets.is_empty().then_some(key.clone()))
+            .collect();
+        for old_key in empty_waiting {
+            self.waiting.remove(&old_key);
+            self.order.retain(|queued| queued != &old_key);
+        }
+        // A widget can have only one outstanding destination. Remove it from
+        // older jobs before inserting the newest binding, without cancelling
+        // shared/running work needed by other widgets.
+        for targets in self.waiting.values_mut().chain(self.running.values_mut()) {
+            targets.retain(|old| !old.same_widget(&target));
+        }
+        let empty_waiting: Vec<_> = self
+            .waiting
+            .iter()
+            .filter_map(|(key, targets)| targets.is_empty().then_some(key.clone()))
+            .collect();
+        for old_key in empty_waiting {
+            self.waiting.remove(&old_key);
+            self.order.retain(|queued| queued != &old_key);
+        }
+        if let Some(targets) = self.running.get_mut(&key) {
+            targets.push(target);
+            return true;
+        }
+        if let Some(targets) = self.waiting.get_mut(&key) {
+            targets.push(target);
+            return true;
+        }
+        if self.waiting.len() >= THUMB_MAX_WAITING {
+            return false;
+        }
+        self.order.push_back(key.clone());
+        self.waiting.insert(key, vec![target]);
+        true
+    }
+
+    fn start_next(&mut self) -> Option<(String, T)>
+    where
+        T: Clone,
+    {
+        if self.active >= THUMB_MAX_ACTIVE {
+            return None;
+        }
+        let key = self.order.pop_front()?;
+        let targets = self.waiting.remove(&key)?;
+        let first = targets.first()?.clone();
+        self.running.insert(key.clone(), targets);
+        self.active += 1;
+        Some((key, first))
+    }
+
+    fn targets_mut(&mut self, key: &str) -> Option<&mut Vec<T>> {
+        self.running.get_mut(key)
+    }
+
+    fn finish(&mut self, key: &str) -> Vec<T> {
+        self.active = self.active.saturating_sub(1);
+        self.running.remove(key).unwrap_or_default()
+    }
+}
+
+thread_local! {
+    static THUMB_CACHE: std::cell::RefCell<std::collections::VecDeque<(String, Option<ThumbnailPixels>)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static THUMB_QUEUE: std::cell::RefCell<ThumbnailQueue<ThumbnailTarget>> = std::cell::RefCell::new(ThumbnailQueue::default());
+}
+
+fn trim_thumbnail_cache(cache: &mut VecDeque<(String, Option<ThumbnailPixels>)>) {
+    let mut bytes: usize = cache
+        .iter()
+        .filter_map(|(_, pixels)| pixels.as_ref())
+        .map(|pixels| pixels.data.len())
+        .sum();
+    while cache.len() > THUMB_CACHE_LIMIT || bytes > THUMB_CACHE_BYTE_LIMIT {
+        let Some((_, removed)) = cache.pop_back() else {
+            break;
+        };
+        if let Some(pixels) = removed {
+            bytes = bytes.saturating_sub(pixels.data.len());
+        }
+    }
+}
 
 use crate::dnd::{self, DropHandler};
 pub use crate::preferences::model::ViewMode;
@@ -233,6 +406,237 @@ fn fallback_icon(is_dir: bool) -> gio::ThemedIcon {
     gio::ThemedIcon::new(if is_dir { "folder" } else { "text-x-generic" })
 }
 
+fn thumbnail_eligible(obj: &FileObject) -> bool {
+    !obj.is_dir()
+        && obj.size() >= 0
+        && obj.size() as u64 <= THUMB_MAX_INPUT
+        && obj
+            .imp()
+            .content_type
+            .borrow()
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/"))
+        && gio::File::for_uri(&obj.uri()).path().is_some()
+}
+
+fn thumbnail_key(obj: &FileObject, size: i32) -> String {
+    format!(
+        "{}:{}:{}:{size}",
+        obj.uri(),
+        obj.size(),
+        obj.modified().unwrap_or_default()
+    )
+}
+
+fn cached_thumbnail(key: &str) -> Option<Option<ThumbnailPixels>> {
+    THUMB_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|(k, _)| k == key)?;
+        let entry = cache.remove(index)?;
+        let value = entry.1.clone();
+        cache.push_front(entry);
+        Some(value)
+    })
+}
+
+fn remember_thumbnail(key: String, value: Option<ThumbnailPixels>) {
+    THUMB_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|(k, _)| k != &key);
+        cache.push_front((key, value));
+        trim_thumbnail_cache(&mut cache);
+    });
+}
+
+fn decode_thumbnail(uri: String, max_size: i32) -> Option<ThumbnailPixels> {
+    let path = gio::File::for_uri(&uri).path()?;
+    // Preflight avoids opening known special files. On Unix, O_NONBLOCK closes
+    // the preflight/open race for FIFOs; fstat then validates the opened inode.
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > THUMB_MAX_INPUT {
+        return None;
+    }
+    use std::io::Read as _;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(THUMB_MAX_INPUT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > THUMB_MAX_INPUT {
+        return None;
+    }
+    let loader = gdk_pixbuf::PixbufLoader::new();
+    let oversized = std::rc::Rc::new(std::cell::Cell::new(false));
+    let oversized_signal = oversized.clone();
+    loader.connect_size_prepared(move |loader, width, height| {
+        if width <= 0
+            || height <= 0
+            || width > THUMB_MAX_DIMENSION
+            || height > THUMB_MAX_DIMENSION
+            || i64::from(width) * i64::from(height) > THUMB_MAX_PIXELS
+        {
+            oversized_signal.set(true);
+            // GdkPixbuf emits this before allocating the decoded surface.
+            loader.set_size(1, 1);
+        }
+    });
+    loader.write(&bytes).ok()?;
+    loader.close().ok()?;
+    if oversized.get() {
+        return None;
+    }
+    let source = loader.pixbuf()?;
+    let (width, height) = (source.width(), source.height());
+    if width <= 0
+        || height <= 0
+        || width > THUMB_MAX_DIMENSION
+        || height > THUMB_MAX_DIMENSION
+        || i64::from(width) * i64::from(height) > THUMB_MAX_PIXELS
+    {
+        return None;
+    }
+    let scale = (max_size as f64 / f64::from(width.max(height))).min(1.0);
+    let width = ((f64::from(width) * scale).round() as i32).max(1);
+    let height = ((f64::from(height) * scale).round() as i32).max(1);
+    let thumb = source.scale_simple(width, height, gdk_pixbuf::InterpType::Bilinear)?;
+    Some(ThumbnailPixels {
+        data: thumb.read_pixel_bytes(),
+        width,
+        height,
+        rowstride: thumb.rowstride(),
+        alpha: thumb.has_alpha(),
+    })
+}
+
+fn current_binding(binding: &ThumbnailBinding, generation: u64, uri: &str) -> bool {
+    binding.generation.get() == generation && binding.uri.borrow().as_str() == uri
+}
+
+fn invalidate_thumbnail_binding(image: &gtk::Image) {
+    let key = glib::Quark::from_str("kito-thumbnail-binding");
+    if let Some(binding) = unsafe { image.qdata::<Rc<ThumbnailBinding>>(key) }
+        .map(|value| unsafe { value.as_ref().clone() })
+    {
+        binding
+            .generation
+            .set(binding.generation.get().wrapping_add(1));
+        binding.uri.borrow_mut().clear();
+    }
+}
+
+fn start_thumbnail(image: &gtk::Image, obj: &FileObject, max_size: i32) {
+    let max_size = max_size.saturating_mul(image.scale_factor()).clamp(1, 512);
+    let key = thumbnail_key(obj, max_size);
+    let uri = obj.uri();
+    let qkey = glib::Quark::from_str("kito-thumbnail-binding");
+    let binding = unsafe { image.qdata::<Rc<ThumbnailBinding>>(qkey) }
+        .map(|value| unsafe { value.as_ref().clone() })
+        .unwrap_or_else(|| {
+            let binding = Rc::new(ThumbnailBinding::default());
+            unsafe {
+                image.set_qdata(qkey, binding.clone());
+            }
+            binding
+        });
+    let generation = binding.generation.get().wrapping_add(1);
+    binding.generation.set(generation);
+    *binding.uri.borrow_mut() = uri.clone();
+    if let Some(cached) = cached_thumbnail(&key) {
+        if let Some(pixels) = cached {
+            apply_thumbnail(image, &pixels);
+        }
+        return;
+    }
+    let target = ThumbnailTarget {
+        image: image.downgrade(),
+        binding,
+        generation,
+        uri,
+        max_size,
+    };
+    // Queue by versioned key: duplicate binds share one decode while retaining
+    // all currently bound cells that need the result. Overflow keeps fallback.
+    let accepted = THUMB_QUEUE.with(|queue| queue.borrow_mut().enqueue(key, target));
+    if accepted {
+        pump_thumbnail_queue();
+    }
+}
+
+fn pump_thumbnail_queue() {
+    loop {
+        let next = THUMB_QUEUE.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            queue.start_next()
+        });
+        let Some((key, _)) = next else {
+            break;
+        };
+        let target = THUMB_QUEUE.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            let targets = queue.targets_mut(&key)?;
+            targets.retain(|target| target.current_image().is_some());
+            targets.first().cloned()
+        });
+        let Some(target) = target else {
+            discard_thumbnail_job(&key);
+            continue;
+        };
+        let uri = target.uri.clone();
+        let max_size = target.max_size;
+        let worker_key = key.clone();
+        let task = gio::spawn_blocking(move || decode_thumbnail(uri, max_size));
+        glib::MainContext::default().spawn_local(async move {
+            let result = task.await.ok().flatten();
+            finish_thumbnail_job(&worker_key, result);
+        });
+    }
+}
+
+fn discard_thumbnail_job(key: &str) {
+    THUMB_QUEUE.with(|queue| {
+        queue.borrow_mut().finish(key);
+    });
+}
+
+fn finish_thumbnail_job(key: &str, result: Option<ThumbnailPixels>) {
+    remember_thumbnail(key.to_string(), result.clone());
+    let targets = THUMB_QUEUE.with(|queue| queue.borrow_mut().finish(key));
+    for target in targets {
+        if let (Some(image), Some(pixels)) = (target.current_image(), result.as_ref()) {
+            apply_thumbnail(&image, pixels);
+        }
+    }
+    pump_thumbnail_queue();
+}
+
+fn apply_thumbnail(image: &gtk::Image, pixels: &ThumbnailPixels) {
+    let texture = gtk::gdk::MemoryTexture::new(
+        pixels.width,
+        pixels.height,
+        if pixels.alpha {
+            gtk::gdk::MemoryFormat::R8g8b8a8
+        } else {
+            gtk::gdk::MemoryFormat::R8g8b8
+        },
+        &pixels.data,
+        pixels.rowstride as usize,
+    );
+    image.set_paintable(Some(&texture));
+}
+
 /// Resolve file-list icons as regular artwork. GtkImage's default GIcon lookup
 /// can select a symbolic companion from a GThemedIcon's name/fallback list;
 /// the symbolic variants in some themes are monochrome even when the regular
@@ -255,6 +659,13 @@ fn set_file_list_icon(image: &gtk::Image, icon: &impl IsA<gio::Icon>) {
 }
 
 fn refresh_file_list_icon(image: &gtk::Image, state: &Rc<std::cell::RefCell<Option<gio::Icon>>>) {
+    let thumbnail_key = glib::Quark::from_str("kito-thumbnail-binding");
+    if unsafe { image.qdata::<Rc<ThumbnailBinding>>(thumbnail_key) }
+        .map(|value| unsafe { value.as_ref().uri.borrow().is_empty() })
+        == Some(false)
+    {
+        return;
+    }
     let Some(icon) = state.borrow().clone() else {
         return;
     };
@@ -360,10 +771,14 @@ fn name_factory(
             let row = list_item.child().and_downcast::<gtk::Box>().unwrap();
             let icon = row.first_child().and_downcast::<gtk::Image>().unwrap();
             let label = row.last_child().and_downcast::<gtk::Label>().unwrap();
+            invalidate_thumbnail_binding(&icon);
             label.set_text(&obj.name());
             match obj.icon() {
                 Some(gicon) => set_file_list_icon(&icon, &gicon),
                 None => set_file_list_icon(&icon, &fallback_icon(obj.is_dir())),
+            }
+            if thumbnail_eligible(&obj) {
+                start_thumbnail(&icon, &obj, pixel_size);
             }
             set_secondary(&row, &obj, &on_secondary);
             set_middle(&row, &obj, &on_middle);
@@ -377,6 +792,16 @@ fn name_factory(
                 on_drop.clone(),
                 on_external_move.clone(),
             );
+        }
+    });
+    factory.connect_unbind(|_, list_item| {
+        if let Some(image) = list_item
+            .downcast_ref::<gtk::ListItem>()
+            .and_then(|item| item.child())
+            .and_then(|row| row.first_child())
+            .and_downcast::<gtk::Image>()
+        {
+            invalidate_thumbnail_binding(&image);
         }
     });
     factory
@@ -727,10 +1152,14 @@ fn build_icons(
         let cell = list_item.child().and_downcast::<gtk::Box>().unwrap();
         let image = cell.first_child().and_downcast::<gtk::Image>().unwrap();
         let label = cell.last_child().and_downcast::<gtk::Label>().unwrap();
+        invalidate_thumbnail_binding(&image);
         label.set_text(&obj.name());
         match obj.icon() {
             Some(gicon) => image.set_from_gicon(&gicon),
             None => image.set_from_gicon(&fallback_icon(obj.is_dir())),
+        }
+        if thumbnail_eligible(&obj) {
+            start_thumbnail(&image, &obj, icon_pixel_size(zoom));
         }
         set_secondary(&cell, &obj, &on_secondary);
         set_middle(&cell, &obj, &on_middle);
@@ -744,6 +1173,16 @@ fn build_icons(
             on_drop.clone(),
             on_external_move.clone(),
         );
+    });
+    factory.connect_unbind(|_, list_item| {
+        if let Some(image) = list_item
+            .downcast_ref::<gtk::ListItem>()
+            .and_then(|item| item.child())
+            .and_then(|cell| cell.first_child())
+            .and_downcast::<gtk::Image>()
+        {
+            invalidate_thumbnail_binding(&image);
+        }
     });
     gtk::GridView::new(Some(selection), Some(factory))
 }
@@ -881,6 +1320,379 @@ pub fn reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_entry(uri: String, size: i64, mime: &str) -> FileObject {
+        FileObject::new(&kito_core::Entry {
+            name: "fixture.png".into(),
+            uri,
+            is_dir: false,
+            size,
+            modified: Some(1),
+            content_type: Some(mime.into()),
+            icon: None,
+        })
+    }
+
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
+        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    #[test]
+    fn thumbnails_require_local_regular_image_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.png");
+        std::fs::write(&path, PNG).unwrap();
+        let uri = gio::File::for_path(&path).uri().to_string();
+        assert!(thumbnail_eligible(&image_entry(
+            uri.clone(),
+            PNG.len() as i64,
+            "image/png"
+        )));
+        assert!(!thumbnail_eligible(&image_entry(
+            uri.clone(),
+            PNG.len() as i64,
+            "text/plain"
+        )));
+        assert!(!thumbnail_eligible(&image_entry(
+            "https://example.invalid/x.png".into(),
+            1,
+            "image/png"
+        )));
+        assert!(!thumbnail_eligible(&image_entry(
+            uri,
+            (THUMB_MAX_INPUT + 1) as i64,
+            "image/png"
+        )));
+    }
+
+    #[test]
+    fn thumbnail_decode_is_bounded_and_bad_inputs_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.png");
+        std::fs::write(&path, PNG).unwrap();
+        let uri = gio::File::for_path(&path).uri().to_string();
+        let thumb = decode_thumbnail(uri.clone(), 32).unwrap();
+        assert_eq!((thumb.width, thumb.height), (1, 1));
+        assert!(thumb.data.len() <= 4);
+        std::fs::write(&path, b"not an image").unwrap();
+        assert!(decode_thumbnail(uri.clone(), 32).is_none());
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(THUMB_MAX_INPUT + 1).unwrap();
+        assert!(decode_thumbnail(uri, 32).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thumbnail_decode_rejects_fifo_without_writer() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.fifo");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // No external command or writer: a blocking open would hang this test.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let uri = gio::File::for_path(path).uri().to_string();
+        assert!(decode_thumbnail(uri, 32).is_none());
+    }
+
+    #[test]
+    fn recycled_thumbnail_binding_rejects_stale_uri_or_generation() {
+        let binding = ThumbnailBinding::default();
+        binding.generation.set(8);
+        *binding.uri.borrow_mut() = "file:///new".into();
+        assert!(current_binding(&binding, 8, "file:///new"));
+        assert!(!current_binding(&binding, 7, "file:///new"));
+        assert!(!current_binding(&binding, 8, "file:///old"));
+    }
+
+    #[test]
+    fn thumbnail_queue_services_fifo_with_four_active_dedups_and_skips_stale() {
+        #[derive(Clone)]
+        struct Request {
+            widget: usize,
+            id: usize,
+            valid: bool,
+            uri: String,
+        }
+        impl ThumbnailQueueTarget for Request {
+            fn same_widget(&self, other: &Self) -> bool {
+                self.widget == other.widget
+            }
+            fn is_live(&self) -> bool {
+                self.valid
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = ThumbnailQueue::default();
+        for id in 0..8 {
+            let path = dir.path().join(format!("{id}.png"));
+            std::fs::write(&path, PNG).unwrap();
+            assert!(queue.enqueue(
+                format!("key-{id}"),
+                Request {
+                    widget: id,
+                    id,
+                    valid: true,
+                    uri: gio::File::for_path(path).uri().to_string(),
+                }
+            ));
+        }
+        // Same key is coalesced into one queued decode with both consumers.
+        assert!(queue.enqueue(
+            "key-3".into(),
+            Request {
+                widget: 30,
+                id: 30,
+                valid: true,
+                uri: gio::File::for_path(dir.path().join("3.png"))
+                    .uri()
+                    .to_string(),
+            }
+        ));
+        // This request becomes stale before its turn in the FIFO.
+        assert!(queue.enqueue(
+            "stale".into(),
+            Request {
+                widget: 99,
+                id: 99,
+                valid: false,
+                uri: gio::File::for_path(dir.path().join("stale.png"))
+                    .uri()
+                    .to_string(),
+            }
+        ));
+        std::fs::write(dir.path().join("stale.png"), PNG).unwrap();
+
+        let mut active = Vec::new();
+        while let Some((key, first)) = queue.start_next() {
+            active.push(key);
+            assert_eq!(queue.active, active.len());
+            assert!(queue.active <= THUMB_MAX_ACTIVE);
+            assert_eq!(first.id, active.len() - 1);
+        }
+        assert_eq!(active.len(), 4);
+
+        let mut completed = Vec::new();
+        while !active.is_empty() || !queue.order.is_empty() {
+            if let Some(key) = active.pop() {
+                let targets = queue.finish(&key);
+                let current: Vec<_> = targets.into_iter().filter(|target| target.valid).collect();
+                if let Some(target) = current.first() {
+                    assert!(decode_thumbnail(target.uri.clone(), 24).is_some());
+                    completed.extend(current.into_iter().map(|target| target.id));
+                }
+            }
+            while let Some((key, _)) = queue.start_next() {
+                let targets = queue.targets_mut(&key).unwrap();
+                targets.retain(|target| target.valid);
+                if targets.is_empty() {
+                    queue.finish(&key);
+                } else {
+                    active.push(key);
+                }
+                assert!(queue.active <= THUMB_MAX_ACTIVE);
+            }
+        }
+        assert!((0..8).all(|id| completed.contains(&id)));
+        assert!(completed.contains(&30));
+        assert!(!completed.contains(&99));
+        assert_eq!(queue.active, 0);
+    }
+
+    #[test]
+    fn thumbnail_queue_bounds_unique_waiting_jobs() {
+        #[derive(Clone)]
+        struct Request(usize);
+        impl ThumbnailQueueTarget for Request {
+            fn same_widget(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+            fn is_live(&self) -> bool {
+                true
+            }
+        }
+        let mut queue = ThumbnailQueue::default();
+        for id in 0..THUMB_MAX_ACTIVE {
+            assert!(queue.enqueue(format!("active-{id}"), Request(id)));
+        }
+        for _ in 0..THUMB_MAX_ACTIVE {
+            queue.start_next().unwrap();
+        }
+        for id in 0..THUMB_MAX_WAITING {
+            assert!(queue.enqueue(format!("waiting-{id}"), Request(id + THUMB_MAX_ACTIVE)));
+        }
+        assert_eq!(queue.waiting.len(), THUMB_MAX_WAITING);
+        assert!(!queue.enqueue("overflow".into(), Request(usize::MAX)));
+        assert_eq!(queue.waiting.len(), THUMB_MAX_WAITING);
+    }
+
+    #[test]
+    fn thumbnail_queue_rebind_replaces_widget_target_across_keys() {
+        #[derive(Clone)]
+        struct Request {
+            widget: usize,
+            generation: usize,
+        }
+        impl ThumbnailQueueTarget for Request {
+            fn same_widget(&self, other: &Self) -> bool {
+                self.widget == other.widget
+            }
+            fn is_live(&self) -> bool {
+                true
+            }
+        }
+
+        let mut queue = ThumbnailQueue::default();
+        for generation in 0..1000 {
+            assert!(queue.enqueue(
+                "same".into(),
+                Request {
+                    widget: 1,
+                    generation
+                }
+            ));
+            assert_eq!(queue.waiting["same"].len(), 1);
+        }
+        assert_eq!(queue.waiting["same"][0].generation, 999);
+
+        queue.enqueue(
+            "shared".into(),
+            Request {
+                widget: 2,
+                generation: 1,
+            },
+        );
+        queue.enqueue(
+            "shared".into(),
+            Request {
+                widget: 3,
+                generation: 1,
+            },
+        );
+        queue.enqueue(
+            "new-key".into(),
+            Request {
+                widget: 1,
+                generation: 1000,
+            },
+        );
+        assert!(!queue.waiting.contains_key("same"));
+        assert_eq!(queue.waiting["new-key"].len(), 1);
+        assert_eq!(queue.waiting["shared"].len(), 2);
+        assert_eq!(queue.waiting["new-key"][0].generation, 1000);
+    }
+
+    #[test]
+    fn thumbnail_queue_repeatedly_prunes_dead_targets_across_all_keys() {
+        #[derive(Clone)]
+        struct Request {
+            widget: usize,
+            alive: bool,
+        }
+        impl ThumbnailQueueTarget for Request {
+            fn same_widget(&self, other: &Self) -> bool {
+                self.widget == other.widget
+            }
+            fn is_live(&self) -> bool {
+                self.alive
+            }
+        }
+
+        let mut queue = ThumbnailQueue::default();
+        assert!(queue.enqueue(
+            "running".into(),
+            Request {
+                widget: 1,
+                alive: true
+            }
+        ));
+        queue.start_next().unwrap();
+        // Keep a valid sibling attached to the running shared job.
+        assert!(queue.enqueue(
+            "running".into(),
+            Request {
+                widget: 2,
+                alive: true
+            }
+        ));
+        assert!(queue.enqueue(
+            "dead-waiting".into(),
+            Request {
+                widget: 3,
+                alive: false
+            }
+        ));
+        assert_eq!(queue.waiting.len(), 1);
+        for id in 0..1000 {
+            assert!(queue.enqueue(
+                "fresh".into(),
+                Request {
+                    widget: id + 10,
+                    alive: true
+                }
+            ));
+            assert!(!queue.waiting.contains_key("dead-waiting"));
+            assert!(!queue.order.iter().any(|key| key == "dead-waiting"));
+            assert_eq!(queue.running["running"].len(), 2);
+            // Newly introduced dead targets in arbitrary buckets are pruned on
+            // the next request, never accumulating with rebuilds.
+            assert!(queue.enqueue(
+                "dead".into(),
+                Request {
+                    widget: id + 2000,
+                    alive: false
+                }
+            ));
+            assert!(queue.enqueue(
+                "cleanup".into(),
+                Request {
+                    widget: id + 4000,
+                    alive: true
+                }
+            ));
+            assert!(!queue.waiting.contains_key("dead"));
+            assert_eq!(queue.waiting.len(), 2);
+        }
+        assert_eq!(queue.finish("running").len(), 2);
+    }
+
+    #[test]
+    fn thumbnail_cache_obeys_entry_and_byte_budgets() {
+        let pixels = |size: usize| {
+            Some(ThumbnailPixels {
+                data: glib::Bytes::from_owned(vec![0; size]),
+                width: 1,
+                height: 1,
+                rowstride: 4,
+                alpha: true,
+            })
+        };
+        let mut cache = std::collections::VecDeque::new();
+        cache.push_front(("negative".into(), None));
+        cache.push_front(("old-large".into(), pixels(THUMB_CACHE_BYTE_LIMIT / 2 + 1)));
+        cache.push_front(("new-large".into(), pixels(THUMB_CACHE_BYTE_LIMIT / 2 + 1)));
+        trim_thumbnail_cache(&mut cache);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].0, "new-large");
+        assert_eq!(
+            cache
+                .iter()
+                .map(|(_, p)| p.as_ref().map_or(0, |p| p.data.len()))
+                .sum::<usize>(),
+            THUMB_CACHE_BYTE_LIMIT / 2 + 1
+        );
+
+        let mut cache = std::collections::VecDeque::new();
+        for id in 0..=THUMB_CACHE_LIMIT {
+            cache.push_front((id.to_string(), None));
+        }
+        trim_thumbnail_cache(&mut cache);
+        assert_eq!(cache.len(), THUMB_CACHE_LIMIT);
+        assert_eq!(cache.front().unwrap().0, THUMB_CACHE_LIMIT.to_string());
+    }
 
     #[test]
     fn open_setting_only_switches_gtk_pointer_activation() {
