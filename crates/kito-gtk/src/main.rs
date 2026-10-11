@@ -78,10 +78,7 @@ fn view_choice_button(mode: ViewMode) -> gtk::ToggleButton {
     content.append(&icon);
     content.append(&check);
 
-    let button = gtk::ToggleButton::builder()
-        .hexpand(true)
-        .tooltip_text(&label)
-        .build();
+    let button = gtk::ToggleButton::builder().tooltip_text(&label).build();
     button.update_property(&[gtk::accessible::Property::Label(&label)]);
     button.set_child(Some(&content));
     button.connect_toggled(move |button| {
@@ -276,7 +273,7 @@ fn register_actions(
     single_item_actions: Rc<RefCell<Vec<gio::SimpleAction>>>,
 ) {
     let group = gio::SimpleActionGroup::new();
-    let defs: [ActionDef; 44] = [
+    let defs: [ActionDef; 45] = [
         ("open", ops::Ctx::open_selected),
         ("open-in-new-tab", ops::Ctx::open_selected_in_new_tabs),
         ("open-in-new-window", ops::Ctx::open_selected_in_new_window),
@@ -300,6 +297,7 @@ fn register_actions(
         ("empty-trash", ops::Ctx::empty_trash),
         ("restore", ops::Ctx::restore_selected),
         ("pin", ops::Ctx::toggle_pin),
+        ("bookmark-current", ops::Ctx::bookmark_current_folder),
         ("favorite", ops::Ctx::toggle_favorite),
         ("cut", |c| c.copy_selected(true)),
         ("copy", |c| c.copy_selected(false)),
@@ -490,6 +488,12 @@ fn load_pathbar_css() {
         }\
         .side-row.active:hover {\
             background-color: alpha(@window_fg_color, 0.24);\
+        }\
+        .side-row.bookmark-drop-before {\
+            border-top: 2px solid @accent_color;\
+        }\
+        .side-row.bookmark-drop-after {\
+            border-bottom: 2px solid @accent_color;\
         }\
         .side-label {\
             color: alpha(@window_fg_color, 0.85);\
@@ -969,6 +973,28 @@ fn build_window(
     nav.append(&up_button);
     header_contents.append(&nav);
     header_contents.append(&path_stack);
+    let bookmark_popover = gtk::Popover::new();
+    let bookmark_action_row = gtk::Button::builder()
+        .label(tr("side-bookmark-current"))
+        .has_frame(false)
+        .build();
+    bookmark_action_row.update_property(&[gtk::accessible::Property::Label(&tr(
+        "side-bookmark-current",
+    ))]);
+    bookmark_popover.set_child(Some(&bookmark_action_row));
+    let bookmark_current = gtk::MenuButton::builder()
+        .popover(&bookmark_popover)
+        .tooltip_text(tr("side-bookmark-current"))
+        .build();
+    bookmark_current.set_child(Some(&gtk::Image::from_gicon(&icons::control_icon(&[
+        "bookmark-new-symbolic",
+        "bookmark-new",
+        "list-add-symbolic",
+        "list-add",
+    ]))));
+    let bookmark_label = tr("side-bookmark-current");
+    bookmark_current.update_property(&[gtk::accessible::Property::Label(&bookmark_label)]);
+    header_contents.append(&bookmark_current);
 
     // The view popover contains only view modes and the hidden-file switch.
     let initial_view = preferences.snapshot().default_view;
@@ -1177,11 +1203,43 @@ fn build_window(
         .css_classes(["status-bar"])
         .build();
     status_bar.append(&status);
+    let status_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    status_spacer.set_hexpand(true);
+    status_bar.append(&status_spacer);
     status_bar.append(&zoom_controls);
+    let initial_status = preferences.snapshot();
+    status.set_visible(initial_status.show_status_item_count);
+    zoom_controls.set_visible(initial_status.show_status_zoom_controls);
+    status_bar.set_visible(
+        initial_status.show_status_item_count || initial_status.show_status_zoom_controls,
+    );
     right.append(&status_bar);
 
     // Manager slot: needed by breadcrumbs (created before the manager).
     let manager_slot: Rc<RefCell<Option<Rc<tabs::TabManager>>>> = Rc::new(RefCell::new(None));
+    let bookmark_button = bookmark_current.downgrade();
+    let bookmark_manager = Rc::downgrade(&manager_slot);
+    preferences.subscribe_bookmarks(Rc::new(move || {
+        let (Some(button), Some(manager_slot)) =
+            (bookmark_button.upgrade(), bookmark_manager.upgrade())
+        else {
+            return;
+        };
+        let uri = manager_slot
+            .borrow()
+            .as_ref()
+            .and_then(|manager| manager.selected_uri());
+        let bookmarkable = uri
+            .as_deref()
+            .is_some_and(ops::current_location_bookmarkable);
+        let already = uri.as_deref().is_some_and(kito_core::bookmarks::is_pinned);
+        button.set_sensitive(bookmarkable && !already);
+        button.set_tooltip_text(Some(&tr(if already {
+            "side-bookmark-exists"
+        } else {
+            "side-bookmark-current"
+        })));
+    }));
     type PathCompletionInvalidator = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
     let path_completion_invalidator: PathCompletionInvalidator = Rc::new(RefCell::new(None));
     let slot_load: Rc<dyn Fn(&str)> = Rc::new({
@@ -1280,6 +1338,7 @@ fn build_window(
         let crumbs_scroll = crumbs_scroll.clone();
         let set_status = set_status.clone();
         let manager_slot = manager_slot.clone();
+        let bookmark_current = bookmark_current.downgrade();
         move |uri: &str, n: usize, mode: ViewMode| {
             // A completed navigation (or tab switch) retires any open
             // background menu: its captured folder may no longer apply.
@@ -1303,6 +1362,16 @@ fn build_window(
             window.set_title(Some(&format!("{name} — Kito Files")));
             if let Some(sidebar) = sidebar_slot.borrow().as_ref() {
                 sidebar.set_active(uri);
+            }
+            if let Some(button) = bookmark_current.upgrade() {
+                let bookmarkable = ops::current_location_bookmarkable(uri);
+                let already = bookmarkable && kito_core::bookmarks::is_pinned(uri);
+                button.set_sensitive(bookmarkable && !already);
+                button.set_tooltip_text(Some(&tr(if already {
+                    "side-bookmark-exists"
+                } else {
+                    "side-bookmark-current"
+                })));
             }
             set_status(n, 0);
             update_view_control(
@@ -1354,7 +1423,19 @@ fn build_window(
         let size_switch = size_column_switch.downgrade();
         let type_switch = type_column_switch.downgrade();
         let modified_switch = modified_column_switch.downgrade();
+        let status = status.downgrade();
+        let zoom_controls = zoom_controls.downgrade();
+        let status_bar = status_bar.downgrade();
         Rc::new(move |prefs| {
+            if let (Some(status), Some(zoom), Some(bar)) = (
+                status.upgrade(),
+                zoom_controls.upgrade(),
+                status_bar.upgrade(),
+            ) {
+                status.set_visible(prefs.show_status_item_count);
+                zoom.set_visible(prefs.show_status_zoom_controls);
+                bar.set_visible(prefs.show_status_item_count || prefs.show_status_zoom_controls);
+            }
             if prefs.icon_zoom != synced_zoom.get() {
                 zoom_generation.set(zoom_generation.get().wrapping_add(1));
                 syncing_zoom.set(true);
@@ -1580,6 +1661,19 @@ fn build_window(
         preferences_dialog.clone(),
         single_item_actions,
     );
+    bookmark_action_row.connect_clicked({
+        let window = window.downgrade();
+        let popover = bookmark_popover.downgrade();
+        move |_| {
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
+            if let Some(window) = window.upgrade() {
+                let _ =
+                    gtk::prelude::WidgetExt::activate_action(&window, "win.bookmark-current", None);
+            }
+        }
+    });
 
     // System clipboard decides what to paste: track ownership changes.
     // Weak reference: the display outlives the window, no cycle.
@@ -1654,6 +1748,8 @@ fn build_window(
         let details_btn = details_btn.downgrade();
         let hidden_label = hidden_label.downgrade();
         let hidden_switch = hidden_switch.downgrade();
+        let bookmark_current = bookmark_current.downgrade();
+        let bookmark_action_row = bookmark_action_row.downgrade();
         Rc::new(move |_| {
             if let Some(button) = back_button.upgrade() {
                 button.set_tooltip_text(Some(&tr("nav-back")));
@@ -1699,6 +1795,16 @@ fn build_window(
             }
             if let Some(button) = new_tab_button.upgrade() {
                 button.set_tooltip_text(Some(&tr("nav-new-tab")));
+            }
+            if let Some(button) = bookmark_current.upgrade() {
+                let label = tr("side-bookmark-current");
+                button.set_tooltip_text(Some(&label));
+                button.update_property(&[gtk::accessible::Property::Label(&label)]);
+            }
+            if let Some(button) = bookmark_action_row.upgrade() {
+                let label = tr("side-bookmark-current");
+                button.set_label(&label);
+                button.update_property(&[gtk::accessible::Property::Label(&label)]);
             }
             if let Some(button) = icons_btn.upgrade() {
                 update_view_choice_label(&button, &tr("view-icons"));

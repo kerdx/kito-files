@@ -196,6 +196,8 @@ pub struct Preferences {
     pub show_size_column: bool,
     pub show_type_column: bool,
     pub show_modified_column: bool,
+    pub show_status_item_count: bool,
+    pub show_status_zoom_controls: bool,
     pub detail_column_widths: DetailColumnWidths,
     /// Stable, non-localized sidebar row identifiers hidden in this app.
     pub hidden_sidebar_ids: Vec<String>,
@@ -217,6 +219,8 @@ impl Default for Preferences {
             show_size_column: true,
             show_type_column: true,
             show_modified_column: false,
+            show_status_item_count: true,
+            show_status_zoom_controls: true,
             detail_column_widths: DetailColumnWidths::DEFAULT,
             hidden_sidebar_ids: Vec::new(),
             custom_sidebar_uris: Vec::new(),
@@ -275,6 +279,14 @@ impl Preferences {
                         .filter(|zoom| (ICON_ZOOM_MIN..=ICON_ZOOM_MAX).contains(zoom))
                         .unwrap_or(100);
                 }
+                "show-status-item-count" => {
+                    result.show_status_item_count =
+                        WindowControls::parse_bool(value).unwrap_or(true);
+                }
+                "show-status-zoom-controls" => {
+                    result.show_status_zoom_controls =
+                        WindowControls::parse_bool(value).unwrap_or(true);
+                }
                 "show-size-column" => {
                     result.show_size_column = WindowControls::parse_bool(value).unwrap_or(true);
                 }
@@ -306,7 +318,7 @@ impl Preferences {
         result
     }
 
-    pub fn config_entries(&self) -> [(&'static str, String); 19] {
+    pub fn config_entries(&self) -> [(&'static str, String); 21] {
         [
             (
                 "default-view",
@@ -339,6 +351,14 @@ impl Preferences {
             (
                 "show-type-column",
                 WindowControls::as_config_bool(self.show_type_column).to_string(),
+            ),
+            (
+                "show-status-item-count",
+                WindowControls::as_config_bool(self.show_status_item_count).to_string(),
+            ),
+            (
+                "show-status-zoom-controls",
+                WindowControls::as_config_bool(self.show_status_zoom_controls).to_string(),
             ),
             (
                 "show-modified-column",
@@ -557,6 +577,43 @@ mod tests {
         assert_eq!(invalid.icon_zoom, 100);
         assert!(invalid.show_size_column);
         assert!(!invalid.show_type_column && !invalid.show_modified_column);
+    }
+
+    #[test]
+    fn status_bar_items_default_on_and_round_trip_independently() {
+        let defaults = Preferences::default();
+        assert!(defaults.show_status_item_count);
+        assert!(defaults.show_status_zoom_controls);
+
+        let parsed = Preferences::from_config_text(
+            "show-status-item-count = false\nshow-status-zoom-controls = true\n",
+        );
+        assert!(!parsed.show_status_item_count);
+        assert!(parsed.show_status_zoom_controls);
+
+        let entries = parsed.config_entries();
+        assert_eq!(
+            entries
+                .iter()
+                .find(|(key, _)| *key == "show-status-item-count")
+                .unwrap()
+                .1,
+            "false"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|(key, _)| *key == "show-status-zoom-controls")
+                .unwrap()
+                .1,
+            "true"
+        );
+
+        let invalid = Preferences::from_config_text(
+            "show-status-item-count = maybe\nshow-status-zoom-controls = invalid\n",
+        );
+        assert!(invalid.show_status_item_count);
+        assert!(invalid.show_status_zoom_controls);
     }
 
     #[test]

@@ -56,7 +56,7 @@ impl PreferenceStore {
     }
 
     #[cfg(test)]
-    fn at_path(path: PathBuf) -> Rc<Self> {
+    pub(crate) fn at_path(path: PathBuf) -> Rc<Self> {
         Rc::new(Self {
             current: Rc::new(RefCell::new(storage::load_from(&path))),
             detail_width_generation: Cell::new(0),
@@ -157,6 +157,24 @@ impl PreferenceStore {
         self.save()
     }
 
+    pub fn set_show_status_item_count(&self, show: bool) -> io::Result<()> {
+        if self.current.borrow().show_status_item_count == show {
+            return Ok(());
+        }
+        self.current.borrow_mut().show_status_item_count = show;
+        self.notify_display();
+        self.save()
+    }
+
+    pub fn set_show_status_zoom_controls(&self, show: bool) -> io::Result<()> {
+        if self.current.borrow().show_status_zoom_controls == show {
+            return Ok(());
+        }
+        self.current.borrow_mut().show_status_zoom_controls = show;
+        self.notify_display();
+        self.save()
+    }
+
     pub fn set_show_modified_column(&self, show: bool) -> io::Result<()> {
         if self.current.borrow().show_modified_column == show {
             return Ok(());
@@ -197,24 +215,6 @@ impl PreferenceStore {
     /// Persist the complete current snapshot (including any debounced values).
     pub fn flush(&self) -> io::Result<()> {
         self.save()
-    }
-
-    pub fn set_sidebar_hidden(&self, id: &str, hidden: bool) -> io::Result<()> {
-        let previous = self.snapshot();
-        let mut prefs = self.current.borrow_mut();
-        if hidden && !prefs.hidden_sidebar_ids.iter().any(|item| item == id) {
-            prefs.hidden_sidebar_ids.push(id.to_string());
-        } else if !hidden {
-            prefs.hidden_sidebar_ids.retain(|item| item != id);
-        }
-        drop(prefs);
-        self.save_sidebar_change(previous)
-    }
-
-    pub fn restore_sidebar(&self) -> io::Result<()> {
-        let previous = self.snapshot();
-        self.current.borrow_mut().hidden_sidebar_ids.clear();
-        self.save_sidebar_change(previous)
     }
 
     #[cfg(test)]
@@ -372,6 +372,31 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_visibility_changes_persist_and_notify_all_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.conf");
+        let store = PreferenceStore::at_path(path.clone());
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        store.subscribe_display({
+            let observed = observed.clone();
+            Rc::new(move |snapshot| {
+                observed.borrow_mut().push((
+                    snapshot.show_status_item_count,
+                    snapshot.show_status_zoom_controls,
+                ));
+            })
+        });
+
+        store.set_show_status_item_count(false).unwrap();
+        store.set_show_status_zoom_controls(false).unwrap();
+
+        assert_eq!(*observed.borrow(), [(false, true), (false, false)]);
+        let persisted = storage::load_from(&path);
+        assert!(!persisted.show_status_item_count);
+        assert!(!persisted.show_status_zoom_controls);
+    }
+
+    #[test]
     fn detail_width_updates_are_memory_only_until_persist_or_flush() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.conf");
@@ -461,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_settings_persist_and_notify_all_subscribers() {
+    fn legacy_custom_locations_persist_and_notify_all_subscribers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.conf");
         let store = PreferenceStore::at_path(path.clone());
@@ -473,20 +498,15 @@ mod tests {
                 Rc::new(move |_| *target.borrow_mut() += 1)
             });
         }
-        store.set_sidebar_hidden("builtin:home", true).unwrap();
         store
             .add_sidebar_uri("smb://host/share/a,b".into())
             .unwrap();
-        assert_eq!((*a.borrow(), *b.borrow()), (2, 2));
-        assert_eq!(
-            storage::load_from(&path).hidden_sidebar_ids,
-            vec!["builtin:home"]
-        );
+        assert_eq!((*a.borrow(), *b.borrow()), (1, 1));
+        assert!(storage::load_from(&path).hidden_sidebar_ids.is_empty());
         assert_eq!(
             storage::load_from(&path).custom_sidebar_uris,
             vec!["smb://host/share/a,b"]
         );
-        store.restore_sidebar().unwrap();
         store.remove_sidebar_uri("smb://host/share/a,b").unwrap();
         assert_eq!(storage::load_from(&path), Preferences::default());
     }
@@ -506,11 +526,8 @@ mod tests {
             Rc::new(move || *count.borrow_mut() += 1)
         });
 
-        store.set_sidebar_hidden("test", true).unwrap();
-        assert_eq!((*sidebar_count.borrow(), *bookmark_count.borrow()), (1, 0));
-
         store.notify_bookmarks_changed();
-        assert_eq!((*sidebar_count.borrow(), *bookmark_count.borrow()), (1, 1));
+        assert_eq!((*sidebar_count.borrow(), *bookmark_count.borrow()), (0, 1));
     }
 
     #[test]
@@ -548,18 +565,17 @@ mod tests {
     }
 
     #[test]
-    fn removing_custom_location_only_clears_its_namespaced_hidden_id() {
+    fn removing_legacy_location_only_clears_legacy_namespace_not_bookmarks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.conf");
         let store = PreferenceStore::at_path(path.clone());
         let uri = "smb://host/share/custom";
+        let bookmarks = dir.path().join("gtk-3.0/bookmarks");
+        kito_core::bookmarks::pin_to(&bookmarks, "custom", uri).unwrap();
+        let bookmarks_before = std::fs::read_to_string(&bookmarks).unwrap();
         store.add_sidebar_uri(uri.into()).unwrap();
-        store
-            .set_sidebar_hidden(&format!("custom:{uri}"), true)
-            .unwrap();
-        store
-            .set_sidebar_hidden(&format!("bookmark:{uri}"), true)
-            .unwrap();
+        store.current.borrow_mut().hidden_sidebar_ids =
+            vec![format!("custom:{uri}"), format!("bookmark:{uri}")];
 
         store.remove_sidebar_uri(uri).unwrap();
 
@@ -573,6 +589,11 @@ mod tests {
             .hidden_sidebar_ids
             .iter()
             .any(|item| item == &format!("bookmark:{uri}")));
+        assert_eq!(saved.custom_sidebar_uris, Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(bookmarks).unwrap(),
+            bookmarks_before
+        );
     }
 
     #[test]

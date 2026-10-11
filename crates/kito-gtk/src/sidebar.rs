@@ -1,4 +1,4 @@
-//! Sidebar: shortcuts, XDG folders and mounted volumes.
+//! Sidebar: shortcuts, shared bookmarks and mounted volumes.
 //! UI labels use the app catalogs; names returned by GIO remain system data.
 
 use crate::preferences::PreferenceStore;
@@ -14,25 +14,76 @@ type LoadFn = Rc<dyn Fn(&str)>;
 /// Sidebar rows for highlighting the current folder.
 type Rows = Rc<RefCell<Vec<(String, gtk::Button)>>>;
 
-const PLACES: [(&str, &str, glib::UserDirectory); 5] = [
-    (
-        "folder-documents",
-        "side-documents",
-        glib::UserDirectory::Documents,
-    ),
-    ("folder-music", "side-music", glib::UserDirectory::Music),
-    (
-        "folder-pictures",
-        "side-pictures",
-        glib::UserDirectory::Pictures,
-    ),
-    ("folder-videos", "side-videos", glib::UserDirectory::Videos),
-    (
-        "folder-download",
-        "side-downloads",
-        glib::UserDirectory::Downloads,
-    ),
+const PLACES: [(&str, glib::UserDirectory); 5] = [
+    ("folder-documents", glib::UserDirectory::Documents),
+    ("folder-music", glib::UserDirectory::Music),
+    ("folder-pictures", glib::UserDirectory::Pictures),
+    ("folder-videos", glib::UserDirectory::Videos),
+    ("folder-download", glib::UserDirectory::Downloads),
 ];
+
+const BOOKMARK_ROW_MIME: &str = "application/x-kito-bookmark-row";
+const MAX_BOOKMARK_ROW_PAYLOAD_BYTES: usize = 16 * 1024;
+
+fn bookmark_drop_after(y: f64, height: i32) -> bool {
+    y >= f64::from(height) / 2.0
+}
+
+fn bookmark_row_content_formats() -> gtk::gdk::ContentFormats {
+    gtk::gdk::ContentFormats::builder()
+        .add_mime_type(BOOKMARK_ROW_MIME)
+        .build()
+}
+
+fn bookmark_row_provider(uri: &str) -> gtk::gdk::ContentProvider {
+    gtk::gdk::ContentProvider::for_bytes(
+        BOOKMARK_ROW_MIME,
+        &glib::Bytes::from_owned(uri.as_bytes().to_vec()),
+    )
+}
+
+fn read_bookmark_row_stream(
+    stream: gio::InputStream,
+    mut accumulated: Vec<u8>,
+    callback: Box<dyn FnOnce(Result<Vec<u8>, glib::Error>)>,
+) {
+    let remaining = MAX_BOOKMARK_ROW_PAYLOAD_BYTES + 1 - accumulated.len();
+    let next_stream = stream.clone();
+    stream.read_bytes_async(
+        remaining,
+        glib::Priority::DEFAULT,
+        gio::Cancellable::NONE,
+        move |result| match result {
+            Err(error) => callback(Err(error)),
+            Ok(bytes) if bytes.is_empty() => callback(Ok(accumulated)),
+            Ok(bytes) => {
+                accumulated.extend_from_slice(bytes.as_ref());
+                if accumulated.len() > MAX_BOOKMARK_ROW_PAYLOAD_BYTES {
+                    callback(Err(glib::Error::new(
+                        gio::IOErrorEnum::NoSpace,
+                        "bookmark row payload exceeds the maximum size",
+                    )));
+                } else {
+                    read_bookmark_row_stream(next_stream, accumulated, callback);
+                }
+            }
+        },
+    );
+}
+
+fn clear_bookmark_drop_marker(button: &gtk::Button) {
+    button.remove_css_class("bookmark-drop-before");
+    button.remove_css_class("bookmark-drop-after");
+}
+
+fn set_bookmark_drop_marker(button: &gtk::Button, after: bool) {
+    clear_bookmark_drop_marker(button);
+    button.add_css_class(if after {
+        "bookmark-drop-after"
+    } else {
+        "bookmark-drop-before"
+    });
+}
 
 /// Registers the row and adds it to the container.
 fn add_row(
@@ -40,117 +91,19 @@ fn add_row(
     rows: &Rows,
     uri: &str,
     button: &gtk::Button,
-    preferences: &Rc<PreferenceStore>,
+    _preferences: &Rc<PreferenceStore>,
 ) {
-    let id = sidebar_id(uri);
-    add_row_with_id(container, rows, uri, button, preferences, &id);
-}
-
-fn add_row_with_id(
-    container: &gtk::Box,
-    rows: &Rows,
-    uri: &str,
-    button: &gtk::Button,
-    preferences: &Rc<PreferenceStore>,
-    id: &str,
-) {
-    let hidden = is_sidebar_hidden(&preferences.snapshot(), id);
-    if hidden {
-        button.set_visible(false);
-    }
-    if id != "builtin:trash" && !button.has_css_class("freedesktop-bookmark") {
-        attach_hide_menu(button, id, preferences);
-    }
     rows.borrow_mut().push((uri.to_string(), button.clone()));
     container.append(button);
-}
-
-fn bookmark_sidebar_id(uri: &str) -> String {
-    format!("bookmark:{uri}")
-}
-
-fn custom_sidebar_id(uri: &str) -> String {
-    format!("custom:{uri}")
-}
-
-fn sidebar_id(uri: &str) -> String {
-    match uri {
-        "network:///" => "builtin:network".into(),
-        kito_core::TRASH_URI => "builtin:trash".into(),
-        "file:///" => "builtin:filesystem-root".into(),
-        _ if gio::File::for_path(glib::home_dir()).uri().as_str() == uri => "builtin:home".into(),
-        _ => uri.to_string(),
-    }
-}
-
-fn volume_sidebar_id(
-    uuid: Option<&str>,
-    device_id: Option<&str>,
-    drive_id: Option<&str>,
-    fallback_name: &str,
-    fallback_drive: &str,
-) -> String {
-    uuid.map(|value| format!("volume:uuid:{value}"))
-        .or_else(|| device_id.map(|value| format!("volume:device:{value}")))
-        .or_else(|| drive_id.map(|value| format!("volume:drive:{value}:{fallback_name}")))
-        // Some backends expose no stable ID. Use volume/drive labels, which
-        // remain stable across mount cycles, rather than the activation URI.
-        // If two unidentifiable volumes expose identical metadata, GIO gives
-        // us no persistent way to distinguish them.
-        .unwrap_or_else(|| {
-            format!(
-                "volume:fallback:{}:{fallback_name}:{}:{fallback_drive}",
-                fallback_name.len(),
-                fallback_drive.len()
-            )
-        })
-}
-
-fn attach_hide_menu(button: &gtk::Button, id: &str, preferences: &Rc<PreferenceStore>) {
-    let gesture = gtk::GestureClick::builder()
-        .button(gtk::gdk::BUTTON_SECONDARY)
-        .build();
-    let weak = button.downgrade();
-    let id = id.to_string();
-    let preferences = Rc::downgrade(preferences);
-    gesture.connect_pressed(move |gesture, _, x, y| {
-        gesture.set_state(gtk::EventSequenceState::Claimed);
-        let (Some(button), Some(preferences)) = (weak.upgrade(), preferences.upgrade()) else {
-            return;
-        };
-        let popover = gtk::Popover::new();
-        let hide = gtk::Button::builder()
-            .label(crate::l10n::tr("side-hide-in-kito"))
-            .has_frame(false)
-            .build();
-        let id = id.clone();
-        let popover_weak = popover.downgrade();
-        let button_weak = button.downgrade();
-        hide.connect_clicked(move |_| {
-            if let Some(popover) = popover_weak.upgrade() {
-                popover.popdown();
-            }
-            if let Err(error) = preferences.set_sidebar_hidden(&id, true) {
-                eprintln!("{}", localized_error("side-settings-error", &error));
-                if let Some(button) = button_weak.upgrade() {
-                    if let Some(window) = button.root().and_downcast::<adw::ApplicationWindow>() {
-                        error_dialog(&window, localized_error("side-settings-error", &error));
-                    }
-                }
-            }
-        });
-        popover.set_child(Some(&hide));
-        popover.set_parent(&button);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover.popup();
-    });
-    button.add_controller(gesture);
 }
 
 fn has_visible_child(container: &gtk::Box) -> bool {
     let mut child = container.first_child();
     while let Some(widget) = child {
-        if widget.is_visible() {
+        // `WidgetExt::is_visible()` also depends on the ancestors, so it stays
+        // false when this container is hidden. Inspect the child's own GTK
+        // `visible` flag so a populated group can reveal its parent again.
+        if widget.property::<bool>("visible") {
             return true;
         }
         child = widget.next_sibling();
@@ -158,11 +111,8 @@ fn has_visible_child(container: &gtk::Box) -> bool {
     false
 }
 
-fn is_sidebar_hidden(preferences: &crate::preferences::model::Preferences, id: &str) -> bool {
-    preferences
-        .hidden_sidebar_ids
-        .iter()
-        .any(|hidden| hidden == id)
+fn append_bookmarks_group(places: &gtk::Box, contents: &gtk::Box) {
+    places.append(contents);
 }
 
 fn update_nav_row_label(button: &gtk::Button, label: &str) {
@@ -308,57 +258,8 @@ fn favorites_toggle_row(
     (button, label, arrow)
 }
 
-fn bookmarks_group_row(contents: &gtk::Box) -> (gtk::Button, gtk::Label) {
-    let label_text = crate::l10n::tr("side-bookmarks");
-    let button = gtk::Button::builder()
-        .has_frame(false)
-        .css_classes(["side-row", "bookmarks-toggle"])
-        .tooltip_text(&label_text)
-        .build();
-    button.update_property(&[
-        gtk::accessible::Property::Label(&label_text),
-        gtk::accessible::Property::Description(&label_text),
-    ]);
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .margin_start(8)
-        .margin_end(8)
-        .margin_top(4)
-        .margin_bottom(4)
-        .build();
-    let icon = gtk::Image::from_gicon(&icons::control_icon(&[
-        "folder-bookmark-symbolic",
-        "bookmarks-symbolic",
-        "bookmark-new-symbolic",
-        "folder-symbolic",
-    ]));
-    icon.set_pixel_size(18);
-    row.append(&icon);
-    let label = gtk::Label::builder()
-        .label(&label_text)
-        .halign(gtk::Align::Start)
-        .hexpand(true)
-        .css_classes(["side-label"])
-        .build();
-    row.append(&label);
-    let arrow = gtk::Image::from_gicon(&icons::control_icon(&["pan-down-symbolic", "pan-down"]));
-    arrow.set_pixel_size(12);
-    row.append(&arrow);
-    button.set_child(Some(&row));
+fn bookmarks_group_row(contents: &gtk::Box) {
     contents.set_visible(false);
-    let contents = contents.clone();
-    button.connect_clicked(move |button| {
-        let expanded = !contents.is_visible();
-        contents.set_visible(expanded);
-        arrow.set_from_gicon(&icons::control_icon(if expanded {
-            &["pan-down-symbolic", "pan-down"]
-        } else {
-            &["pan-end-symbolic", "pan-end"]
-        }));
-        button.update_state(&[gtk::accessible::State::Expanded(Some(expanded))]);
-    });
-    (button, label)
 }
 
 fn bookmark_row(
@@ -367,6 +268,7 @@ fn bookmark_row(
     load: LoadFn,
     on_drop: &DropHandler,
     window: &adw::ApplicationWindow,
+    preferences: &Rc<PreferenceStore>,
 ) -> gtk::Button {
     let target_uri = uri.to_string();
     let window_weak = window.downgrade();
@@ -416,12 +318,39 @@ fn bookmark_row(
         .button(gtk::gdk::BUTTON_SECONDARY)
         .build();
     let uri = uri.to_string();
+    let bookmark_name = name.to_string();
+    let preferences = Rc::downgrade(preferences);
     gesture.connect_pressed(move |gesture, _, x, y| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
         let Some(button) = gesture.widget().and_downcast::<gtk::Button>() else {
             return;
         };
         let popover = gtk::Popover::new();
+        let rename = gtk::Button::builder()
+            .label(crate::l10n::tr("side-rename-bookmark"))
+            .has_frame(false)
+            .build();
+        let rename_uri = uri.clone();
+        let rename_name = bookmark_name.clone();
+        let rename_window = remove_window_weak.clone();
+        let rename_preferences = preferences.clone();
+        let rename_button = button.downgrade();
+        let rename_popover = popover.downgrade();
+        rename.connect_clicked(move |_| {
+            if let Some(popover) = rename_popover.upgrade() {
+                popover.popdown();
+            }
+            if let (Some(button), Some(window)) = (rename_button.upgrade(), rename_window.upgrade())
+            {
+                show_bookmark_rename(
+                    &button,
+                    &window,
+                    &rename_uri,
+                    &rename_name,
+                    rename_preferences.clone(),
+                );
+            }
+        });
         let remove = gtk::Button::builder()
             .label(crate::l10n::tr("side-remove-bookmark"))
             .has_frame(false)
@@ -430,6 +359,7 @@ fn bookmark_row(
             let popover = popover.clone();
             let uri = uri.clone();
             let window = remove_window_weak.clone();
+            let preferences = preferences.clone();
             move |_| {
                 popover.popdown();
                 if let Err(error) = kito_core::bookmarks::unpin(&uri) {
@@ -437,16 +367,246 @@ fn bookmark_row(
                     if let Some(window) = window.upgrade() {
                         error_dialog(&window, error.to_string());
                     }
+                } else if let Some(preferences) = preferences.upgrade() {
+                    preferences.notify_bookmarks_changed();
                 }
             }
         });
-        popover.set_child(Some(&remove));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        menu.append(&rename);
+        menu.append(&remove);
+        popover.set_child(Some(&menu));
         popover.set_parent(&button);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.popup();
     });
     button.add_controller(gesture);
     button
+}
+
+fn show_bookmark_rename(
+    _button: &gtk::Button,
+    window: &adw::ApplicationWindow,
+    uri: &str,
+    current_name: &str,
+    preferences: std::rc::Weak<PreferenceStore>,
+) {
+    let dialog = adw::Dialog::builder()
+        .title(crate::l10n::tr("side-rename-bookmark"))
+        .content_width(360)
+        .build();
+    let entry = gtk::Entry::builder()
+        .text(current_name)
+        .placeholder_text(crate::l10n::tr("side-bookmark-name"))
+        .build();
+    let error_label = gtk::Label::builder()
+        .visible(false)
+        .css_classes(["error"])
+        .wrap(true)
+        .build();
+    let save = gtk::Button::builder()
+        .label(crate::l10n::tr("side-bookmark-save"))
+        .css_classes(["suggested-action"])
+        .build();
+    let cancel = gtk::Button::builder()
+        .label(crate::l10n::tr("dialog-cancel"))
+        .build();
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.append(&cancel);
+    buttons.append(&save);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.append(&entry);
+    content.append(&error_label);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+    cancel.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| {
+            dialog.close();
+        }
+    });
+    let uri = uri.to_string();
+    save.connect_clicked({
+        let dialog = dialog.clone();
+        let entry = entry.clone();
+        let error_label = error_label.clone();
+        let preferences = preferences.clone();
+        move |_| {
+            let name = entry.text().trim().to_string();
+            if name.is_empty() {
+                error_label.set_text(&crate::l10n::tr("side-bookmark-name-empty"));
+                error_label.set_visible(true);
+                return;
+            }
+            if kito_core::bookmarks::read()
+                .iter()
+                .any(|(other_name, other_uri)| other_uri != &uri && other_name == &name)
+            {
+                error_label.set_text(&crate::l10n::tr("side-bookmark-name-duplicate"));
+                error_label.set_visible(true);
+                return;
+            }
+            match kito_core::bookmarks::rename(&uri, &name) {
+                Ok(_) => {
+                    dialog.close();
+                    if let Some(preferences) = preferences.upgrade() {
+                        preferences.notify_bookmarks_changed();
+                    }
+                }
+                Err(error) => {
+                    error_label.set_text(&crate::l10n::tr_with_one(
+                        "side-bookmark-rename-error",
+                        "error",
+                        &error.to_string(),
+                    ));
+                    error_label.set_visible(true);
+                }
+            }
+        }
+    });
+    dialog.present(Some(window));
+    glib::idle_add_local_once({
+        let entry = entry.clone();
+        move || {
+            entry.grab_focus();
+            entry.select_region(0, -1);
+        }
+    });
+}
+
+fn attach_bookmark_reorder(
+    button: &gtk::Button,
+    uri: &str,
+    window: &adw::ApplicationWindow,
+    preferences: &Rc<PreferenceStore>,
+) {
+    let source = gtk::DragSource::new();
+    source.set_actions(gtk::gdk::DragAction::MOVE);
+    let uri = uri.to_string();
+    let target_uri = uri.clone();
+    source.connect_prepare(move |_, _, _| Some(bookmark_row_provider(&uri)));
+    let weak_button = button.downgrade();
+    source.connect_drag_begin(move |source, _| {
+        if let Some(button) = weak_button.upgrade() {
+            let paintable = gtk::WidgetPaintable::new(Some(&button));
+            source.set_icon(Some(&paintable), 16, 16);
+        }
+    });
+    button.add_controller(source);
+
+    // This private MIME is intentionally disjoint from file-list/URI targets;
+    // reordering a bookmark must never be interpreted as a filesystem drop.
+    let target = gtk::DropTargetAsync::new(
+        Some(bookmark_row_content_formats()),
+        gtk::gdk::DragAction::MOVE,
+    );
+    target.connect_accept(|_, drop| {
+        drop.formats().contain_mime_type(BOOKMARK_ROW_MIME)
+            && drop.actions().contains(gtk::gdk::DragAction::MOVE)
+    });
+    let weak_window = window.downgrade();
+    let preferences = Rc::downgrade(preferences);
+    let weak_button = button.downgrade();
+    target.connect_drag_enter({
+        let button = weak_button.clone();
+        move |_, _, _, y| {
+            if let Some(button) = button.upgrade() {
+                set_bookmark_drop_marker(&button, bookmark_drop_after(y, button.height()));
+            }
+            gtk::gdk::DragAction::MOVE
+        }
+    });
+    target.connect_drag_motion({
+        let button = weak_button.clone();
+        move |_, _, _, y| {
+            if let Some(button) = button.upgrade() {
+                set_bookmark_drop_marker(&button, bookmark_drop_after(y, button.height()));
+            }
+            gtk::gdk::DragAction::MOVE
+        }
+    });
+    target.connect_drag_leave(move |_, _| {
+        if let Some(button) = weak_button.upgrade() {
+            clear_bookmark_drop_marker(&button);
+        }
+    });
+    let weak_button = button.downgrade();
+    target.connect_drop(move |_, drop, _, y| {
+        if let Some(button) = weak_button.upgrade() {
+            clear_bookmark_drop_marker(&button);
+        }
+        let after = weak_button
+            .upgrade()
+            .is_some_and(|button| bookmark_drop_after(y, button.height()));
+        let finish_drop = drop.clone();
+        let target_uri = target_uri.clone();
+        let preferences = preferences.clone();
+        let weak_window = weak_window.clone();
+        drop.read_async(
+            &[BOOKMARK_ROW_MIME],
+            glib::Priority::DEFAULT,
+            gio::Cancellable::NONE,
+            move |result| {
+                let (stream, _) = match result {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        if let Some(window) = weak_window.upgrade() {
+                            error_dialog(&window, error.to_string());
+                        }
+                        finish_drop.finish(gtk::gdk::DragAction::empty());
+                        return;
+                    }
+                };
+                let weak_window = weak_window.clone();
+                read_bookmark_row_stream(
+                    stream,
+                    Vec::new(),
+                    Box::new(move |result| {
+                        let bytes = match result {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                if let Some(window) = weak_window.upgrade() {
+                                    error_dialog(&window, error.to_string());
+                                }
+                                finish_drop.finish(gtk::gdk::DragAction::empty());
+                                return;
+                            }
+                        };
+                        let Ok(source_uri) = std::str::from_utf8(bytes.as_ref()) else {
+                            finish_drop.finish(gtk::gdk::DragAction::empty());
+                            return;
+                        };
+                        match kito_core::bookmarks::reorder_relative_to(
+                            source_uri,
+                            &target_uri,
+                            after,
+                        ) {
+                            Ok(true) => {
+                                if let Some(preferences) = preferences.upgrade() {
+                                    preferences.notify_bookmarks_changed();
+                                }
+                                finish_drop.finish(gtk::gdk::DragAction::MOVE);
+                            }
+                            Ok(false) => finish_drop.finish(gtk::gdk::DragAction::empty()),
+                            Err(error) => {
+                                if let Some(window) = weak_window.upgrade() {
+                                    error_dialog(&window, error.to_string());
+                                }
+                                finish_drop.finish(gtk::gdk::DragAction::empty());
+                            }
+                        }
+                    }),
+                );
+            },
+        );
+        true
+    });
+    button.add_controller(target);
 }
 
 /// Observe compatible drag hover over the sidebar, but accept drops only on
@@ -589,9 +749,19 @@ fn update_bookmark_icon(button: &gtk::Button, uri: &str) {
         glib::Priority::DEFAULT,
         None::<&gio::Cancellable>,
         move |result| {
-            if let (Ok(info), Some(image)) = (result, image.upgrade()) {
-                if let Some(icon) = info.icon() {
-                    image.set_from_gicon(&icon);
+            if let Some(image) = image.upgrade() {
+                if let Ok(info) = result {
+                    if let Some(icon) = info.icon() {
+                        image.set_from_gicon(&icon);
+                        image.set_pixel_size(18);
+                    }
+                } else {
+                    image.set_from_gicon(&icons::control_icon(&[
+                        "dialog-warning-symbolic",
+                        "dialog-warning",
+                        "folder-symbolic",
+                        "folder",
+                    ]));
                     image.set_pixel_size(18);
                 }
             }
@@ -617,7 +787,7 @@ fn bookmark_icon(uri: &str) -> gio::ThemedIcon {
     {
         return place_icon("user-desktop");
     }
-    for (icon_name, _, directory) in PLACES {
+    for (icon_name, directory) in PLACES {
         if glib::user_special_dir(directory)
             .is_some_and(|special| special.as_path() == path.as_path())
         {
@@ -625,29 +795,6 @@ fn bookmark_icon(uri: &str) -> gio::ThemedIcon {
         }
     }
     generic_folder()
-}
-
-fn sidebar_place_uris() -> Vec<String> {
-    let mut places = vec![gio::File::for_path(glib::home_dir()).uri().to_string()];
-    for (_, _, directory) in PLACES {
-        if let Some(path) = glib::user_special_dir(directory).filter(|path| path.is_dir()) {
-            places.push(gio::File::for_path(&path).uri().to_string());
-        }
-    }
-    places
-}
-
-/// Localized folder name from GIO (e.g. "Documents" on an Italian
-/// system). It is system data, not a UI string to translate.
-fn display_name(path: &std::path::Path, fallback: &str) -> String {
-    gio::File::for_path(path)
-        .query_info(
-            "standard::display-name",
-            gio::FileQueryInfoFlags::NONE,
-            gio::Cancellable::NONE,
-        )
-        .map(|info| info.display_name().to_string())
-        .unwrap_or_else(|_| fallback.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -673,13 +820,12 @@ fn shortcut_places(
     );
     add_row(parent, rows, &home_uri, &home_button, preferences);
 
-    add_row_with_id(
+    add_row(
         parent,
         rows,
         kito_core::FAVORITES_URI,
         favorites_toggle,
         preferences,
-        "builtin:favorites",
     );
 
     let network = icons::control_icon(&[
@@ -708,14 +854,8 @@ fn shortcut_places(
     [home_button, network_button, trash_button]
 }
 
-fn unique_bookmarks(
-    bookmarks: Vec<(String, String)>,
-    standard_locations: &[String],
-) -> Vec<(String, String)> {
-    let mut known = standard_locations
-        .iter()
-        .map(|uri| gio::File::for_uri(uri))
-        .collect::<Vec<_>>();
+fn unique_bookmarks(bookmarks: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut known = Vec::new();
     bookmarks
         .into_iter()
         .filter_map(|(name, uri)| {
@@ -728,32 +868,6 @@ fn unique_bookmarks(
             }
         })
         .collect()
-}
-
-fn xdg_places(
-    load: &LoadFn,
-    parent: &gtk::Box,
-    rows: &Rows,
-    on_drop: &DropHandler,
-    preferences: &Rc<PreferenceStore>,
-) {
-    for (icon_name, label_id, dir) in PLACES {
-        let Some(path) = glib::user_special_dir(dir) else {
-            continue;
-        };
-        if !path.is_dir() {
-            continue;
-        }
-        let uri = gio::File::for_path(&path).uri().to_string();
-        let button = nav_row(
-            &place_icon(icon_name),
-            &display_name(&path, &crate::l10n::tr(label_id)),
-            load.clone(),
-            uri.clone(),
-            on_drop,
-        );
-        add_row(parent, rows, &uri, &button, preferences);
-    }
 }
 
 /// Trash row in Places: opens `trash:///` and has the "Empty Trash…"
@@ -865,7 +979,7 @@ fn trash_row(
     load: LoadFn,
     window: &adw::ApplicationWindow,
     on_drop: &DropHandler,
-    preferences: &Rc<PreferenceStore>,
+    _preferences: &Rc<PreferenceStore>,
 ) -> gtk::Button {
     let button = nav_row(
         &trash_icon(false),
@@ -918,7 +1032,6 @@ fn trash_row(
         .build();
     let button_weak = button.downgrade();
     let window = window.clone();
-    let preferences = preferences.clone();
     // Menu icon from the last applied probe: no sync query on click.
     let menu_state = state.clone();
     gesture.connect_pressed(move |gesture, _, x, y| {
@@ -960,29 +1073,8 @@ fn trash_row(
             }
             let _ = gtk::prelude::WidgetExt::activate_action(&window, "win.empty-trash", None);
         });
-        let hide = gtk::Button::builder()
-            .label(crate::l10n::tr("side-hide-in-kito"))
-            .has_frame(false)
-            .build();
-        let preferences = preferences.clone();
-        let popover_weak = popover.downgrade();
-        let button_weak = button.downgrade();
-        hide.connect_clicked(move |_| {
-            if let Some(popover) = popover_weak.upgrade() {
-                popover.popdown();
-            }
-            if let Err(error) = preferences.set_sidebar_hidden("builtin:trash", true) {
-                eprintln!("{}", localized_error("side-settings-error", &error));
-                if let Some(button) = button_weak.upgrade() {
-                    if let Some(window) = button.root().and_downcast::<adw::ApplicationWindow>() {
-                        error_dialog(&window, localized_error("side-settings-error", &error));
-                    }
-                }
-            }
-        });
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
         menu.append(&empty);
-        menu.append(&hide);
         popover.set_child(Some(&menu));
         popover.set_parent(&button);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -999,10 +1091,6 @@ fn error_dialog(window: &adw::ApplicationWindow, body: String) {
         .build();
     dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
     dialog.present(Some(window));
-}
-
-fn localized_error(message: &str, error: &impl std::fmt::Display) -> String {
-    crate::l10n::tr(message).replace("{ $error }", &error.to_string())
 }
 
 /// Finishes a mount operation without losing backend errors.
@@ -1084,7 +1172,7 @@ fn volume_row(
     load: LoadFn,
     window: adw::ApplicationWindow,
     on_drop: &DropHandler,
-    preferences: &Rc<PreferenceStore>,
+    _preferences: &Rc<PreferenceStore>,
 ) -> (gtk::Box, Option<(String, gtk::Button)>) {
     let name = volume.name();
     let button = gtk::Button::builder()
@@ -1116,33 +1204,6 @@ fn volume_row(
             .build(),
     );
     button.set_child(Some(&row));
-    // Prefer stable backend identifiers; exclude activation URIs because they
-    // can change between mount and unmount.
-    let fallback_name = volume.name();
-    let device_id = volume.identifier("unix-device");
-    let drive = volume.drive();
-    let drive_id = drive
-        .as_ref()
-        .and_then(|drive| drive.identifier("unix-device"));
-    let fallback_drive = drive
-        .map(|drive| drive.name().to_string())
-        .unwrap_or_default();
-    let stable_id = volume_sidebar_id(
-        volume.uuid().as_deref(),
-        device_id.as_deref(),
-        drive_id.as_deref(),
-        &fallback_name,
-        &fallback_drive,
-    );
-    if preferences
-        .snapshot()
-        .hidden_sidebar_ids
-        .contains(&stable_id)
-    {
-        button.set_visible(false);
-    }
-    attach_hide_menu(&button, &stable_id, preferences);
-
     let line = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(2)
@@ -1334,8 +1395,8 @@ pub fn build_sidebar(
     let device_rows: Rows = Rc::new(RefCell::new(Vec::new()));
     let rows = vec![
         shortcut_rows.clone(),
-        bookmark_rows.clone(),
         place_rows.clone(),
+        bookmark_rows.clone(),
         custom_rows.clone(),
         device_rows.clone(),
     ];
@@ -1358,14 +1419,6 @@ pub fn build_sidebar(
 
     let (favorites_toggle, favorites_label, _favorites_arrow) =
         favorites_toggle_row(load.clone(), &on_drop);
-    attach_hide_menu(&favorites_toggle, "builtin:favorites", &preferences);
-    favorites_toggle.set_visible(
-        !preferences
-            .snapshot()
-            .hidden_sidebar_ids
-            .iter()
-            .any(|id| id == "builtin:favorites"),
-    );
     let favorites_contents = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let quick_places = shortcut_places(
         &load,
@@ -1380,11 +1433,8 @@ pub fn build_sidebar(
     let bookmark_contents = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
-        .margin_start(12)
         .build();
-    let (bookmark_group, bookmark_group_label) = bookmarks_group_row(&bookmark_contents);
-    shortcuts.insert_child_after(&bookmark_group, Some(&favorites_toggle));
-    shortcuts.insert_child_after(&bookmark_contents, Some(&bookmark_group));
+    bookmarks_group_row(&bookmark_contents);
 
     let places_separator_before = section_separator();
     outer.append(&places_separator_before);
@@ -1427,10 +1477,9 @@ pub fn build_sidebar(
         .ok();
     let refresh_shortcuts: Rc<dyn Fn()> = Rc::new({
         let rows = bookmark_rows.clone();
-        let quick_places = quick_places.clone();
         let bookmark_contents = bookmark_contents.clone();
-        let bookmark_group_label = bookmark_group_label.clone();
-        let bookmark_group = bookmark_group.clone();
+        let before_separator = places_separator_before.clone();
+        let places = places.clone();
         let load = load.clone();
         let bookmark_window = window.clone();
         let on_drop = on_drop.clone();
@@ -1442,45 +1491,39 @@ pub fn build_sidebar(
         let _monitor = bookmark_monitor.clone();
         move || {
             let _ = &_monitor;
-            let snapshot = preferences.snapshot();
-            for (button, id) in
-                quick_places
-                    .iter()
-                    .zip(["builtin:home", "builtin:network", "builtin:trash"])
-            {
-                button.set_visible(!is_sidebar_hidden(&snapshot, id));
-            }
             let label = crate::l10n::tr("side-favorites");
             favorites_label.set_text(&label);
             favorites_toggle.set_tooltip_text(Some(&label));
             favorites_toggle.update_property(&[gtk::accessible::Property::Label(&label)]);
-            favorites_toggle.set_visible(!is_sidebar_hidden(&snapshot, "builtin:favorites"));
-            let bookmark_label = crate::l10n::tr("side-bookmarks");
-            bookmark_group_label.set_text(&bookmark_label);
-            bookmark_group.set_tooltip_text(Some(&bookmark_label));
-            bookmark_group.update_property(&[
-                gtk::accessible::Property::Label(&bookmark_label),
-                gtk::accessible::Property::Description(&bookmark_label),
-            ]);
-            let bookmarks_expanded = bookmark_contents.is_visible();
             while let Some(child) = bookmark_contents.first_child() {
                 bookmark_contents.remove(&child);
             }
             rows.borrow_mut().clear();
-            let bookmarks = unique_bookmarks(kito_core::bookmarks::read(), &sidebar_place_uris());
+            let bookmarks = unique_bookmarks(kito_core::bookmarks::read());
             for (name, uri) in bookmarks {
-                let button = bookmark_row(&name, &uri, load.clone(), &on_drop, &bookmark_window);
-                button.set_visible(!is_sidebar_hidden(&snapshot, &bookmark_sidebar_id(&uri)));
+                let button = bookmark_row(
+                    &name,
+                    &uri,
+                    load.clone(),
+                    &on_drop,
+                    &bookmark_window,
+                    &preferences,
+                );
+                // Freedesktop bookmarks are never hidden by Kito sidebar preferences.
+                button.set_visible(true);
+                attach_bookmark_reorder(&button, &uri, &bookmark_window, &preferences);
                 rows.borrow_mut().push((uri, button.clone()));
                 bookmark_contents.append(&button);
             }
-            bookmark_contents.set_visible(bookmarks_expanded);
+            bookmark_contents.set_visible(!rows.borrow().is_empty());
+            let has_places = has_visible_child(&places);
+            places.set_visible(has_places);
+            before_separator.set_visible(has_places);
             let _ = apply_active_row(&all_rows, active_uri.borrow().as_deref());
         }
     });
 
     if let Some(monitor) = bookmark_monitor {
-        let refresh_shortcuts = refresh_shortcuts.clone();
         let preferences = preferences.clone();
         monitor.connect_changed(move |_, file, other, _| {
             let is_bookmarks = file
@@ -1492,33 +1535,37 @@ pub fn build_sidebar(
                         .is_some_and(|name| name.as_os_str() == "bookmarks")
                 });
             if is_bookmarks {
-                refresh_shortcuts();
                 preferences.notify_bookmarks_changed();
             }
         });
     }
+    let refresh_weak = Rc::downgrade(&refresh_shortcuts);
+    preferences.subscribe_bookmarks(Rc::new(move || {
+        if let Some(refresh) = refresh_weak.upgrade() {
+            refresh();
+        }
+    }));
 
     let refresh_places: Rc<dyn Fn()> = Rc::new({
         let places = places.clone();
-        let load = load.clone();
         let rows = place_rows.clone();
-        let on_drop = on_drop.clone();
         let before_separator = places_separator_before.clone();
         let after_separator = places_separator_after.clone();
         let add_bookmark = add_bookmark.clone();
+        let bookmark_contents = bookmark_contents.clone();
         let all_rows = rows_for_active.clone();
         let active_uri = active_uri.clone();
-        let preferences = preferences.clone();
         move || {
             while let Some(child) = places.first_child() {
                 places.remove(&child);
             }
             rows.borrow_mut().clear();
-            xdg_places(&load, &places, &rows, &on_drop, &preferences);
             let add_bookmark_label = crate::l10n::tr("side-add-bookmark");
             add_bookmark.set_label(&add_bookmark_label);
             add_bookmark.update_property(&[gtk::accessible::Property::Label(&add_bookmark_label)]);
             places.append(&add_bookmark);
+            // Keep the transient drop target before the shared bookmark list.
+            append_bookmarks_group(&places, &bookmark_contents);
             let has_places = has_visible_child(&places);
             places.set_visible(has_places);
             before_separator.set_visible(has_places);
@@ -1584,6 +1631,7 @@ pub fn build_sidebar(
         let load = load.clone();
         let drop_handler = on_drop.clone();
         let prefs = preferences.clone();
+        let window = window.downgrade();
         let all_rows = rows_for_active.clone();
         let active_uri = active_uri.clone();
         move || {
@@ -1604,13 +1652,51 @@ pub fn build_sidebar(
                     uri.clone(),
                     &drop_handler,
                 );
-                let hidden = prefs
-                    .snapshot()
-                    .hidden_sidebar_ids
-                    .iter()
-                    .any(|id| id == &custom_sidebar_id(&uri));
-                row.set_visible(!hidden);
-                attach_hide_menu(&row, &custom_sidebar_id(&uri), &prefs);
+                row.set_visible(true);
+                // Fallback rows remain reachable when automatic migration of
+                // old Kito locations failed. Removing one only edits Kito's
+                // legacy settings; it never unpins a Freedesktop bookmark.
+                let gesture = gtk::GestureClick::builder()
+                    .button(gtk::gdk::BUTTON_SECONDARY)
+                    .build();
+                let row_weak = row.downgrade();
+                let window_weak = window.clone();
+                let prefs = prefs.clone();
+                let legacy_uri = uri.clone();
+                gesture.connect_pressed(move |gesture, _, x, y| {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    let Some(row) = row_weak.upgrade() else {
+                        return;
+                    };
+                    let popover = gtk::Popover::new();
+                    popover.add_css_class("ctx-menu");
+                    let remove = gtk::Button::builder()
+                        .label(crate::l10n::tr("side-remove-legacy-location"))
+                        .has_frame(false)
+                        .build();
+                    let popover_weak = popover.downgrade();
+                    let prefs = prefs.clone();
+                    let uri = legacy_uri.clone();
+                    let window = window_weak.clone();
+                    remove.connect_clicked(move |_| {
+                        if let Some(popover) = popover_weak.upgrade() {
+                            popover.popdown();
+                        }
+                        if let Err(error) = prefs.remove_sidebar_uri(&uri) {
+                            if let Some(window) = window.upgrade() {
+                                error_dialog(&window, error.to_string());
+                            }
+                        }
+                    });
+                    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    menu.append(&remove);
+                    popover.set_child(Some(&menu));
+                    popover.set_parent(&row);
+                    popover
+                        .set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                    popover.popup();
+                });
+                row.add_controller(gesture);
                 rows.borrow_mut().push((uri.clone(), row.clone()));
                 box_widget.append(&row);
             }
@@ -1662,6 +1748,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bookmark_reorder_format_is_private_and_position_uses_row_halves() {
+        let provider = bookmark_row_provider("file:///tmp/bookmark");
+        let formats = provider.formats();
+        assert!(formats.contain_mime_type(BOOKMARK_ROW_MIME));
+        assert!(!formats.contain_mime_type("text/plain"));
+        assert!(!formats.contain_mime_type("text/uri-list"));
+        assert!(!formats.contains_type(gtk::gdk::FileList::static_type()));
+
+        let target_formats = bookmark_row_content_formats();
+        assert!(target_formats.contain_mime_type(BOOKMARK_ROW_MIME));
+        assert!(!target_formats.contain_mime_type("text/uri-list"));
+        assert!(!target_formats.contains_type(gtk::gdk::FileList::static_type()));
+        assert!(!bookmark_drop_after(49.9, 100));
+        assert!(bookmark_drop_after(50.0, 100));
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn bookmark_reorder_drop_target_is_separate_from_directory_file_target() {
+        gtk::test_synced(|| {
+            let app = adw::Application::new(
+                Some("org.example.KitoSidebarDndProbe"),
+                gio::ApplicationFlags::NON_UNIQUE,
+            );
+            app.register(None::<&gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::new(&app);
+            let temporary = tempfile::tempdir().unwrap();
+            let folder = temporary.path().join("bookmark-folder");
+            std::fs::create_dir(&folder).unwrap();
+            let uri = gio::File::for_path(folder).uri().to_string();
+            let preferences = PreferenceStore::at_path(temporary.path().join("settings.conf"));
+            let on_drop: DropHandler = Rc::new(|_, _, _, _, drop| {
+                drop.finish(gtk::gdk::DragAction::empty());
+            });
+            let row = bookmark_row(
+                "Bookmark",
+                &uri,
+                Rc::new(|_| {}),
+                &on_drop,
+                &window,
+                &preferences,
+            );
+            attach_bookmark_reorder(&row, &uri, &window, &preferences);
+            dnd::attach_drop_target(&row, Rc::new(move || Some(uri.clone())), on_drop);
+
+            let controllers = row.observe_controllers();
+            let targets = (0..controllers.n_items())
+                .filter_map(|index| {
+                    controllers
+                        .item(index)
+                        .and_downcast::<gtk::DropTargetAsync>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(targets.len(), 2);
+            assert!(targets.iter().any(|target| {
+                target
+                    .formats()
+                    .is_some_and(|formats| formats.contain_mime_type(BOOKMARK_ROW_MIME))
+                    && target.actions() == gtk::gdk::DragAction::MOVE
+            }));
+            assert!(targets.iter().any(|target| {
+                target
+                    .formats()
+                    .is_some_and(|formats| formats.contains_type(gtk::gdk::FileList::static_type()))
+                    && target.actions().contains(gtk::gdk::DragAction::COPY)
+            }));
+            assert!((0..controllers.n_items()).all(|index| {
+                controllers
+                    .item(index)
+                    .and_downcast::<gtk::DropTarget>()
+                    .is_none()
+            }));
+        });
+    }
+
+    #[test]
     fn bookmark_click_classification_uses_gio_type_not_filename() {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("looks-like-a-file.txt");
@@ -1686,6 +1848,34 @@ mod tests {
             .file_type();
         assert!(bookmark_file_type_is_directory(directory_type));
         assert!(!bookmark_file_type_is_directory(file_type));
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn bookmarks_follow_transient_cta_without_a_section_heading() {
+        gtk::test_synced(|| {
+            let places = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let add_bookmark = gtk::Button::with_label("Add bookmark");
+            let contents = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            bookmarks_group_row(&contents);
+            places.append(&add_bookmark);
+            append_bookmarks_group(&places, &contents);
+
+            assert!(contents.parent().is_some());
+            assert!(has_visible_child(&places));
+            assert_eq!(places.first_child().unwrap(), add_bookmark);
+            assert_eq!(add_bookmark.next_sibling().unwrap(), contents);
+            places.set_visible(has_visible_child(&places));
+            assert!(places.is_visible());
+            assert!(!contents.is_visible());
+
+            contents.set_visible(true);
+            contents.append(&gtk::Button::with_label("Folder"));
+            let has_places = has_visible_child(&places);
+            places.set_visible(has_places);
+            assert!(has_places);
+            assert!(places.is_visible());
+        });
     }
 
     #[test]
@@ -1806,77 +1996,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_ids_are_stable_and_volume_fallbacks_are_not_shared() {
-        assert_eq!(sidebar_id("network:///"), "builtin:network");
-        assert_eq!(sidebar_id(kito_core::TRASH_URI), "builtin:trash");
-        assert_eq!(sidebar_id("file:///"), "builtin:filesystem-root");
-        assert_eq!(
-            volume_sidebar_id(
-                Some("uuid-1"),
-                Some("/dev/sda1"),
-                Some("/dev/sda"),
-                "Disk",
-                "External drive"
-            ),
-            "volume:uuid:uuid-1"
-        );
-        assert_eq!(
-            volume_sidebar_id(
-                None,
-                Some("/dev/sdb1"),
-                Some("/dev/sdb"),
-                "Share",
-                "Network drive"
-            ),
-            "volume:device:/dev/sdb1"
-        );
-        assert_eq!(
-            volume_sidebar_id(None, None, Some("/dev/sdc"), "Backup", "External drive"),
-            "volume:drive:/dev/sdc:Backup"
-        );
-        let fallback = volume_sidebar_id(None, None, None, "Backup", "External drive");
-        assert_ne!(
-            fallback,
-            volume_sidebar_id(None, None, None, "Media", "External drive")
-        );
-        let hidden = crate::preferences::model::Preferences {
-            hidden_sidebar_ids: vec![
-                "builtin:home".into(),
-                "builtin:favorites".into(),
-                "builtin:network".into(),
-                "builtin:trash".into(),
-                "file:///places".into(),
-                "volume:uuid:uuid-1".into(),
-                "builtin:filesystem-root".into(),
-            ],
-            ..Default::default()
-        };
-        for id in [
-            "builtin:home",
-            "builtin:favorites",
-            "builtin:network",
-            "builtin:trash",
-            "file:///places",
-            "volume:uuid:uuid-1",
-            "builtin:filesystem-root",
-        ] {
-            assert!(is_sidebar_hidden(&hidden, id), "{id}");
-        }
-        assert!(!is_sidebar_hidden(&hidden, "file:///other"));
-    }
-
-    #[test]
-    fn bookmark_and_custom_ids_are_namespaced_for_the_same_uri() {
-        let uri = "smb://host/share/item";
-        let bookmark = bookmark_sidebar_id(uri);
-        let custom = custom_sidebar_id(uri);
-        assert_eq!(bookmark, "bookmark:smb://host/share/item");
-        assert_eq!(custom, "custom:smb://host/share/item");
-        assert_ne!(bookmark, custom);
-        assert_eq!(uri, "smb://host/share/item");
-    }
-
-    #[test]
     fn hidden_rows_do_not_steal_the_active_sidebar_highlight() {
         let destinations = [
             ("file:///home/kerd".to_string(), true),
@@ -1889,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn favorites_hide_standard_place_and_duplicate_bookmarks() {
+    fn freedesktop_bookmarks_keep_xdg_locations_and_deduplicate_records() {
         let bookmarks = vec![
             (
                 "Documents URI".to_string(),
@@ -1904,17 +2023,18 @@ mod tests {
                 "file:///home/kerd/Projects/".to_string(),
             ),
         ];
-        let known = [
-            "file:///home/kerd".to_string(),
-            "file:///home/kerd/Documents/".to_string(),
-        ];
-
         assert_eq!(
-            unique_bookmarks(bookmarks, &known),
-            [(
-                "Project".to_string(),
-                "file:///home/kerd/Projects".to_string()
-            )]
+            unique_bookmarks(bookmarks),
+            [
+                (
+                    "Documents URI".to_string(),
+                    "file:///home/kerd/Documents".to_string()
+                ),
+                (
+                    "Project".to_string(),
+                    "file:///home/kerd/Projects".to_string()
+                )
+            ]
         );
     }
 

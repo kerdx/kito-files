@@ -23,6 +23,7 @@ pub(crate) const APPLICATION_ACCELERATORS: &[(&str, &[&str])] = &[
 /// must continue to select text when an entry or dialog has focus.
 pub(crate) const FILE_VIEW_SHORTCUTS: &[(&str, &str)] = &[
     ("<Control>a", "win.select-all"),
+    ("<Control>d", "win.bookmark-current"),
     ("<Control>t", "win.new-tab"),
     ("<Control>w", "win.close-tab"),
     ("<Control><Shift>t", "win.reopen-tab"),
@@ -162,6 +163,18 @@ mod tests {
         assert_eq!(
             resolve_accelerators("win.reload", ["F5".to_string(), "<Control>r".to_string()]),
             vec!["F5".to_string(), "<Control>r".to_string()]
+        );
+    }
+
+    #[test]
+    fn ctrl_d_is_file_view_local_and_does_not_become_an_application_accelerator() {
+        assert!(!APPLICATION_ACCELERATORS
+            .iter()
+            .any(|(action, _)| *action == "win.bookmark-current"));
+        assert!(FILE_VIEW_SHORTCUTS.contains(&("<Control>d", "win.bookmark-current")));
+        assert_eq!(
+            resolve_accelerators("win.bookmark-current", std::iter::empty()),
+            vec!["<Control>d".to_string()]
         );
     }
 }

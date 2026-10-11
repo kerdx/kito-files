@@ -295,6 +295,23 @@ pub struct Ctx {
     pub focus_path: Rc<dyn Fn()>,
 }
 
+/// Whether an already-loaded current location is a bookmarkable GIO target.
+/// Tabs reach this callback only after a successful load, so probing remote
+/// filesystems synchronously here would add latency without improving safety.
+pub(crate) fn current_location_bookmarkable(uri: &str) -> bool {
+    !uri.is_empty()
+        && !gio::File::for_uri(uri).equal(&gio::File::for_path(glib::home_dir()))
+        && !matches!(
+            uri,
+            kito_core::FAVORITES_URI
+                | kito_core::ADD_BOOKMARK_URI
+                | kito_core::TRASH_URI
+                | "network:///"
+        )
+        && !uri.starts_with("recent:")
+        && !uri.starts_with("search:")
+}
+
 impl Ctx {
     /// GDK `changed` notification: our own publish keeps the state,
     /// anything else invalidates it. Ownership is the content provider
@@ -331,6 +348,7 @@ impl Ctx {
         let completion = drop.map(|drop| DropCompletion { drop, action });
         if destination == kito_core::ADD_BOOKMARK_URI {
             let mut results = Vec::new();
+            let mut added = false;
             for uri in uris {
                 let name = gio::File::for_uri(&uri)
                     .basename()
@@ -348,6 +366,7 @@ impl Ctx {
                         "Bookmark drop requires COPY or LINK",
                     ))
                 };
+                added |= result.is_ok();
                 if let Err(error) = &result {
                     self.toast(&error.to_string());
                 }
@@ -358,7 +377,10 @@ impl Ctx {
             if let Some(completion) = completion {
                 completion.finish(&results);
             }
-            self.preferences.notify_bookmarks_changed();
+            if added {
+                self.preferences.notify_bookmarks_changed();
+                self.toast(&crate::l10n::tr("side-bookmark-added"));
+            }
             return;
         }
         if destination == kito_core::FAVORITES_URI {
@@ -1157,6 +1179,7 @@ impl Ctx {
         if kito_core::bookmarks::is_pinned(&uri) {
             match kito_core::bookmarks::unpin(&uri) {
                 Ok(_) => {
+                    self.preferences.notify_bookmarks_changed();
                     self.toast(&crate::l10n::tr("pin-unpinned"));
                     self.manager.reload_if_current(kito_core::FAVORITES_URI);
                 }
@@ -1165,10 +1188,41 @@ impl Ctx {
         } else {
             match kito_core::bookmarks::pin(&objs[0].name(), &uri) {
                 Ok(_) => {
+                    self.preferences.notify_bookmarks_changed();
                     self.toast(&crate::l10n::tr("pin-pinned"));
                     self.manager.reload_if_current(kito_core::FAVORITES_URI);
                 }
                 Err(e) => self.error_dialog(&crate::l10n::tr("error-pin"), e.to_string()),
+            }
+        }
+    }
+
+    /// Adds the active real local folder to the shared Freedesktop bookmark
+    /// list. This is deliberately distinct from pinning the selected item.
+    pub fn bookmark_current_folder(&self) {
+        let Some(uri) = self.manager.selected_uri() else {
+            return;
+        };
+        if !current_location_bookmarkable(&uri) {
+            self.toast(&crate::l10n::tr("side-bookmark-unavailable"));
+            return;
+        }
+        let file = gio::File::for_uri(&uri);
+        if kito_core::bookmarks::is_pinned(&uri) {
+            self.toast(&crate::l10n::tr("side-bookmark-exists"));
+            return;
+        }
+        let name = file
+            .basename()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| kito_core::uri_to_display(&uri));
+        match kito_core::bookmarks::pin(&name, &uri) {
+            Ok(_) => {
+                self.preferences.notify_bookmarks_changed();
+                self.toast(&crate::l10n::tr("side-bookmark-added"));
+            }
+            Err(error) => {
+                self.error_dialog(&crate::l10n::tr("side-bookmark-error"), error.to_string())
             }
         }
     }
@@ -1634,6 +1688,24 @@ fn prop_row(label: &str, value: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_bookmark_destination_allows_local_and_remote_gio_locations_only() {
+        for uri in ["file:///tmp", "smb://server/share", "sftp://host/home/user"] {
+            assert!(current_location_bookmarkable(uri), "{uri}");
+        }
+        for uri in [
+            "",
+            kito_core::FAVORITES_URI,
+            kito_core::ADD_BOOKMARK_URI,
+            kito_core::TRASH_URI,
+            "network:///",
+            "recent:///",
+            "search:///",
+        ] {
+            assert!(!current_location_bookmarkable(uri), "{uri}");
+        }
+    }
 
     /// Delivery through the channel future. One test (not two) so parallel
     /// test threads never contend for default-context ownership.
