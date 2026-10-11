@@ -7,8 +7,8 @@ use gtk::{gio, glib};
 use std::rc::Rc;
 
 use crate::dnd::{self, DropHandler};
-use crate::preferences::model::OpenItems;
 pub use crate::preferences::model::ViewMode;
+use crate::preferences::model::{DetailColumnWidths, OpenItems};
 
 const ICON_VIEW_BASE_SIZE: i32 = 96;
 const ICON_VIEW_BASE_CELL_WIDTH: i32 = 160;
@@ -32,6 +32,7 @@ pub struct ViewDisplay {
     pub show_size: bool,
     pub show_type: bool,
     pub show_modified: bool,
+    pub detail_column_widths: DetailColumnWidths,
 }
 
 /// Right-click on a row: object + point + anchor widget.
@@ -479,6 +480,8 @@ fn build_details(
     display: ViewDisplay,
     sort_order: Rc<std::cell::Cell<kito_core::SortOrder>>,
     on_sort: Rc<dyn Fn(kito_core::SortOrder)>,
+    update_widths: Rc<dyn Fn(DetailColumnWidths) -> u64>,
+    persist_widths: Rc<dyn Fn(DetailColumnWidths, u64)>,
 ) -> gtk::ColumnView {
     let view = gtk::ColumnView::new(Some(selection));
     let name = gtk::ColumnViewColumn::new(
@@ -493,7 +496,9 @@ fn build_details(
         )),
     );
     name.set_id(Some("name"));
+    name.set_resizable(true);
     name.set_expand(true);
+    name.set_fixed_width(display.detail_column_widths.name);
     view.append_column(&name);
     let size = gtk::ColumnViewColumn::new(
         Some(&crate::l10n::tr("props-size")),
@@ -512,7 +517,8 @@ fn build_details(
         )),
     );
     size.set_id(Some("size"));
-    size.set_fixed_width(110);
+    size.set_resizable(true);
+    size.set_fixed_width(display.detail_column_widths.size);
     size.set_visible(display.show_size);
     view.append_column(&size);
     let kind = gtk::ColumnViewColumn::new(
@@ -532,7 +538,8 @@ fn build_details(
         )),
     );
     kind.set_id(Some("type"));
-    kind.set_fixed_width(200);
+    kind.set_resizable(true);
+    kind.set_fixed_width(display.detail_column_widths.kind);
     kind.set_visible(display.show_type);
     view.append_column(&kind);
     let modified = gtk::ColumnViewColumn::new(
@@ -552,9 +559,48 @@ fn build_details(
         )),
     );
     modified.set_id(Some("modified"));
-    modified.set_fixed_width(170);
+    modified.set_resizable(true);
+    modified.set_fixed_width(display.detail_column_widths.modified);
     modified.set_visible(display.show_modified);
     view.append_column(&modified);
+
+    // GTK emits fixed-width notifications while dragging. Debounce writes so
+    // the settings file is touched only after the pointer has settled.
+    let pending = Rc::new(std::cell::RefCell::new(None::<glib::SourceId>));
+    let widths = Rc::new(std::cell::Cell::new(display.detail_column_widths));
+    for column in [&name, &size, &kind, &modified] {
+        let pending = pending.clone();
+        let widths = widths.clone();
+        let update_widths = update_widths.clone();
+        let persist_widths = persist_widths.clone();
+        let name = name.clone();
+        let size = size.clone();
+        let kind = kind.clone();
+        let modified = modified.clone();
+        column.connect_fixed_width_notify(move |_| {
+            let current = DetailColumnWidths {
+                name: name.fixed_width(),
+                size: size.fixed_width(),
+                kind: kind.fixed_width(),
+                modified: modified.fixed_width(),
+            }
+            .clamped();
+            widths.set(current);
+            let generation = update_widths(current);
+            if let Some(timer) = pending.borrow_mut().take() {
+                timer.remove();
+            }
+            let pending_timer = pending.clone();
+            let persist_widths = persist_widths.clone();
+            let widths = widths.clone();
+            let source =
+                glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                    pending_timer.borrow_mut().take();
+                    persist_widths(widths.get(), generation);
+                });
+            *pending.borrow_mut() = Some(source);
+        });
+    }
 
     // ColumnView's own headers are the clickable, localized column titles.
     // The view-level `header_factory` is for GtkListHeader section rows, not
@@ -703,6 +749,7 @@ fn build_icons(
 }
 
 /// Builds the view for `mode` on the given store. Returns widget and selection.
+#[allow(clippy::too_many_arguments)]
 pub fn build_view(
     mode: ViewMode,
     store: &gio::ListStore,
@@ -711,14 +758,23 @@ pub fn build_view(
     display: ViewDisplay,
     sort_order: Rc<std::cell::Cell<kito_core::SortOrder>>,
     on_sort: Rc<dyn Fn(kito_core::SortOrder)>,
+    update_widths: Rc<dyn Fn(DetailColumnWidths) -> u64>,
+    persist_widths: Rc<dyn Fn(DetailColumnWidths, u64)>,
 ) -> (gtk::Widget, gtk::MultiSelection) {
     let selection = gtk::MultiSelection::new(Some(store.clone()));
     let widget: gtk::Widget = match mode {
         ViewMode::Icons => build_icons(selection.clone(), handlers, display.icon_zoom).upcast(),
         ViewMode::Compact => build_compact(selection.clone(), handlers, display.icon_zoom).upcast(),
-        ViewMode::Details => {
-            build_details(selection.clone(), handlers, display, sort_order, on_sort).upcast()
-        }
+        ViewMode::Details => build_details(
+            selection.clone(),
+            handlers,
+            display,
+            sort_order,
+            on_sort,
+            update_widths,
+            persist_widths,
+        )
+        .upcast(),
     };
     // Activation (pointer or keyboard) has one shared handler in FileTab.
     set_open_items(&widget, open_items);
@@ -948,6 +1004,12 @@ mod tests {
                 show_size: false,
                 show_type: true,
                 show_modified: false,
+                detail_column_widths: DetailColumnWidths {
+                    name: 330,
+                    size: 90,
+                    kind: 250,
+                    modified: 190,
+                },
             };
             let sort_order = Rc::new(std::cell::Cell::new(kito_core::SortOrder::default()));
             let observed_orders = Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -968,6 +1030,8 @@ mod tests {
                 display,
                 sort_order,
                 on_sort,
+                Rc::new(|_| 0),
+                Rc::new(|_, _| {}),
             );
             let view = widget.clone().downcast::<gtk::ColumnView>().unwrap();
             // ColumnView.header_factory configures section headers, not the
@@ -989,6 +1053,16 @@ mod tests {
             assert!(size.sorter().is_some());
             assert!(kind.sorter().is_some());
             assert!(modified.sorter().is_some());
+            assert!(
+                name.is_resizable()
+                    && size.is_resizable()
+                    && kind.is_resizable()
+                    && modified.is_resizable()
+            );
+            assert_eq!(name.fixed_width(), 330);
+            assert_eq!(size.fixed_width(), 90);
+            assert_eq!(kind.fixed_width(), 250);
+            assert_eq!(modified.fixed_width(), 190);
             assert!(name.is_visible());
             assert!(!size.is_visible());
             assert!(kind.is_visible());

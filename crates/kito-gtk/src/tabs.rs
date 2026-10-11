@@ -3,7 +3,7 @@
 
 use crate::file_list;
 use crate::file_list::{FileObject, SecondaryHandler, ViewMode};
-use crate::preferences::model::{OpenItems, Preferences};
+use crate::preferences::model::{DetailColumnWidths, OpenItems, Preferences};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::{
@@ -376,7 +376,24 @@ fn rebuild_view(tab: &Rc<FileTab>) {
             if is_trash_uri(&tab.history.current_uri()) {
                 crate::context_menu::show_trash(anchor, x, y, &tab.window, selected.len());
             } else {
-                crate::context_menu::show(anchor, x, y, &tab.window, selected.len(), folders_only);
+                let is_favorite = selected.first().is_some_and(|item| {
+                    tab.manager
+                        .upgrade()
+                        .is_some_and(|manager| manager.preference_store.is_favorite(&item.uri()))
+                });
+                let is_bookmarked = selected
+                    .first()
+                    .is_some_and(|item| kito_core::bookmarks::is_pinned(&item.uri()));
+                crate::context_menu::show(
+                    anchor,
+                    x,
+                    y,
+                    &tab.window,
+                    selected.len(),
+                    folders_only,
+                    is_favorite,
+                    is_bookmarked,
+                );
             }
         }
     });
@@ -433,12 +450,36 @@ fn rebuild_view(tab: &Rc<FileTab>) {
         show_size: display.show_size_column,
         show_type: display.show_type_column,
         show_modified: display.show_modified_column,
+        detail_column_widths: display.detail_column_widths,
     };
     let on_sort: Rc<dyn Fn(kito_core::SortOrder)> = Rc::new({
         let tab = Rc::downgrade(tab);
         move |order| {
             if let Some(tab) = tab.upgrade() {
                 tab.set_sort_order(order);
+            }
+        }
+    });
+    let update_widths: Rc<dyn Fn(DetailColumnWidths) -> u64> = Rc::new({
+        let manager = tab.manager.clone();
+        move |widths| {
+            if let Some(manager) = manager.upgrade() {
+                manager.preference_store.update_detail_column_widths(widths)
+            } else {
+                0
+            }
+        }
+    });
+    let persist_widths: Rc<dyn Fn(DetailColumnWidths, u64)> = Rc::new({
+        let manager = tab.manager.clone();
+        move |widths, generation| {
+            if let Some(manager) = manager.upgrade() {
+                if let Err(error) = manager
+                    .preference_store
+                    .persist_detail_column_widths(widths, generation)
+                {
+                    eprintln!("save details column widths: {error}");
+                }
             }
         }
     });
@@ -456,6 +497,8 @@ fn rebuild_view(tab: &Rc<FileTab>) {
         display,
         tab.sort_order.clone(),
         on_sort,
+        update_widths,
+        persist_widths,
     );
     wire_activate(tab, &widget);
     // Selection -> status bar (selected items).
@@ -489,6 +532,9 @@ fn rebuild_view(tab: &Rc<FileTab>) {
 
 impl FileTab {
     fn title_for(uri: &str) -> String {
+        if uri == kito_core::FAVORITES_URI {
+            return crate::l10n::tr("side-favorites");
+        }
         uri.trim_end_matches('/')
             .rsplit('/')
             .next()
@@ -663,6 +709,14 @@ impl FileTab {
         }
         let show_hidden = self.show_hidden.get();
         let sort_order = self.sort_order.get();
+        let favorite_uris = if target == kito_core::FAVORITES_URI {
+            self.manager
+                .upgrade()
+                .map(|manager| manager.preference_store.snapshot().favorite_uris)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if previous == target {
             self.scroll_before_load
                 .set(Some(self.scrolled.vadjustment().value()));
@@ -681,14 +735,22 @@ impl FileTab {
         let (tx, rx) = async_channel::bounded::<Result<ListedFolder, String>>(1);
         let worker_target = target.clone();
         std::thread::spawn(move || {
-            let result = kito_core::list_dir_with_sort(
-                &worker_target,
-                show_hidden,
-                &cancellable,
-                sort_order,
-            )
-            .map(|(entries, timings)| ListedFolder { entries, timings })
-            .map_err(|e| e.to_string());
+            let result = if worker_target == kito_core::FAVORITES_URI {
+                let items = favorite_uris
+                    .into_iter()
+                    .map(|uri| {
+                        let label = kito_core::uri_to_display(&uri);
+                        (label, uri)
+                    })
+                    .collect::<Vec<_>>();
+                kito_core::list_uri_entries(&items, sort_order, &cancellable)
+                    .map(|(entries, timings)| ListedFolder { entries, timings })
+                    .map_err(|error| error.to_string())
+            } else {
+                kito_core::list_dir_with_sort(&worker_target, show_hidden, &cancellable, sort_order)
+                    .map(|(entries, timings)| ListedFolder { entries, timings })
+                    .map_err(|e| e.to_string())
+            };
             let _ = tx.send_blocking(result);
         });
         glib::spawn_future_local(async move {
@@ -819,6 +881,16 @@ impl FileTab {
             }
         }
         self.hidden_sync.mark_refreshed(show_hidden);
+        if target == kito_core::FAVORITES_URI && n == 0 {
+            self.empty_page
+                .set_title(&crate::l10n::tr("empty-favorites"));
+            self.empty_page
+                .set_description(Some(&crate::l10n::tr("empty-favorites-description")));
+        } else {
+            self.empty_page.set_title(&crate::l10n::tr("empty-folder"));
+            self.empty_page
+                .set_description(Some(&crate::l10n::tr("empty-folder-description")));
+        }
         self.stack.set_visible_child_name(settled_child(n, true));
         if self
             .manager
@@ -902,6 +974,16 @@ impl FileTab {
     }
 
     fn install_directory_monitor(self: &Rc<Self>, uri: &str) {
+        if uri == kito_core::FAVORITES_URI {
+            // Favorites is a Kito-only virtual list, not a view of the shared
+            // Freedesktop bookmark file. PreferenceStore reloads it when its
+            // own URI list changes; target operations reload it independently.
+            if self.monitor_uri.borrow().as_deref() != Some(uri) {
+                self.stop_monitor();
+                *self.monitor_uri.borrow_mut() = Some(uri.to_string());
+            }
+            return;
+        }
         if self.monitor_uri.borrow().as_deref() == Some(uri) {
             return;
         }
@@ -1284,6 +1366,7 @@ pub struct TabManager {
     on_sort: OnSort,
     show_hidden: Rc<Cell<bool>>,
     preferences: Rc<RefCell<Preferences>>,
+    preference_store: Rc<crate::preferences::PreferenceStore>,
     open_window: Rc<dyn Fn(Vec<String>)>,
     closed_tabs: RefCell<ClosedTabs>,
     ctx: RefCell<std::rc::Weak<crate::ops::Ctx>>,
@@ -1340,7 +1423,7 @@ impl TabManager {
         on_status: OnStatus,
         on_sort: OnSort,
         show_hidden: Rc<Cell<bool>>,
-        preferences: Rc<RefCell<Preferences>>,
+        preference_store: Rc<crate::preferences::PreferenceStore>,
         open_window: Rc<dyn Fn(Vec<String>)>,
     ) -> Rc<Self> {
         let manager = Rc::new(Self {
@@ -1351,7 +1434,8 @@ impl TabManager {
             on_status,
             on_sort,
             show_hidden,
-            preferences,
+            preferences: preference_store.shared(),
+            preference_store,
             open_window,
             closed_tabs: RefCell::new(ClosedTabs::default()),
             ctx: RefCell::new(std::rc::Weak::new()),
@@ -1398,6 +1482,20 @@ impl TabManager {
                 }
             });
         }
+        manager.preference_store.subscribe_sidebar({
+            let manager_weak = Rc::downgrade(&manager);
+            Rc::new(move |_| {
+                let Some(manager) = manager_weak.upgrade() else {
+                    return;
+                };
+                let tabs = manager.tabs.borrow().clone();
+                for tab in tabs {
+                    if tab.history.current_uri() == kito_core::FAVORITES_URI {
+                        tab.reload();
+                    }
+                }
+            })
+        });
         manager
     }
 

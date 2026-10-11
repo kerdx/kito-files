@@ -276,7 +276,7 @@ fn register_actions(
     single_item_actions: Rc<RefCell<Vec<gio::SimpleAction>>>,
 ) {
     let group = gio::SimpleActionGroup::new();
-    let defs: [ActionDef; 43] = [
+    let defs: [ActionDef; 44] = [
         ("open", ops::Ctx::open_selected),
         ("open-in-new-tab", ops::Ctx::open_selected_in_new_tabs),
         ("open-in-new-window", ops::Ctx::open_selected_in_new_window),
@@ -300,6 +300,7 @@ fn register_actions(
         ("empty-trash", ops::Ctx::empty_trash),
         ("restore", ops::Ctx::restore_selected),
         ("pin", ops::Ctx::toggle_pin),
+        ("favorite", ops::Ctx::toggle_favorite),
         ("cut", |c| c.copy_selected(true)),
         ("copy", |c| c.copy_selected(false)),
         ("paste", ops::Ctx::paste),
@@ -509,6 +510,26 @@ fn load_pathbar_css() {
             border-top-style: solid;\
             border-top-color: alpha(@window_fg_color, 0.08);\
         }\
+        /* Keep selection on GTK's item/row node (not individual cells), so\
+         * ColumnView columns read as one selected row and icons stay themed. */\
+        gridview > child {\
+            border-radius: 8px;\
+            transition: background-color 120ms ease-out;\
+        }\
+        gridview > child:hover,\
+        columnview row:hover {\
+            background-color: alpha(@window_fg_color, 0.06);\
+        }\
+        gridview > child:selected,\
+        columnview row:selected {\
+            background-color: @accent_bg_color;\
+            color: @accent_fg_color;\
+        }\
+        gridview:focus > child:selected,\
+        columnview:focus row:selected {\
+            outline: 2px solid @accent_bg_color;\
+            outline-offset: -2px;\
+        }\
         .zoom-button {\
             min-width: 24px;\
             min-height: 24px;\
@@ -611,6 +632,11 @@ fn rebuild_crumbs(crumbs: &gtk::Box, uri: &str, load: &Rc<dyn Fn(&str)>, edit: &
                     "user-trash-full-symbolic",
                     "user-trash",
                 ],
+            ))
+        } else if uri == kito_core::FAVORITES_URI {
+            Some((
+                tr("side-favorites"),
+                &["starred-symbolic", "star-symbolic", "starred", "star"],
             ))
         } else if uri.starts_with("network:") {
             Some((
@@ -748,6 +774,15 @@ fn main() -> glib::ExitCode {
                 }
             }
             build_window(app, uris, preferences.clone());
+        }
+    });
+
+    app.connect_shutdown({
+        let preferences = preferences.clone();
+        move |_| {
+            if let Err(error) = preferences.flush() {
+                eprintln!("flush preferences on shutdown: {error}");
+            }
         }
     });
 
@@ -1305,7 +1340,7 @@ fn build_window(
         set_status,
         on_sort,
         show_hidden.clone(),
-        preferences.shared(),
+        preferences.clone(),
         open_window,
     );
     *manager_slot.borrow_mut() = Some(manager.clone());

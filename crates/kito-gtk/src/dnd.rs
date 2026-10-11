@@ -9,6 +9,7 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc};
 pub enum TransferAction {
     Copy,
     Move,
+    Link,
 }
 
 pub type DropHandler = Rc<dyn Fn(Vec<String>, String, TransferAction, bool, gdk::Drop)>;
@@ -84,6 +85,7 @@ pub fn transfer_action(
     match selected {
         gdk::DragAction::COPY => Some(TransferAction::Copy),
         gdk::DragAction::MOVE => Some(TransferAction::Move),
+        gdk::DragAction::LINK => Some(TransferAction::Link),
         _ => None,
     }
 }
@@ -103,6 +105,29 @@ fn preferred_drop_action(
     };
     if offered.contains(wanted) {
         wanted
+    } else if offered.contains(gdk::DragAction::LINK) {
+        gdk::DragAction::LINK
+    } else {
+        gdk::DragAction::empty()
+    }
+}
+
+fn preferred_for_target(
+    offered: gdk::DragAction,
+    modifiers: gdk::ModifierType,
+    supported: gdk::DragAction,
+) -> gdk::DragAction {
+    let available = offered & supported;
+    let wanted = preferred_drop_action(offered, modifiers);
+    if !wanted.is_empty() && available.contains(wanted) {
+        wanted
+    } else if available.contains(gdk::DragAction::LINK) {
+        gdk::DragAction::LINK
+    } else if supported.contains(gdk::DragAction::LINK) && available.contains(gdk::DragAction::COPY)
+    {
+        // Special bookmark targets may safely reinterpret COPY as adding a
+        // link-like entry. Ordinary folders keep the old no-fallback behavior.
+        gdk::DragAction::COPY
     } else {
         gdk::DragAction::empty()
     }
@@ -110,13 +135,8 @@ fn preferred_drop_action(
 
 fn negotiate_drop_action(drop: &gdk::Drop, supported: gdk::DragAction) -> gdk::DragAction {
     let offered = drop.actions();
-    let preferred = preferred_drop_action(offered, drop.device().modifier_state());
     let available = offered & supported;
-    let selected = if !preferred.is_empty() && available.contains(preferred) {
-        preferred
-    } else {
-        gdk::DragAction::empty()
-    };
+    let selected = preferred_for_target(offered, drop.device().modifier_state(), supported);
     drop.status(available, selected);
     selected
 }
@@ -126,9 +146,23 @@ fn choose_drop_action(drop: &gdk::Drop, supported: gdk::DragAction) -> Option<Tr
     let selected = drop
         .drag()
         .map(|drag| drag.selected_action())
-        .filter(|action| !action.is_empty())
-        .unwrap_or_else(|| preferred_drop_action(offered, drop.device().modifier_state()));
-    transfer_action(selected, offered, supported)
+        .unwrap_or_else(gdk::DragAction::empty);
+    choose_action(selected, offered, drop.device().modifier_state(), supported)
+}
+
+fn choose_action(
+    selected: gdk::DragAction,
+    offered: gdk::DragAction,
+    modifiers: gdk::ModifierType,
+    supported: gdk::DragAction,
+) -> Option<TransferAction> {
+    let action =
+        if selected.is_unique() && offered.contains(selected) && supported.contains(selected) {
+            selected
+        } else {
+            preferred_for_target(offered, modifiers, supported)
+        };
+    transfer_action(action, offered, supported)
 }
 
 pub fn prepared_file_list(uris: &[String]) -> Option<PreparedDrag> {
@@ -162,12 +196,82 @@ pub fn file_list_uris(value: &glib::Value) -> Option<Vec<String>> {
     )
 }
 
+fn parse_uri_list(bytes: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let uris: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| {
+            glib::Uri::parse(line, glib::UriFlags::NONE).is_ok_and(|uri| !uri.scheme().is_empty())
+        })
+        .map(str::to_string)
+        .collect();
+    (!uris.is_empty()).then_some(uris)
+}
+
+const MAX_URI_LIST_BYTES: usize = 1024 * 1024;
+
+fn read_uri_stream(
+    stream: gio::InputStream,
+    mut accumulated: Vec<u8>,
+    callback: Box<dyn FnOnce(Result<Vec<u8>, glib::Error>)>,
+) {
+    // Read one byte beyond the maximum when necessary, so an exactly-full
+    // payload can still be distinguished from an oversized one at EOF.
+    let remaining = MAX_URI_LIST_BYTES + 1 - accumulated.len();
+    let read_stream = stream.clone();
+    stream.read_bytes_async(
+        remaining.min(64 * 1024),
+        glib::Priority::DEFAULT,
+        gio::Cancellable::NONE,
+        move |result| match result {
+            Err(error) => callback(Err(error)),
+            Ok(bytes) if bytes.is_empty() => callback(Ok(accumulated)),
+            Ok(bytes) => {
+                accumulated.extend_from_slice(bytes.as_ref());
+                if accumulated.len() > MAX_URI_LIST_BYTES {
+                    callback(Err(glib::Error::new(
+                        gio::IOErrorEnum::NoSpace,
+                        "URI list exceeds the maximum size",
+                    )));
+                } else {
+                    read_uri_stream(read_stream, accumulated, callback);
+                }
+            }
+        },
+    );
+}
+
 pub fn attach_drop_target(
     widget: &impl IsA<gtk::Widget>,
     destination: Destination,
     on_drop: DropHandler,
 ) {
-    let actions = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+    attach_drop_target_with_actions(
+        widget,
+        destination,
+        on_drop,
+        gdk::DragAction::COPY | gdk::DragAction::MOVE,
+    );
+}
+
+pub fn attach_drop_target_with_actions(
+    widget: &impl IsA<gtk::Widget>,
+    destination: Destination,
+    on_drop: DropHandler,
+    actions: gdk::DragAction,
+) {
+    attach_drop_target_with_actions_and_hover(widget, destination, on_drop, actions, None);
+}
+
+pub fn attach_drop_target_with_actions_and_hover(
+    widget: &impl IsA<gtk::Widget>,
+    destination: Destination,
+    on_drop: DropHandler,
+    actions: gdk::DragAction,
+    hover: Option<Rc<dyn Fn(bool)>>,
+) {
     let formats = gdk::ContentFormats::builder()
         .add_type(gdk::FileList::static_type())
         .add_mime_type("text/uri-list")
@@ -179,9 +283,36 @@ pub fn attach_drop_target(
             || formats.contain_mime_type("text/uri-list"))
             && drop.actions().intersects(actions)
     });
-    target.connect_drag_enter(move |_, drop, _, _| negotiate_drop_action(drop, actions));
-    target.connect_drag_motion(move |_, drop, _, _| negotiate_drop_action(drop, actions));
+    target.connect_drag_enter({
+        let hover = hover.clone();
+        move |_, drop, _, _| {
+            if let Some(hover) = &hover {
+                hover(true);
+            }
+            negotiate_drop_action(drop, actions)
+        }
+    });
+    target.connect_drag_motion({
+        let hover = hover.clone();
+        move |_, drop, _, _| {
+            if let Some(hover) = &hover {
+                hover(true);
+            }
+            negotiate_drop_action(drop, actions)
+        }
+    });
+    target.connect_drag_leave({
+        let hover = hover.clone();
+        move |_, _| {
+            if let Some(hover) = &hover {
+                hover(false);
+            }
+        }
+    });
     target.connect_drop(move |_, drop, _, _| {
+        if let Some(hover) = &hover {
+            hover(false);
+        }
         let Some(action) = choose_drop_action(drop, actions) else {
             drop.finish(gdk::DragAction::empty());
             return false;
@@ -200,16 +331,49 @@ pub fn attach_drop_target(
             gio::Cancellable::NONE,
             move |result| {
                 let drop = callback_drop;
-                let Ok(value) = result else {
-                    drop.finish(gdk::DragAction::empty());
-                    return;
-                };
-                let Some(uris) = file_list_uris(&value).filter(|uris| !uris.is_empty()) else {
-                    drop.finish(gdk::DragAction::empty());
-                    return;
-                };
-                let internal = mark_internal_drop(&drop);
-                on_drop(uris, destination, action, internal, drop);
+                if let Ok(value) = result {
+                    if let Some(uris) = file_list_uris(&value).filter(|uris| !uris.is_empty()) {
+                        let internal = mark_internal_drop(&drop);
+                        on_drop(uris, destination, action, internal, drop);
+                        return;
+                    }
+                }
+                let fallback_drop = drop.clone();
+                let fallback_on_drop = on_drop.clone();
+                let fallback_destination = destination.clone();
+                drop.read_async(
+                    &["text/uri-list"],
+                    glib::Priority::DEFAULT,
+                    gio::Cancellable::NONE,
+                    move |result| {
+                        let Ok((stream, _)) = result else {
+                            fallback_drop.finish(gdk::DragAction::empty());
+                            return;
+                        };
+                        read_uri_stream(
+                            stream,
+                            Vec::new(),
+                            Box::new(move |result| {
+                                let Ok(bytes) = result else {
+                                    fallback_drop.finish(gdk::DragAction::empty());
+                                    return;
+                                };
+                                let Some(uris) = parse_uri_list(&bytes) else {
+                                    fallback_drop.finish(gdk::DragAction::empty());
+                                    return;
+                                };
+                                let internal = mark_internal_drop(&fallback_drop);
+                                fallback_on_drop(
+                                    uris,
+                                    fallback_destination,
+                                    action,
+                                    internal,
+                                    fallback_drop,
+                                );
+                            }),
+                        );
+                    },
+                );
             },
         );
         true
@@ -250,7 +414,7 @@ pub fn attach_row_drag_drop(
     }
 
     let source = gtk::DragSource::new();
-    source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
+    source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE | gdk::DragAction::LINK);
     let drag_uris: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(None));
     source.connect_prepare({
         let drag_uris = drag_uris.clone();
@@ -308,13 +472,25 @@ mod tests {
     }
 
     #[test]
-    fn link_and_ambiguous_actions_are_never_accepted() {
+    fn link_is_accepted_only_when_the_drop_target_supports_it() {
         let both = gdk::DragAction::COPY | gdk::DragAction::MOVE;
         assert_eq!(
             transfer_action(gdk::DragAction::LINK, gdk::DragAction::LINK, both),
             None
         );
+        assert_eq!(
+            transfer_action(
+                gdk::DragAction::LINK,
+                gdk::DragAction::LINK,
+                gdk::DragAction::LINK
+            ),
+            Some(TransferAction::Link)
+        );
         assert_eq!(transfer_action(both, both, both), None);
+        assert_eq!(
+            preferred_drop_action(gdk::DragAction::LINK, gdk::ModifierType::empty()),
+            gdk::DragAction::LINK
+        );
     }
 
     #[test]
@@ -337,6 +513,135 @@ mod tests {
             preferred_drop_action(gdk::DragAction::COPY, gdk::ModifierType::SHIFT_MASK),
             gdk::DragAction::empty()
         );
+    }
+
+    #[test]
+    fn special_destination_never_selects_move_and_falls_back_to_copy() {
+        let safe = gdk::DragAction::COPY | gdk::DragAction::LINK;
+        let offered = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+        assert_eq!(
+            preferred_for_target(offered, gdk::ModifierType::empty(), safe),
+            gdk::DragAction::COPY
+        );
+        assert_eq!(
+            preferred_for_target(offered, gdk::ModifierType::empty(), offered),
+            gdk::DragAction::MOVE
+        );
+        assert_ne!(
+            preferred_for_target(offered, gdk::ModifierType::SHIFT_MASK, safe),
+            gdk::DragAction::MOVE
+        );
+        let folders = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+        assert!(preferred_for_target(
+            gdk::DragAction::COPY,
+            gdk::ModifierType::SHIFT_MASK,
+            folders,
+        )
+        .is_empty());
+        assert!(preferred_for_target(
+            folders,
+            gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
+            folders,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn selected_action_is_used_only_when_supported_and_offered() {
+        let folder = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+        let special = gdk::DragAction::COPY | gdk::DragAction::LINK;
+        let modifiers = gdk::ModifierType::empty();
+
+        assert_eq!(
+            choose_action(gdk::DragAction::MOVE, folder, modifiers, folder),
+            Some(TransferAction::Move)
+        );
+        assert_eq!(
+            choose_action(gdk::DragAction::MOVE, folder, modifiers, special),
+            Some(TransferAction::Copy)
+        );
+        assert_eq!(
+            choose_action(
+                gdk::DragAction::LINK,
+                gdk::DragAction::COPY | gdk::DragAction::LINK,
+                modifiers,
+                special
+            ),
+            Some(TransferAction::Link)
+        );
+        assert_eq!(
+            choose_action(
+                gdk::DragAction::empty(),
+                gdk::DragAction::empty(),
+                modifiers,
+                special
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn uri_list_parser_keeps_multiple_encoded_uris_and_ignores_comments() {
+        assert_eq!(
+            parse_uri_list(b"# comment\r\nfile:///tmp/a%20b\r\nfile:///tmp/folder/\n"),
+            Some(vec![
+                "file:///tmp/a%20b".to_string(),
+                "file:///tmp/folder/".to_string()
+            ])
+        );
+        assert_eq!(parse_uri_list(b"\r\n# only comment\nplain text\n"), None);
+        assert_eq!(parse_uri_list(b"\xff"), None);
+    }
+
+    fn collect_memory_stream(chunks: &[&[u8]]) -> Result<Vec<u8>, glib::Error> {
+        let stream = gio::MemoryInputStream::new();
+        for chunk in chunks {
+            stream.add_bytes(&glib::Bytes::from(*chunk));
+        }
+        let context = glib::MainContext::new();
+        let _guard = context.acquire().unwrap();
+        let loop_ = glib::MainLoop::new(Some(&context), false);
+        let result = Rc::new(RefCell::new(None));
+        context
+            .with_thread_default(|| {
+                read_uri_stream(
+                    stream.upcast(),
+                    Vec::new(),
+                    Box::new({
+                        let loop_ = loop_.clone();
+                        let result = result.clone();
+                        move |read_result| {
+                            *result.borrow_mut() = Some(read_result);
+                            loop_.quit();
+                        }
+                    }),
+                );
+                loop_.run();
+            })
+            .unwrap();
+        let outcome = result.borrow_mut().take().unwrap();
+        outcome
+    }
+
+    #[test]
+    fn uri_list_stream_reads_through_short_chunks_to_eof() {
+        let bytes =
+            collect_memory_stream(&[b"file:///tmp/a%", b"20b\r\n", b"file:///tmp/dir\n"]).unwrap();
+        assert_eq!(
+            parse_uri_list(&bytes),
+            Some(vec![
+                "file:///tmp/a%20b".to_string(),
+                "file:///tmp/dir".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn oversized_uri_list_stream_is_rejected_before_parsing() {
+        let oversized = vec![b'x'; MAX_URI_LIST_BYTES + 1];
+        let result = collect_memory_stream(&[&oversized]);
+        assert!(result.is_err());
+        assert!(parse_uri_list(&result.unwrap_or_default()).is_none());
     }
 
     #[test]

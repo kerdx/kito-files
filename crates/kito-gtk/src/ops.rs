@@ -87,6 +87,7 @@ impl DropCompletion {
         let action = match self.action {
             crate::dnd::TransferAction::Copy if succeeded > 0 => gdk::DragAction::COPY,
             crate::dnd::TransferAction::Move if all_succeeded => gdk::DragAction::MOVE,
+            crate::dnd::TransferAction::Link if succeeded > 0 => gdk::DragAction::LINK,
             _ => gdk::DragAction::empty(),
         };
         self.drop.finish(action);
@@ -209,6 +210,14 @@ impl ClipTracker {
         Some(generation)
     }
 
+    /// Retires a cut dispatch rejected before it starts, without consuming
+    /// clipboard entries. Only the matching operation may clear the mark.
+    fn cancel_cut(&mut self, op_generation: u64) {
+        if self.cut_in_flight == Some(op_generation) {
+            self.cut_in_flight = None;
+        }
+    }
+
     /// Applies a finished cut move. Always retires a matching in-flight
     /// mark; touches entries only when the clipboard still belongs to
     /// this operation (same generation): full success consumes the cut,
@@ -320,6 +329,74 @@ impl Ctx {
         drop: Option<gdk::Drop>,
     ) {
         let completion = drop.map(|drop| DropCompletion { drop, action });
+        if destination == kito_core::ADD_BOOKMARK_URI {
+            let mut results = Vec::new();
+            for uri in uris {
+                let name = gio::File::for_uri(&uri)
+                    .basename()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| kito_core::uri_to_display(&uri));
+                let result = if matches!(
+                    action,
+                    crate::dnd::TransferAction::Copy | crate::dnd::TransferAction::Link
+                ) {
+                    kito_core::bookmarks::pin(&name, &uri)
+                } else {
+                    Err(glib::Error::new(
+                        gio::IOErrorEnum::InvalidArgument,
+                        "Bookmark drop requires COPY or LINK",
+                    ))
+                };
+                if let Err(error) = &result {
+                    self.toast(&error.to_string());
+                }
+                results.push(OperationItemResult::from_result(
+                    "bookmark", uri, None, result,
+                ));
+            }
+            if let Some(completion) = completion {
+                completion.finish(&results);
+            }
+            self.preferences.notify_bookmarks_changed();
+            return;
+        }
+        if destination == kito_core::FAVORITES_URI {
+            if matches!(
+                action,
+                crate::dnd::TransferAction::Copy | crate::dnd::TransferAction::Link
+            ) {
+                let mut results = Vec::new();
+                for uri in uris {
+                    match self.preferences.add_favorite(&uri) {
+                        Ok(()) => results.push(OperationItemResult::from_result(
+                            "favorite",
+                            uri,
+                            None,
+                            Ok(()),
+                        )),
+                        Err(error) => results.push(OperationItemResult::from_result(
+                            "favorite",
+                            uri,
+                            None,
+                            Err(glib::Error::new(
+                                gio::IOErrorEnum::Failed,
+                                &error.to_string(),
+                            )),
+                        )),
+                    }
+                }
+                if let Some(completion) = completion {
+                    completion.finish(&results);
+                }
+            } else {
+                self.toast(&crate::l10n::tr("favorites-not-a-folder"));
+                if let Some(completion) = completion {
+                    completion.finish(&[]);
+                }
+            }
+            return;
+        }
         if uris.is_empty() {
             if let Some(completion) = completion {
                 completion.finish(&[]);
@@ -387,6 +464,9 @@ impl Ctx {
         if results.is_empty() {
             return;
         }
+        // Item operations act on real targets; refresh virtual Favorites so
+        // renamed, moved, deleted or restored targets expose current metadata.
+        self.manager.reload_if_current(kito_core::FAVORITES_URI);
         let succeeded = results
             .iter()
             .filter(|result| matches!(result.state, ItemState::Succeeded))
@@ -602,6 +682,10 @@ impl Ctx {
     }
 
     pub fn go_up(&self) {
+        if self.manager.selected_uri().as_deref() == Some(kito_core::FAVORITES_URI) {
+            self.manager.go_back();
+            return;
+        }
         if let Some(uri) = self.manager.selected_uri() {
             if let Some(parent) = gio::File::for_uri(&uri).parent() {
                 self.manager.load_selected(&parent.uri());
@@ -732,6 +816,16 @@ impl Ctx {
         drop_completion: Option<DropCompletion>,
         move_with_backend: bool,
     ) {
+        if dest == kito_core::FAVORITES_URI {
+            self.toast(&crate::l10n::tr("favorites-not-a-folder"));
+            if let Some(op_generation) = cut_op {
+                self.clipboard.borrow_mut().cancel_cut(op_generation);
+            }
+            if let Some(completion) = drop_completion {
+                completion.finish(&[]);
+            }
+            return;
+        }
         if uris.is_empty() {
             if let Some(completion) = drop_completion {
                 completion.finish(&[]);
@@ -1050,26 +1144,51 @@ impl Ctx {
         dialog.present(Some(&self.window));
     }
 
-    /// Pin/unpin of the single selected folder (context menu).
+    /// Pin/unpin of the single selected file or folder (context menu).
     /// Writes to `~/.config/gtk-3.0/bookmarks`: the sidebar reloads
     /// on its own via monitor (also applies to pins made by Nautilus).
     pub fn toggle_pin(&self) {
         let objs = self.manager.selected_objects();
-        if objs.len() != 1 || !objs[0].is_dir() {
-            self.toast(&crate::l10n::tr("pin-select-folder"));
+        if objs.len() != 1 {
+            self.toast(&crate::l10n::tr("pin-select-item"));
             return;
         }
         let uri = objs[0].uri();
         if kito_core::bookmarks::is_pinned(&uri) {
             match kito_core::bookmarks::unpin(&uri) {
-                Ok(_) => self.toast(&crate::l10n::tr("pin-unpinned")),
+                Ok(_) => {
+                    self.toast(&crate::l10n::tr("pin-unpinned"));
+                    self.manager.reload_if_current(kito_core::FAVORITES_URI);
+                }
                 Err(e) => self.error_dialog(&crate::l10n::tr("error-unpin"), e.to_string()),
             }
         } else {
             match kito_core::bookmarks::pin(&objs[0].name(), &uri) {
-                Ok(_) => self.toast(&crate::l10n::tr("pin-pinned")),
+                Ok(_) => {
+                    self.toast(&crate::l10n::tr("pin-pinned"));
+                    self.manager.reload_if_current(kito_core::FAVORITES_URI);
+                }
                 Err(e) => self.error_dialog(&crate::l10n::tr("error-pin"), e.to_string()),
             }
+        }
+    }
+
+    pub fn toggle_favorite(&self) {
+        let objs = self.manager.selected_objects();
+        if objs.len() != 1 {
+            self.toast(&crate::l10n::tr("pin-select-item"));
+            return;
+        }
+        let uri = objs[0].uri();
+        match self.preferences.toggle_favorite(&uri) {
+            Ok(added) => {
+                self.toast(&crate::l10n::tr(if added {
+                    "favorite-added"
+                } else {
+                    "favorite-removed"
+                }));
+            }
+            Err(error) => self.error_dialog(&crate::l10n::tr("error-favorite"), error.to_string()),
         }
     }
 
@@ -1190,6 +1309,10 @@ impl Ctx {
     /// [`Self::new_folder`] keeps the selected-tab behavior for the shared
     /// action and shortcuts.
     pub fn new_folder_at(&self, dest: &str) {
+        if dest == kito_core::FAVORITES_URI {
+            self.toast(&crate::l10n::tr("favorites-not-a-folder"));
+            return;
+        }
         let dest = dest.to_string();
         let this = self.clone();
         self.name_dialog(
@@ -1231,6 +1354,10 @@ impl Ctx {
     /// [`Self::new_file`] keeps the selected-tab behavior for the shared
     /// action.
     pub fn new_file_at(&self, dest: &str, template: String) {
+        if dest == kito_core::FAVORITES_URI {
+            self.toast(&crate::l10n::tr("favorites-not-a-folder"));
+            return;
+        }
         if !dest.starts_with("file://") {
             self.error_dialog(
                 &crate::l10n::tr("term-cannot-here"),
@@ -1339,6 +1466,10 @@ impl Ctx {
     /// selected file without clearing the selection.
     pub fn show_folder_properties(&self, dest_uri: &str) {
         if dest_uri.is_empty() {
+            return;
+        }
+        if dest_uri == kito_core::FAVORITES_URI {
+            self.toast(&crate::l10n::tr("favorites-not-a-folder"));
             return;
         }
         self.show_properties_for(dest_uri);
@@ -1636,6 +1767,37 @@ mod tests {
                 cut: true,
             }
         );
+    }
+
+    #[test]
+    fn rejected_destination_cancels_cut_without_consuming_clipboard() {
+        let mut clip = ClipTracker::default();
+        let published = clip.publish(entries(&[A, B], true));
+        let op = clip.begin_cut().expect("first move dispatches");
+        assert_eq!(clip.begin_cut(), None);
+
+        clip.cancel_cut(op);
+
+        assert_eq!(clip.entries.as_ref().unwrap().uris, vec![A, B]);
+        assert!(clip.entries.as_ref().unwrap().cut);
+        assert_eq!(clip.published_text.as_deref(), Some(published.as_str()));
+        assert_eq!(clip.begin_cut(), Some(op));
+    }
+
+    #[test]
+    fn stale_rejected_cut_does_not_cancel_new_generation() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let old_op = clip.generation;
+        assert_eq!(clip.begin_cut(), Some(old_op));
+
+        clip.publish(entries(&[B], true));
+        let new_op = clip.begin_cut().expect("new cut can dispatch");
+        clip.cancel_cut(old_op);
+
+        assert_eq!(clip.entries.as_ref().unwrap().uris, vec![B]);
+        assert_eq!(clip.begin_cut(), None);
+        clip.cancel_cut(new_op);
     }
 
     #[test]

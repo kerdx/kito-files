@@ -42,7 +42,7 @@ const fn danger_row(
 }
 
 /// Menu on a selected entry (row or cell).
-const ROWS: [Row; 11] = [
+const ROWS: [Row; 12] = [
     row(
         &[
             "document-open-symbolic",
@@ -77,6 +77,11 @@ const ROWS: [Row; 11] = [
         ],
         "menu-pin",
         "pin",
+    ),
+    row(
+        &["starred-symbolic", "star-symbolic", "star"],
+        "menu-add-favorite",
+        "favorite",
     ),
     row(&["edit-cut-symbolic", "edit-cut"], "menu-cut", "cut"),
     row(&["edit-copy-symbolic", "edit-copy"], "menu-copy", "copy"),
@@ -222,6 +227,7 @@ fn row_button(r: &Row, app: &gtk::Application, shortcut_width: i32) -> gtk::Butt
 }
 
 /// Builds the popover with its rows, without opening it.
+#[allow(clippy::too_many_arguments)]
 fn build(
     anchor: &gtk::Widget,
     rows: &[Row],
@@ -229,6 +235,8 @@ fn build(
     window: &adw::ApplicationWindow,
     selected_count: usize,
     folders_only: bool,
+    is_favorite: bool,
+    is_bookmarked: bool,
 ) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
@@ -243,7 +251,19 @@ fn build(
     let shortcut_width = shortcuts::shortcut_column_width(&app, &actions);
     let list = menu_box();
     for (i, r) in rows.iter().enumerate() {
-        let button = row_button(r, &app, shortcut_width);
+        let mut display_row = Row {
+            icons: r.icons,
+            label: r.label,
+            action: r.action,
+            danger: r.danger,
+        };
+        if r.action == "favorite" && is_favorite {
+            display_row.label = "menu-remove-favorite";
+        }
+        if r.action == "pin" && is_bookmarked {
+            display_row.label = "menu-unpin";
+        }
+        let button = row_button(&display_row, &app, shortcut_width);
         if matches!(r.action, "rename" | "properties") && selected_count != 1 {
             button.set_sensitive(false);
         }
@@ -279,6 +299,8 @@ struct PopupOptions<'a> {
     separators_after: &'a [usize],
     selected_count: usize,
     folders_only: bool,
+    is_favorite: bool,
+    is_bookmarked: bool,
 }
 
 fn popup(anchor: &gtk::Widget, x: f64, y: f64, options: PopupOptions<'_>) {
@@ -289,6 +311,8 @@ fn popup(anchor: &gtk::Widget, x: f64, y: f64, options: PopupOptions<'_>) {
         options.window,
         options.selected_count,
         options.folders_only,
+        options.is_favorite,
+        options.is_bookmarked,
     );
     popover.connect_closed(|popover| popover.unparent());
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -318,6 +342,7 @@ fn side_for(anchor: &gtk::Widget, x: f64, natural_width: i32) -> gtk::PositionTy
 }
 
 /// Right-click on an entry: full menu, the entry is already selected.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     anchor: &gtk::Widget,
     x: f64,
@@ -325,6 +350,8 @@ pub fn show(
     window: &adw::ApplicationWindow,
     selected_count: usize,
     folders_only: bool,
+    is_favorite: bool,
+    is_bookmarked: bool,
 ) {
     popup(
         anchor,
@@ -336,6 +363,8 @@ pub fn show(
             separators_after: &SEPARATORS_AFTER,
             selected_count,
             folders_only,
+            is_favorite,
+            is_bookmarked,
         },
     );
 }
@@ -358,6 +387,8 @@ pub fn show_trash(
             separators_after: &TRASH_SEPARATORS_AFTER,
             selected_count,
             folders_only: false,
+            is_favorite: false,
+            is_bookmarked: false,
         },
     );
 }
@@ -1064,8 +1095,9 @@ pub fn show_background_for(
 ) -> (gtk::Popover, gio::SimpleActionGroup) {
     let local = kito_core::uri_to_path(dest).is_some();
     let group = gio::SimpleActionGroup::new();
-    let writable = writable_initial(dest);
-    let paste = clipboard_hint(ctx);
+    let virtual_favorites = dest == kito_core::FAVORITES_URI;
+    let writable = !virtual_favorites && writable_initial(dest);
+    let paste = !virtual_favorites && clipboard_hint(ctx);
     let can_create_file = gio::SimpleAction::new("can-create-file", None);
     can_create_file.set_enabled(writable);
     group.add_action(&can_create_file);
@@ -1255,6 +1287,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn favorites_action_is_separate_from_shared_bookmark_pin_action() {
+        let pin = ROWS.iter().find(|row| row.action == "pin").unwrap();
+        let favorite = ROWS.iter().find(|row| row.action == "favorite").unwrap();
+        assert_eq!(pin.label, "menu-pin");
+        assert_eq!(favorite.label, "menu-add-favorite");
+        assert_ne!(pin.action, favorite.action);
     }
 
     #[test]

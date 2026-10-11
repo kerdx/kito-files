@@ -302,11 +302,18 @@ pub fn sort_entries(entries: &mut [Entry], order: SortOrder) {
 /// Queries one directory entry's display and sort metadata. Intended for
 /// worker threads, including targeted updates from GIO monitors.
 pub fn query_entry(uri: &str) -> Result<Entry, glib::Error> {
+    query_entry_with_cancellable(uri, &gio::Cancellable::new())
+}
+
+pub fn query_entry_with_cancellable(
+    uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<Entry, glib::Error> {
     let file = gio::File::for_uri(uri);
     let info = file.query_info(
         "standard::name,standard::type,standard::size,time::modified,standard::icon,standard::content-type",
         gio::FileQueryInfoFlags::NONE,
-        gio::Cancellable::NONE,
+        Some(cancellable),
     )?;
     let is_dir = info.file_type() == gio::FileType::Directory;
     Ok(Entry {
@@ -324,6 +331,60 @@ pub fn query_entry(uri: &str) -> Result<Entry, glib::Error> {
             .and_then(|icon| icon.to_string())
             .map(|icon| icon.to_string()),
     })
+}
+
+/// Builds a virtual listing from explicit `(label, real URI)` items. Missing
+/// targets remain visible and removable; no virtual URI reaches GIO.
+pub fn list_uri_entries(
+    items: &[(String, String)],
+    order: SortOrder,
+    cancellable: &gio::Cancellable,
+) -> Result<(Vec<Entry>, ListTimings), glib::Error> {
+    let started = std::time::Instant::now();
+    let mut entries = Vec::with_capacity(items.len());
+    for (label, uri) in items {
+        if cancellable.is_cancelled() {
+            return Err(glib::Error::new(
+                gio::IOErrorEnum::Cancelled,
+                "Operation cancelled",
+            ));
+        }
+        let entry = match query_entry_with_cancellable(uri, cancellable) {
+            Ok(entry) => entry,
+            Err(error)
+                if error.matches(gio::IOErrorEnum::Cancelled) || cancellable.is_cancelled() =>
+            {
+                return Err(error);
+            }
+            Err(_) => Entry {
+                name: label.clone(),
+                uri: uri.clone(),
+                is_dir: false,
+                size: -1,
+                modified: None,
+                content_type: None,
+                icon: Some("text-x-generic".to_string()),
+            },
+        };
+        entries.push(entry);
+    }
+    let enumeration = started.elapsed();
+    let sort_started = std::time::Instant::now();
+    sort_entries(&mut entries, order);
+    let sorting = sort_started.elapsed();
+    if cancellable.is_cancelled() {
+        return Err(glib::Error::new(
+            gio::IOErrorEnum::Cancelled,
+            "Operation cancelled",
+        ));
+    }
+    Ok((
+        entries,
+        ListTimings {
+            enumeration,
+            sorting,
+        },
+    ))
 }
 
 pub fn compare_entries(left: &Entry, right: &Entry, order: SortOrder) -> std::cmp::Ordering {
@@ -483,6 +544,11 @@ pub fn delete_recursive(uri: &str) -> Result<(), glib::Error> {
 
 /// Trash URI (GIO backend, requires gvfs).
 pub const TRASH_URI: &str = "trash:///";
+
+/// Stable virtual root for Freedesktop bookmarks; never pass to file operations.
+pub const FAVORITES_URI: &str = "favorites:///";
+/// Internal DND destination marker; never a GIO folder.
+pub const ADD_BOOKMARK_URI: &str = "bookmark-add:///";
 
 /// Local path of a `file://` URI, decoded via GIO (`%20`, Unicode,
 /// `#`, ...). `None` for non-local URIs (`trash:///`, `network:///`,
@@ -857,6 +923,36 @@ pub fn move_to(src_uri: &str, dest_dir_uri: &str) -> Result<(), glib::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_uri_listing_preserves_real_targets_and_missing_favorites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let file = tmp.path().join(".hidden-file");
+        std::fs::write(&file, b"favorite").unwrap();
+        let missing = tmp.path().join("missing");
+        let folder_uri = gio::File::for_path(&folder).uri().to_string();
+        let file_uri = gio::File::for_path(&file).uri().to_string();
+        let missing_uri = gio::File::for_path(&missing).uri().to_string();
+        let items = vec![
+            ("Favorite folder".into(), folder_uri.clone()),
+            ("Favorite file".into(), file_uri.clone()),
+            ("Missing".into(), missing_uri.clone()),
+        ];
+        let (entries, _) =
+            list_uri_entries(&items, SortOrder::default(), &gio::Cancellable::new()).unwrap();
+        let folder_entry = entries.iter().find(|item| item.uri == folder_uri).unwrap();
+        assert!(folder_entry.is_dir);
+        assert_eq!(folder_entry.name, "folder");
+        let file_entry = entries.iter().find(|item| item.uri == file_uri).unwrap();
+        assert!(!file_entry.is_dir);
+        assert_eq!(file_entry.size, 8);
+        assert_eq!(file_entry.name, ".hidden-file");
+        let missing_entry = entries.iter().find(|item| item.uri == missing_uri).unwrap();
+        assert!(!missing_entry.is_dir);
+        assert!(missing_entry.size < 0);
+    }
 
     #[test]
     fn query_entry_returns_metadata_for_uri_with_spaces() {

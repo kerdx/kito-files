@@ -14,6 +14,8 @@ pub struct PreferencesDialogState {
     sidebar_page: adw::PreferencesPage,
     sidebar_locations_group: adw::PreferencesGroup,
     sidebar_custom_rows: gtk::Box,
+    sidebar_legacy_group: adw::PreferencesGroup,
+    sidebar_legacy_rows: gtk::Box,
     sidebar_add_button: gtk::Button,
     sidebar_restore_group: adw::PreferencesGroup,
     sidebar_restore_button: gtk::Button,
@@ -260,7 +262,7 @@ pub fn present(
         .icon_name("sidebar-show-symbolic")
         .build();
     let sidebar_locations_group = adw::PreferencesGroup::builder()
-        .title(crate::l10n::tr("prefs-sidebar-custom-locations"))
+        .title(crate::l10n::tr("side-bookmarks"))
         .build();
     let sidebar_custom_rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_locations_group.add(&sidebar_custom_rows);
@@ -279,8 +281,15 @@ pub fn present(
             None::<&gtk::gio::Cancellable>,
             move |result| match result {
                 Ok(file) => {
-                    if let Err(error) = preferences.add_sidebar_uri(file.uri().to_string()) {
-                        present_save_error(&error_window, &error);
+                    let uri = file.uri().to_string();
+                    let name = file
+                        .basename()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| uri.clone());
+                    if let Err(error) = kito_core::bookmarks::pin(&name, &uri) {
+                        present_message(&error_window, error.to_string());
+                    } else {
+                        preferences.notify_bookmarks_changed();
                     }
                 }
                 Err(error) if error.matches(gtk::DialogError::Dismissed) => {}
@@ -292,6 +301,43 @@ pub fn present(
         );
     });
     sidebar_locations_group.add(&add_location);
+    let add_file = gtk::Button::with_label(&crate::l10n::tr("prefs-sidebar-add-file-bookmark"));
+    let file_window = window.downgrade();
+    let file_preferences = store.clone();
+    add_file.connect_clicked(move |_| {
+        let Some(window) = file_window.upgrade() else {
+            return;
+        };
+        let chooser = gtk::FileDialog::new();
+        let preferences = file_preferences.clone();
+        let error_window = window.clone();
+        chooser.open(
+            Some(&window),
+            None::<&gtk::gio::Cancellable>,
+            move |result| match result {
+                Ok(file) => {
+                    let uri = file.uri().to_string();
+                    let name = file
+                        .basename()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| uri.clone());
+                    if let Err(error) = kito_core::bookmarks::pin(&name, &uri) {
+                        present_message(&error_window, error.to_string());
+                    } else {
+                        preferences.notify_bookmarks_changed();
+                    }
+                }
+                Err(error) if error.matches(gtk::DialogError::Dismissed) => {}
+                Err(error) => present_message(&error_window, error.to_string()),
+            },
+        );
+    });
+    sidebar_locations_group.add(&add_file);
+    let sidebar_legacy_group = adw::PreferencesGroup::builder()
+        .title(crate::l10n::tr("prefs-sidebar-custom-locations"))
+        .build();
+    let sidebar_legacy_rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_legacy_group.add(&sidebar_legacy_rows);
     let sidebar_restore_group = adw::PreferencesGroup::builder()
         .title(crate::l10n::tr("prefs-sidebar-hidden"))
         .description(crate::l10n::tr("prefs-sidebar-hidden-note"))
@@ -308,37 +354,72 @@ pub fn present(
     });
     sidebar_restore_group.add(&sidebar_restore_button);
     sidebar_page.add(&sidebar_locations_group);
+    sidebar_page.add(&sidebar_legacy_group);
     sidebar_page.add(&sidebar_restore_group);
     dialog.add(&sidebar_page);
 
     refresh_sidebar_preferences(
         &sidebar_custom_rows,
         &sidebar_restore_button,
+        &sidebar_legacy_group,
+        &sidebar_legacy_rows,
         &store.snapshot(),
+        &Rc::downgrade(store),
+        &window.downgrade(),
+    );
+    refresh_sidebar_bookmarks(
+        &sidebar_custom_rows,
         &Rc::downgrade(store),
         &window.downgrade(),
     );
     let locations_weak = sidebar_locations_group.downgrade();
     let custom_rows_weak = sidebar_custom_rows.downgrade();
     let restore_weak = sidebar_restore_button.downgrade();
+    let legacy_group_weak = sidebar_legacy_group.downgrade();
+    let legacy_rows_weak = sidebar_legacy_rows.downgrade();
     let weak_store = Rc::downgrade(store);
     let window_weak = window.downgrade();
     store.subscribe_sidebar(Rc::new(move |snapshot| {
-        let (Some(_group), Some(custom_rows), Some(restore), Some(store)) = (
+        let (
+            Some(_group),
+            Some(custom_rows),
+            Some(restore),
+            Some(legacy_group),
+            Some(legacy_rows),
+            Some(store),
+        ) = (
             locations_weak.upgrade(),
             custom_rows_weak.upgrade(),
             restore_weak.upgrade(),
+            legacy_group_weak.upgrade(),
+            legacy_rows_weak.upgrade(),
             weak_store.upgrade(),
-        ) else {
+        )
+        else {
             return;
         };
         refresh_sidebar_preferences(
             &custom_rows,
             &restore,
+            &legacy_group,
+            &legacy_rows,
             &snapshot,
             &Rc::downgrade(&store),
             &window_weak,
         );
+    }));
+    let bookmark_rows_weak = sidebar_custom_rows.downgrade();
+    let bookmark_store_weak = Rc::downgrade(store);
+    let bookmark_window_weak = window.downgrade();
+    store.subscribe_bookmarks(Rc::new(move || {
+        let (Some(rows), Some(store), Some(_window)) = (
+            bookmark_rows_weak.upgrade(),
+            bookmark_store_weak.upgrade(),
+            bookmark_window_weak.upgrade(),
+        ) else {
+            return;
+        };
+        refresh_sidebar_bookmarks(&rows, &Rc::downgrade(&store), &bookmark_window_weak);
     }));
 
     *existing.borrow_mut() = Some(PreferencesDialogState {
@@ -348,6 +429,8 @@ pub fn present(
         sidebar_page,
         sidebar_locations_group,
         sidebar_custom_rows,
+        sidebar_legacy_group,
+        sidebar_legacy_rows,
         sidebar_add_button: add_location,
         sidebar_restore_group,
         sidebar_restore_button,
@@ -394,6 +477,9 @@ pub fn retranslate(state: &PreferencesDialogState, store: &PreferenceStore) {
         .set_title(&crate::l10n::tr("prefs-sidebar"));
     state
         .sidebar_locations_group
+        .set_title(&crate::l10n::tr("side-bookmarks"));
+    state
+        .sidebar_legacy_group
         .set_title(&crate::l10n::tr("prefs-sidebar-custom-locations"));
     state
         .sidebar_add_button
@@ -410,10 +496,13 @@ pub fn retranslate(state: &PreferencesDialogState, store: &PreferenceStore) {
     refresh_sidebar_preferences(
         &state.sidebar_custom_rows,
         &state.sidebar_restore_button,
+        &state.sidebar_legacy_group,
+        &state.sidebar_legacy_rows,
         &snapshot,
         &state.store,
         &state.window,
     );
+    refresh_sidebar_bookmarks(&state.sidebar_custom_rows, &state.store, &state.window);
 
     state
         .default_view_row
@@ -534,21 +623,18 @@ fn replace_strings(model: &gtk::StringList, values: &[String]) {
 fn refresh_sidebar_preferences(
     rows: &gtk::Box,
     restore_button: &gtk::Button,
+    legacy_group: &adw::PreferencesGroup,
+    legacy_rows: &gtk::Box,
     snapshot: &crate::preferences::model::Preferences,
     store: &std::rc::Weak<PreferenceStore>,
     window: &glib::WeakRef<adw::ApplicationWindow>,
 ) {
-    while let Some(child) = rows.first_child() {
-        rows.remove(&child);
+    let _ = rows;
+    while let Some(child) = legacy_rows.first_child() {
+        legacy_rows.remove(&child);
     }
     for uri in &snapshot.custom_sidebar_uris {
-        let file = gtk::gio::File::for_uri(uri);
-        let title = file
-            .basename()
-            .map(|name| name.to_string_lossy().to_string())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| uri.clone());
-        let row = adw::ActionRow::builder().title(title).subtitle(uri).build();
+        let row = adw::ActionRow::builder().title(uri).subtitle(uri).build();
         let remove = gtk::Button::with_label(&crate::l10n::tr("prefs-sidebar-remove"));
         remove.add_css_class("flat");
         remove.set_valign(gtk::Align::Center);
@@ -559,23 +645,66 @@ fn refresh_sidebar_preferences(
                 uri,
             ))],
         );
-        let uri = uri.clone();
         let store = store.clone();
         let window = window.clone();
+        let uri = uri.clone();
         remove.connect_clicked(move |_| {
             let Some(store) = store.upgrade() else {
                 return;
             };
             if let Err(error) = store.remove_sidebar_uri(&uri) {
                 if let Some(window) = window.upgrade() {
-                    present_save_error(&window, &error);
+                    present_message(&window, save_error(&error));
                 }
+            }
+        });
+        row.add_suffix(&remove);
+        legacy_rows.append(&row);
+    }
+    legacy_group.set_visible(!snapshot.custom_sidebar_uris.is_empty());
+    restore_button.set_sensitive(!snapshot.hidden_sidebar_ids.is_empty());
+}
+
+fn refresh_sidebar_bookmarks(
+    rows: &gtk::Box,
+    store: &std::rc::Weak<PreferenceStore>,
+    window: &glib::WeakRef<adw::ApplicationWindow>,
+) {
+    while let Some(child) = rows.first_child() {
+        rows.remove(&child);
+    }
+    for (title, uri) in kito_core::bookmarks::read() {
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(&uri)
+            .build();
+        let remove = gtk::Button::with_label(&crate::l10n::tr("prefs-sidebar-remove"));
+        remove.add_css_class("flat");
+        remove.set_valign(gtk::Align::Center);
+        remove.update_property(
+            &[gtk::accessible::Property::Label(&crate::l10n::tr_with_one(
+                "prefs-sidebar-remove-accessible",
+                "location",
+                &uri,
+            ))],
+        );
+        let store = store.clone();
+        let window = window.clone();
+        remove.connect_clicked(move |_| {
+            let Some(store) = store.upgrade() else {
+                return;
+            };
+            if let Err(error) = kito_core::bookmarks::unpin(&uri) {
+                if let Some(window) = window.upgrade() {
+                    present_message(&window, error.to_string());
+                }
+            } else {
+                store.notify_bookmarks_changed();
             }
         });
         row.add_suffix(&remove);
         rows.append(&row);
     }
-    restore_button.set_sensitive(!snapshot.hidden_sidebar_ids.is_empty());
 }
 
 fn present_save_error(window: &adw::ApplicationWindow, error: &std::io::Error) {

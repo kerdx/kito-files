@@ -41,6 +41,31 @@ pub const ICON_ZOOM_MIN: u8 = 60;
 pub const ICON_ZOOM_MAX: u8 = 180;
 pub const ICON_ZOOM_STEP: u8 = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailColumnWidths {
+    pub name: i32,
+    pub size: i32,
+    pub kind: i32,
+    pub modified: i32,
+}
+
+impl DetailColumnWidths {
+    pub const DEFAULT: Self = Self {
+        name: 240,
+        size: 110,
+        kind: 200,
+        modified: 170,
+    };
+    pub fn clamped(self) -> Self {
+        Self {
+            name: self.name.clamp(120, 1600),
+            size: self.size.clamp(70, 1200),
+            kind: self.kind.clamp(100, 1200),
+            modified: self.modified.clamp(110, 1200),
+        }
+    }
+}
+
 impl OpenItems {
     pub fn as_config_value(self) -> &'static str {
         match self {
@@ -171,10 +196,13 @@ pub struct Preferences {
     pub show_size_column: bool,
     pub show_type_column: bool,
     pub show_modified_column: bool,
+    pub detail_column_widths: DetailColumnWidths,
     /// Stable, non-localized sidebar row identifiers hidden in this app.
     pub hidden_sidebar_ids: Vec<String>,
     /// GIO URIs added to the sidebar; these never touch shared GTK bookmarks.
     pub custom_sidebar_uris: Vec<String>,
+    /// Kito-only favorites. Kept separate from shared Freedesktop bookmarks.
+    pub favorite_uris: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -189,8 +217,10 @@ impl Default for Preferences {
             show_size_column: true,
             show_type_column: true,
             show_modified_column: false,
+            detail_column_widths: DetailColumnWidths::DEFAULT,
             hidden_sidebar_ids: Vec::new(),
             custom_sidebar_uris: Vec::new(),
+            favorite_uris: Vec::new(),
         }
     }
 }
@@ -255,15 +285,28 @@ impl Preferences {
                     result.show_modified_column =
                         WindowControls::parse_bool(value).unwrap_or(false);
                 }
+                "details-name-width" => {
+                    result.detail_column_widths.name = parse_width(value, 120, 1600, 240)
+                }
+                "details-size-width" => {
+                    result.detail_column_widths.size = parse_width(value, 70, 1200, 110)
+                }
+                "details-type-width" => {
+                    result.detail_column_widths.kind = parse_width(value, 100, 1200, 200)
+                }
+                "details-modified-width" => {
+                    result.detail_column_widths.modified = parse_width(value, 110, 1200, 170)
+                }
                 "sidebar-hidden" => result.hidden_sidebar_ids = decode_list(value),
                 "sidebar-custom" => result.custom_sidebar_uris = decode_list(value),
+                "favorites" => result.favorite_uris = decode_list(value),
                 _ => {}
             }
         }
         result
     }
 
-    pub fn config_entries(&self) -> [(&'static str, String); 14] {
+    pub fn config_entries(&self) -> [(&'static str, String); 19] {
         [
             (
                 "default-view",
@@ -303,8 +346,34 @@ impl Preferences {
             ),
             ("sidebar-hidden", encode_list(&self.hidden_sidebar_ids)),
             ("sidebar-custom", encode_list(&self.custom_sidebar_uris)),
+            ("favorites", encode_list(&self.favorite_uris)),
+            (
+                "details-name-width",
+                self.detail_column_widths.name.to_string(),
+            ),
+            (
+                "details-size-width",
+                self.detail_column_widths.size.to_string(),
+            ),
+            (
+                "details-type-width",
+                self.detail_column_widths.kind.to_string(),
+            ),
+            (
+                "details-modified-width",
+                self.detail_column_widths.modified.to_string(),
+            ),
         ]
     }
+}
+
+fn parse_width(value: &str, min: i32, max: i32, default: i32) -> i32 {
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|width| (min..=max).contains(width))
+        .unwrap_or(default)
 }
 
 // Hex encoding makes commas, newlines and arbitrary UTF-8 safe in the
@@ -376,8 +445,60 @@ mod tests {
         assert_eq!(preferences.icon_zoom, 100);
         assert!(preferences.show_size_column && preferences.show_type_column);
         assert!(!preferences.show_modified_column);
+        assert_eq!(
+            preferences.detail_column_widths,
+            DetailColumnWidths::DEFAULT
+        );
         assert!(preferences.hidden_sidebar_ids.is_empty());
         assert!(preferences.custom_sidebar_uris.is_empty());
+    }
+
+    #[test]
+    fn detail_column_widths_parse_bounds_and_round_trip() {
+        let parsed = Preferences::from_config_text(
+            "details-name-width=320\ndetails-size-width=1\ndetails-type-width=1601\ndetails-modified-width=bad\nfuture=value\n",
+        );
+        assert_eq!(
+            parsed.detail_column_widths,
+            DetailColumnWidths {
+                name: 320,
+                size: 110,
+                kind: 200,
+                modified: 170,
+            }
+        );
+
+        let widths = DetailColumnWidths {
+            name: 1600,
+            size: 70,
+            kind: 1200,
+            modified: 1199,
+        };
+        let preferences = Preferences {
+            detail_column_widths: widths,
+            ..Preferences::default()
+        };
+        let text = preferences
+            .config_entries()
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}\n"))
+            .collect::<String>();
+        assert_eq!(Preferences::from_config_text(&text), preferences);
+        assert_eq!(
+            DetailColumnWidths {
+                name: -1,
+                size: 5000,
+                kind: 50,
+                modified: 2000,
+            }
+            .clamped(),
+            DetailColumnWidths {
+                name: 120,
+                size: 1200,
+                kind: 100,
+                modified: 1200,
+            }
+        );
     }
 
     #[test]
@@ -399,6 +520,26 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(decode_list("ff,61,ø"), vec!["a"]);
+    }
+
+    #[test]
+    fn favorites_have_an_independent_settings_key_and_round_trip() {
+        let favorites = vec![
+            "file:///tmp/a".to_string(),
+            "smb://host/share/é,one\nline".to_string(),
+        ];
+        let preferences = Preferences {
+            favorite_uris: favorites.clone(),
+            custom_sidebar_uris: vec!["file:///tmp/custom".into()],
+            ..Preferences::default()
+        };
+        let entries = preferences.config_entries();
+        let favorites_entry = entries.iter().find(|(key, _)| *key == "favorites").unwrap();
+        assert_eq!(favorites_entry.1, encode_list(&favorites));
+        let restored =
+            Preferences::from_config_text(&format!("favorites = {}\n", favorites_entry.1));
+        assert_eq!(restored.favorite_uris, favorites);
+        assert!(restored.custom_sidebar_uris.is_empty());
     }
 
     #[test]
