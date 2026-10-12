@@ -17,7 +17,8 @@ Wayland or X11 backend automatically; development testing is done on Wayland.
 - Tabs, back/forward navigation and Icons, Compact or Details views.
 - Editable breadcrumbs and asynchronous local path autocompletion.
 - Places, devices, network locations and shared freedesktop bookmarks.
-- Copy, cut, paste, rename, file/folder creation and properties.
+- Multi-selection; copy, cut, paste, rename, file/folder creation and properties.
+- Drag-and-drop to folders and tabs; external Moves are confirmed only after success.
 - Trash, restore and confirmed permanent deletion, with collision handling.
 - Asynchronous folder loading and bulk view updates.
 - Terminal integration and preferences for view, click behavior and window controls.
@@ -66,7 +67,7 @@ follows the system language, with English fallback, or your saved English/Italia
 - [Development guide](docs/DEVELOPMENT.md): dependencies, architecture, tests and translations.
 - [Performance report](docs/perf-report.md): measurements and optimization details.
 
-File selection currently supports one item at a time. See the user guide for
-file-creation limitations and other usage details.
+Some actions, such as rename and properties, still apply to one selected item at a time.
+See the user guide for file-creation limitations and other usage details.
 
 Released under the [MIT License](LICENSE).

@@ -1379,41 +1379,39 @@ pub struct TabManager {
 }
 
 impl TabManager {
+    /// Extra drop target on the tab bar. `AdwTabBar`'s own
+    /// `setup_extra_drop_target` acknowledges drops synchronously from the
+    /// `extra-drag-drop` handler, before any file I/O could succeed, so an
+    /// external MOVE source would delete its data on faith. Instead this
+    /// installs a `GtkDropTargetAsync` on the bar itself: the `GdkDrop` is
+    /// handed to the operation engine and finished only after the
+    /// transfer settles. The destination is the folder of the tab under
+    /// the pointer, resolved from the drop coordinates; tabs showing a
+    /// view rather than a folder (`recent:`, `search:`, `network:///`)
+    /// resolve to no destination, so the hover is declined and the drop
+    /// refused.
     pub fn setup_tab_bar(self: &Rc<Self>, tab_bar: &adw::TabBar, ctx: &Rc<crate::ops::Ctx>) {
         let actions = gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE;
-        tab_bar.setup_extra_drop_target(actions, &[gtk::gdk::FileList::static_type()]);
         let manager = Rc::downgrade(self);
         let ctx = Rc::downgrade(ctx);
-        tab_bar.connect_extra_drag_drop(move |bar, page, value| {
-            let Some(action) =
-                crate::dnd::transfer_action(bar.extra_drag_preferred_action(), actions, actions)
-            else {
-                return false;
-            };
-            let Some(uris) = crate::dnd::file_list_uris(value).filter(|uris| !uris.is_empty())
-            else {
-                return false;
-            };
-            let Some(manager) = manager.upgrade() else {
-                return false;
-            };
-            let Some(destination) = manager.uri_for_page(page) else {
-                return false;
-            };
-            let internal = crate::dnd::mark_active_internal_drop();
-            // AdwTabBar's extra-drag-drop signal cannot defer its GDK
-            // acknowledgement until background I/O completes. Reject an
-            // external MOVE here so its source cannot delete data early.
-            if !internal && action == crate::dnd::TransferAction::Move {
-                return false;
-            }
-            if let Some(ctx) = ctx.upgrade() {
-                ctx.transfer_uris(uris, destination, action, internal, None);
-                true
-            } else {
-                false
-            }
+        let tab_bar_ref = tab_bar.downgrade();
+        let destination: crate::dnd::ResolveDestination = Rc::new(move |x, y| {
+            let manager = manager.upgrade()?;
+            let tab_bar = tab_bar_ref.upgrade()?;
+            let page = page_at_point(&tab_bar, x, y)?;
+            manager
+                .uri_for_page(&page)
+                .filter(|uri| is_drop_destination(uri))
         });
+        let on_drop: crate::dnd::DropHandler =
+            Rc::new(move |uris, destination, action, internal, drop| {
+                if let Some(ctx) = ctx.upgrade() {
+                    ctx.transfer_uris(uris, destination, action, internal, Some(drop));
+                } else {
+                    drop.finish(gtk::gdk::DragAction::empty());
+                }
+            });
+        crate::dnd::attach_drop_target_with_resolver(tab_bar, destination, on_drop, actions);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2363,6 +2361,387 @@ fn retained_selection_uris(selected: &[String], current_order: &[String]) -> Vec
 #[cfg(test)]
 fn find_uri_index(listed: &[String], uri: &str) -> Option<u32> {
     listed.iter().position(|u| u == uri).map(|i| i as u32)
+}
+
+/// A tab's allocation in tab-bar coordinates. Pure geometry, so the
+/// coordinate-to-page mapping stays headless-testable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TabRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl TabRect {
+    /// Half-open containment: a point on the right or bottom edge belongs
+    /// to the next tab, so neighbouring tabs can never both match.
+    fn contains(&self, px: f64, py: f64) -> bool {
+        self.width > 0.0
+            && self.height > 0.0
+            && self.x <= px
+            && px < self.x + self.width
+            && self.y <= py
+            && py < self.y + self.height
+    }
+}
+
+/// Assigns view page indices to the tab rectangles of one tab box (pinned
+/// or regular). Tabs are ordered by horizontal position, because widget
+/// child order is not guaranteed to match the visual order; in RTL the
+/// first page is the rightmost tab. Pinned pages are always the first
+/// pages of an `AdwTabView`, so a pinned box starts at page 0 and the
+/// regular box at `first_page`.
+fn tab_page_rects(tabs: &[TabRect], first_page: u32, rtl: bool) -> Vec<(TabRect, u32)> {
+    let mut order: Vec<usize> = (0..tabs.len()).collect();
+    order.sort_by(|&a, &b| tabs[a].x.total_cmp(&tabs[b].x));
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(position, index)| {
+            let page = if rtl {
+                first_page + (tabs.len() - 1 - position) as u32
+            } else {
+                first_page + position as u32
+            };
+            (tabs[index], page)
+        })
+        .collect()
+}
+
+/// The page under a point in tab-bar coordinates; `None` when the point
+/// sits on no tab (gaps, padding, action widgets, scrolled-out areas).
+fn page_index_at(zones: &[(TabRect, u32)], x: f64, y: f64) -> Option<u32> {
+    let zone = zones.iter().find(|(rect, _)| rect.contains(x, y));
+    zone.map(|&(_, page)| page)
+}
+
+/// The per-tab containers of the `AdwTabBox` groups inside the bar. The
+/// `AdwTabBar` template holds one `AdwTabBox` per group (readable
+/// `pinned` property), and each box parents one `AdwGizmo` "tabboxchild"
+/// per tab. Widgets that do not match are ignored, so separators,
+/// attention arrows and popovers never count as tabs.
+fn tab_containers(tab_bar: &adw::TabBar) -> (Vec<gtk::Widget>, Vec<gtk::Widget>) {
+    let mut pinned = Vec::new();
+    let mut regular = Vec::new();
+    let mut pending = vec![tab_bar.clone().upcast::<gtk::Widget>()];
+    while let Some(widget) = pending.pop() {
+        let mut child = widget.first_child();
+        while let Some(node) = child {
+            let next = node.next_sibling();
+            if node.type_().name() == "AdwTabBox" && node.has_property("pinned") {
+                let is_pinned = node.property::<bool>("pinned");
+                let mut tab = node.first_child();
+                while let Some(tab_node) = tab {
+                    let tab_next = tab_node.next_sibling();
+                    if tab_node.type_().name() == "AdwGizmo" {
+                        if is_pinned {
+                            pinned.push(tab_node);
+                        } else {
+                            regular.push(tab_node);
+                        }
+                    }
+                    tab = tab_next;
+                }
+            } else {
+                pending.push(node);
+            }
+            child = next;
+        }
+    }
+    (pinned, regular)
+}
+
+fn tab_rect(tab_bar: &adw::TabBar, container: &gtk::Widget) -> Option<TabRect> {
+    let bounds = container.compute_bounds(tab_bar)?;
+    Some(TabRect {
+        x: f64::from(bounds.x()),
+        y: f64::from(bounds.y()),
+        width: f64::from(bounds.width()),
+        height: f64::from(bounds.height()),
+    })
+}
+
+/// Whether a tab's location may receive dropped files. The tab-bar
+/// resolver runs this on every hover and on the drop itself, so a page that
+/// only shows a view refuses the drag instead of failing after the source
+/// has already been told to move its data. `recent:`, `search:` and
+/// `network:///` are views rather than writable folders. Trash, Favorites
+/// and Add Bookmark are virtual destinations `transfer_uris` handles
+/// itself and are not matched by those prefixes; every other GIO URI,
+/// including remote ones (`sftp://`, `smb://`, ...), stays allowed.
+fn is_drop_destination(uri: &str) -> bool {
+    !uri.is_empty()
+        && !uri.starts_with("recent:")
+        && !uri.starts_with("search:")
+        && !uri.starts_with("network:")
+}
+
+/// Resolves the page under a point given in tab-bar coordinates. The
+/// container counts must match the view exactly; any structural mismatch
+/// resolves to `None`, so a drop is refused rather than routed to an
+/// unknown folder.
+fn page_at_point(tab_bar: &adw::TabBar, x: f64, y: f64) -> Option<adw::TabPage> {
+    let view = tab_bar.view()?;
+    let n_pages = view.n_pages();
+    let n_pinned = view.n_pinned_pages();
+    if n_pages < 0 || n_pinned < 0 || n_pinned > n_pages {
+        return None;
+    }
+    let (pinned, regular) = tab_containers(tab_bar);
+    if pinned.len() != n_pinned as usize || regular.len() != (n_pages - n_pinned) as usize {
+        return None;
+    }
+    let pinned_rects: Vec<TabRect> = pinned
+        .iter()
+        .map(|container| tab_rect(tab_bar, container))
+        .collect::<Option<_>>()?;
+    let regular_rects: Vec<TabRect> = regular
+        .iter()
+        .map(|container| tab_rect(tab_bar, container))
+        .collect::<Option<_>>()?;
+    let rtl = tab_bar.direction() == gtk::TextDirection::Rtl;
+    let mut zones = tab_page_rects(&pinned_rects, 0, rtl);
+    zones.extend(tab_page_rects(&regular_rects, n_pinned as u32, rtl));
+    let index = page_index_at(&zones, x, y)?;
+    (index < n_pages as u32).then(|| view.nth_page(index as i32))
+}
+
+#[cfg(test)]
+mod tab_bar_drop_tests {
+    use super::*;
+
+    fn rect(x: f64, width: f64) -> TabRect {
+        TabRect {
+            x,
+            y: 0.0,
+            width,
+            height: 40.0,
+        }
+    }
+
+    #[test]
+    fn page_indices_follow_visual_order_left_to_right() {
+        // Containers can arrive in widget order, which is not the visual
+        // order: indices are assigned by horizontal position.
+        let tabs = [rect(200.0, 100.0), rect(0.0, 100.0), rect(100.0, 100.0)];
+        let zones = tab_page_rects(&tabs, 0, false);
+        assert_eq!(page_index_at(&zones, 50.0, 10.0), Some(0));
+        assert_eq!(page_index_at(&zones, 150.0, 10.0), Some(1));
+        assert_eq!(page_index_at(&zones, 250.0, 10.0), Some(2));
+    }
+
+    #[test]
+    fn rtl_first_page_is_the_rightmost_tab() {
+        let tabs = [rect(0.0, 100.0), rect(100.0, 100.0), rect(200.0, 100.0)];
+        let zones = tab_page_rects(&tabs, 0, true);
+        assert_eq!(page_index_at(&zones, 250.0, 10.0), Some(0));
+        assert_eq!(page_index_at(&zones, 150.0, 10.0), Some(1));
+        assert_eq!(page_index_at(&zones, 50.0, 10.0), Some(2));
+    }
+
+    #[test]
+    fn regular_box_pages_start_after_the_pinned_ones() {
+        let pinned = [rect(0.0, 80.0)];
+        let regular = [rect(80.0, 100.0), rect(180.0, 100.0)];
+        let mut zones = tab_page_rects(&pinned, 0, false);
+        zones.extend(tab_page_rects(&regular, 1, false));
+        assert_eq!(page_index_at(&zones, 40.0, 10.0), Some(0));
+        assert_eq!(page_index_at(&zones, 120.0, 10.0), Some(1));
+        assert_eq!(page_index_at(&zones, 220.0, 10.0), Some(2));
+    }
+
+    #[test]
+    fn points_off_any_tab_resolve_to_no_page() {
+        let tabs = [rect(0.0, 100.0), rect(120.0, 100.0)];
+        let zones = tab_page_rects(&tabs, 0, false);
+        // Gap between the tabs.
+        assert_eq!(page_index_at(&zones, 110.0, 10.0), None);
+        // Half-open edges: the right and bottom edges belong to nobody.
+        assert_eq!(page_index_at(&zones, 100.0, 10.0), None);
+        assert_eq!(page_index_at(&zones, 50.0, 40.0), None);
+        assert_eq!(page_index_at(&zones, 50.0, -1.0), None);
+        // A zero-sized container (hidden or scrolled out) never matches.
+        let hidden = [TabRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        }];
+        let zones = tab_page_rects(&hidden, 0, false);
+        assert_eq!(page_index_at(&zones, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn views_are_not_drop_destinations() {
+        // Hover and drop use the same resolver, so a view page declines the
+        // negotiation and refuses the drop instead of failing halfway.
+        for view in [
+            "recent:///",
+            "recent:///file%3A%2F%2Ftmp%2Fx",
+            "search:///name~pattern",
+            "network:///",
+            "network://",
+        ] {
+            assert!(!is_drop_destination(view), "{view}");
+        }
+        assert!(!is_drop_destination(""));
+    }
+
+    #[test]
+    fn virtual_and_remote_destinations_stay_allowed() {
+        // What `transfer_uris` handles itself, plus every GIO URI that can
+        // really receive files.
+        for destination in [
+            kito_core::TRASH_URI,
+            kito_core::FAVORITES_URI,
+            kito_core::ADD_BOOKMARK_URI,
+            "file:///home/user/Docs",
+            "sftp://server/var/www",
+            "smb://nas/share",
+            "davs://host/path",
+        ] {
+            assert!(is_drop_destination(destination), "{destination}");
+        }
+    }
+
+    /// Real `AdwTabBar` structure: the resolver must find one container
+    /// per page and map the pointer to the right page, including a pinned
+    /// page in its own box and RTL mirroring.
+    #[test]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn tab_bar_resolves_the_page_under_the_pointer() {
+        gtk::test_synced(|| {
+            let app = adw::Application::new(
+                Some("org.example.KitoTabBarDndProbe"),
+                gio::ApplicationFlags::NON_UNIQUE,
+            );
+            app.register(None::<&gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::new(&app);
+            let view = adw::TabView::new();
+            let bar = adw::TabBar::new();
+            bar.set_view(Some(&view));
+            let pages: Vec<adw::TabPage> = ["one", "two", "three"]
+                .iter()
+                .map(|label| view.append(&gtk::Label::new(Some(label))))
+                .collect();
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            content.append(&bar);
+            window.set_content(Some(&content));
+            window.set_default_size(600, 200);
+            window.present();
+
+            let context = glib::MainContext::default();
+            // Conditions are polled while the main loop drains the
+            // compositor; tab box resizes animate, so allocations settle
+            // over a few frames.
+            let settle = |condition: &dyn Fn() -> bool| -> bool {
+                for _ in 0..300 {
+                    if condition() {
+                        return true;
+                    }
+                    while context.iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                condition()
+            };
+            let all_tabs_allocated = |bar: &adw::TabBar| {
+                let (pinned, regular) = tab_containers(bar);
+                pinned.into_iter().chain(regular).all(|widget| {
+                    tab_rect(bar, &widget).is_some_and(|rect| rect.width > 0.0 && rect.height > 0.0)
+                })
+            };
+            assert!(settle(&|| bar.height() > 0), "tab bar was never allocated");
+            assert!(
+                settle(&|| all_tabs_allocated(&bar)),
+                "tabs never allocated"
+            );
+
+            // Containers sorted left to right; each must resolve to the
+            // page at the same visual position, one per view page.
+            let assert_mapping = |expected: &[&adw::TabPage]| {
+                let (pinned, regular) = tab_containers(&bar);
+                let mut positioned: Vec<(TabRect, gtk::Widget)> = pinned
+                    .into_iter()
+                    .chain(regular)
+                    .map(|widget| (tab_rect(&bar, &widget).expect("allocated"), widget))
+                    .collect();
+                positioned.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+                assert_eq!(positioned.len(), expected.len());
+                let resolved: Vec<Option<adw::TabPage>> = positioned
+                    .iter()
+                    .map(|(rect, _)| {
+                        page_at_point(&bar, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+                    })
+                    .collect();
+                let wanted: Vec<Option<adw::TabPage>> = expected
+                    .iter()
+                    .map(|page| Some((*page).clone()))
+                    .collect();
+                assert_eq!(resolved, wanted);
+                // Points off every tab resolve to no page.
+                let first = &positioned[0].0;
+                assert_eq!(
+                    page_at_point(&bar, first.x - 10.0, first.y + 5.0),
+                    None
+                );
+                assert_eq!(page_at_point(&bar, first.x + 5.0, -1.0), None);
+            };
+
+            let one = pages[0].clone();
+            let two = pages[1].clone();
+            let three = pages[2].clone();
+            assert_mapping(&[&one, &two, &three]);
+
+            // Pinning moves the page into the pinned box, leftmost in LTR;
+            // the box resize animates, so wait for fresh allocations.
+            view.set_page_pinned(&three, true);
+            assert!(
+                settle(&|| all_tabs_allocated(&bar)),
+                "pinned tab never allocated"
+            );
+            assert_mapping(&[&three, &one, &two]);
+
+            // A global RTL default (as in an RTL locale) mirrors the whole
+            // bar: the first page is the rightmost tab and the pinned box
+            // sits on the right, so left to right the pages are two, one,
+            // three. The guard restores LTR for any later test in the
+            // process, including after a failed assertion.
+            struct ResetDirection;
+            impl Drop for ResetDirection {
+                fn drop(&mut self) {
+                    gtk::Widget::set_default_direction(gtk::TextDirection::Ltr);
+                }
+            }
+            let _reset_direction = ResetDirection;
+            gtk::Widget::set_default_direction(gtk::TextDirection::Rtl);
+            let rtl_settled = {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let mut settled = false;
+                while std::time::Instant::now() < deadline {
+                    while context.iteration(false) {}
+                    let (pinned, regular) = tab_containers(&bar);
+                    let rightmost = pinned
+                        .into_iter()
+                        .chain(regular)
+                        .filter_map(|widget| tab_rect(&bar, &widget))
+                        .max_by(|a, b| a.x.total_cmp(&b.x));
+                    if rightmost.is_some_and(|rect| {
+                        page_at_point(&bar, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+                            .as_ref()
+                            == Some(&three)
+                    }) {
+                        settled = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                settled
+            };
+            assert!(rtl_settled, "RTL mirroring never appeared");
+            assert_mapping(&[&two, &one, &three]);
+        });
+    }
 }
 
 #[cfg(test)]

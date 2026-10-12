@@ -97,21 +97,31 @@ impl DropCompletion {
         if self.finished.get() {
             return;
         }
-        let succeeded = results
-            .iter()
-            .filter(|result| matches!(result.state, ItemState::Succeeded))
-            .count();
-        let all_succeeded = !results.is_empty()
-            && succeeded == results.len()
-            && results.iter().all(|result| !result.needs_retry());
-        let action = match self.action {
-            crate::dnd::TransferAction::Copy if succeeded > 0 => gdk::DragAction::COPY,
-            crate::dnd::TransferAction::Move if all_succeeded => gdk::DragAction::MOVE,
-            crate::dnd::TransferAction::Link if succeeded > 0 => gdk::DragAction::LINK,
-            _ => gdk::DragAction::empty(),
-        };
         self.finished.set(true);
-        self.drop.finish(action);
+        self.drop.finish(ack_action(self.action, results));
+    }
+}
+
+/// The acknowledgement sent to the drag source once the asynchronous
+/// transfer settled. A MOVE may only be confirmed after every item
+/// reached the destination: a partial or failed transfer leaves the
+/// source data untouched. COPY and LINK confirm partial success.
+fn ack_action(
+    action: crate::dnd::TransferAction,
+    results: &[OperationItemResult],
+) -> gdk::DragAction {
+    let succeeded = results
+        .iter()
+        .filter(|result| matches!(result.state, ItemState::Succeeded))
+        .count();
+    let all_succeeded = !results.is_empty()
+        && succeeded == results.len()
+        && results.iter().all(|result| !result.needs_retry());
+    match action {
+        crate::dnd::TransferAction::Copy if succeeded > 0 => gdk::DragAction::COPY,
+        crate::dnd::TransferAction::Move if all_succeeded => gdk::DragAction::MOVE,
+        crate::dnd::TransferAction::Link if succeeded > 0 => gdk::DragAction::LINK,
+        _ => gdk::DragAction::empty(),
     }
 }
 
@@ -1972,6 +1982,95 @@ fn prop_row(label: &str, value: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn move_result(source: &str, result: Result<(), glib::Error>) -> OperationItemResult {
+        OperationItemResult::from_result(
+            "operation-move",
+            source.to_string(),
+            Some("file:///dest".to_string()),
+            result,
+        )
+    }
+
+    fn failed_error() -> glib::Error {
+        glib::Error::new(gio::IOErrorEnum::Failed, "boom")
+    }
+
+    #[test]
+    fn move_ack_is_sent_only_after_complete_success() {
+        use crate::dnd::TransferAction;
+        // Full success: the external source may delete its data.
+        assert_eq!(
+            ack_action(
+                TransferAction::Move,
+                &[
+                    move_result("file:///a", Ok(())),
+                    move_result("file:///b", Ok(())),
+                ],
+            ),
+            gdk::DragAction::MOVE
+        );
+        // Partial transfer: no ack, so the source deletes nothing and the
+        // items that did not arrive stay on the source side.
+        assert_eq!(
+            ack_action(
+                TransferAction::Move,
+                &[
+                    move_result("file:///a", Ok(())),
+                    move_result("file:///b", Err(failed_error())),
+                ],
+            ),
+            gdk::DragAction::empty()
+        );
+        // All failed, cancelled or empty batches never confirm a move.
+        assert_eq!(
+            ack_action(
+                TransferAction::Move,
+                &[move_result("file:///a", Err(failed_error()))],
+            ),
+            gdk::DragAction::empty()
+        );
+        assert_eq!(
+            ack_action(
+                TransferAction::Move,
+                &[move_result(
+                    "file:///a",
+                    Err(glib::Error::new(gio::IOErrorEnum::Cancelled, "stopped")),
+                )],
+            ),
+            gdk::DragAction::empty()
+        );
+        assert_eq!(
+            ack_action(TransferAction::Move, &[]),
+            gdk::DragAction::empty()
+        );
+    }
+
+    #[test]
+    fn copy_and_link_ack_partial_success() {
+        use crate::dnd::TransferAction;
+        let results = [
+            move_result("file:///a", Ok(())),
+            move_result("file:///b", Err(failed_error())),
+        ];
+        assert_eq!(
+            ack_action(TransferAction::Copy, &results),
+            gdk::DragAction::COPY
+        );
+        assert_eq!(
+            ack_action(TransferAction::Link, &results),
+            gdk::DragAction::LINK
+        );
+        let failed = [move_result("file:///a", Err(failed_error()))];
+        assert_eq!(
+            ack_action(TransferAction::Copy, &failed),
+            gdk::DragAction::empty()
+        );
+        assert_eq!(
+            ack_action(TransferAction::Copy, &[]),
+            gdk::DragAction::empty()
+        );
+    }
 
     #[test]
     fn undo_records_require_identity_to_survive_the_move() {

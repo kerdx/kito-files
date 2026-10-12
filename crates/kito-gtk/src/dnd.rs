@@ -14,6 +14,10 @@ pub enum TransferAction {
 
 pub type DropHandler = Rc<dyn Fn(Vec<String>, String, TransferAction, bool, gdk::Drop)>;
 pub type Destination = Rc<dyn Fn() -> Option<String>>;
+/// Destination resolved from the drop coordinates, in the coordinate
+/// space of the target widget. `None` means the point is not a valid
+/// target: the hover is declined and the drop refused.
+pub type ResolveDestination = Rc<dyn Fn(f64, f64) -> Option<String>>;
 pub type ExternalMoveHandler = Rc<dyn Fn(Vec<String>)>;
 pub type PrepareHandler = Rc<dyn Fn() -> Option<PreparedDrag>>;
 
@@ -58,20 +62,6 @@ fn mark_internal_drop(drop: &gdk::Drop) -> bool {
         });
     }
     internal
-}
-
-/// AdwTabBar reports the matching page but not its GdkDrop. This records the
-/// active in-process drag so the source does not repeat an already completed move.
-pub fn mark_active_internal_drop() -> bool {
-    let key = ACTIVE_DRAGS.with(|active| active.borrow().iter().next().copied());
-    if let Some(key) = key {
-        INTERNAL_DROPS.with(|drops| {
-            drops.borrow_mut().insert(key);
-        });
-        true
-    } else {
-        false
-    }
 }
 
 pub fn transfer_action(
@@ -133,10 +123,53 @@ fn preferred_for_target(
     }
 }
 
-fn negotiate_drop_action(drop: &gdk::Drop, supported: gdk::DragAction) -> gdk::DragAction {
+fn action_bits(action: TransferAction) -> gdk::DragAction {
+    match action {
+        TransferAction::Copy => gdk::DragAction::COPY,
+        TransferAction::Move => gdk::DragAction::MOVE,
+        TransferAction::Link => gdk::DragAction::LINK,
+    }
+}
+
+/// Pure policy for a coordinate-resolved destination: with no destination
+/// under the pointer every action is declined, so the source is shown a
+/// refusal instead of a transfer that may never start. Otherwise the usual
+/// modifier-based negotiation applies.
+fn destination_negotiation(
+    offered: gdk::DragAction,
+    modifiers: gdk::ModifierType,
+    supported: gdk::DragAction,
+    destination_available: bool,
+) -> Option<TransferAction> {
+    if !destination_available {
+        return None;
+    }
+    transfer_action(
+        preferred_for_target(offered, modifiers, supported),
+        offered,
+        supported,
+    )
+}
+
+/// Negotiates the drop action for a coordinate-resolved destination.
+/// While no destination resolves under the pointer every action is
+/// declined, so the source sees an invalid target instead of a transfer
+/// that may never start. The drop stays unclaimed for other targets.
+fn negotiate_drop_action_for(
+    drop: &gdk::Drop,
+    supported: gdk::DragAction,
+    destination_available: bool,
+) -> gdk::DragAction {
     let offered = drop.actions();
     let available = offered & supported;
-    let selected = preferred_for_target(offered, drop.device().modifier_state(), supported);
+    let selected = destination_negotiation(
+        offered,
+        drop.device().modifier_state(),
+        supported,
+        destination_available,
+    )
+    .map(action_bits)
+    .unwrap_or(gdk::DragAction::empty());
     drop.status(available, selected);
     selected
 }
@@ -163,6 +196,29 @@ fn choose_action(
             preferred_for_target(offered, modifiers, supported)
         };
     transfer_action(action, offered, supported)
+}
+
+/// Refuses a drop at the current position, keeping the `GtkDropTargetAsync`
+/// contract in exactly one place.
+///
+/// `complete` performs the single completion of the drop (always an empty
+/// action here, so the source is told the drop failed and keeps its data).
+/// The value returned to GTK is what the `drop` signal handler must report:
+/// `TRUE` means this handler owns the completion and GTK stops processing
+/// the event, `FALSE` means "not a drop zone" and lets the event keep
+/// propagating while the drop is left untouched
+/// (`gtk_drop_target_async_drop` / `GtkDropTargetAsync::drop` in
+/// gtk/gtkdroptargetasync.c).
+///
+/// Finishing the drop and then returning `FALSE` would hand an
+/// already-finished `GdkDrop` to the next controller — a GLib critical from
+/// the second `gdk_drop_finish()` (`gdk_drop_finish` requires the DROPPING
+/// state) — and returning `FALSE` without finishing would leave the drop
+/// unfinished (`gdk_drop_finalize` warns about that) with the source waiting
+/// for a completion that never arrives. One finish, one handler.
+fn refuse_drop(complete: impl FnOnce()) -> bool {
+    complete();
+    true
 }
 
 pub fn prepared_file_list(uris: &[String]) -> Option<PreparedDrag> {
@@ -272,6 +328,29 @@ pub fn attach_drop_target_with_actions_and_hover(
     actions: gdk::DragAction,
     hover: Option<Rc<dyn Fn(bool)>>,
 ) {
+    let resolve: ResolveDestination = Rc::new(move |_, _| destination());
+    attach_drop_target_resolving(widget, resolve, on_drop, actions, hover);
+}
+
+/// Drop target whose destination depends on the pointer position, such as
+/// a tab bar where each tab is a different folder. The resolver runs on
+/// every motion and on the drop itself, in the widget's coordinate space.
+pub fn attach_drop_target_with_resolver(
+    widget: &impl IsA<gtk::Widget>,
+    resolve: ResolveDestination,
+    on_drop: DropHandler,
+    actions: gdk::DragAction,
+) {
+    attach_drop_target_resolving(widget, resolve, on_drop, actions, None);
+}
+
+fn attach_drop_target_resolving(
+    widget: &impl IsA<gtk::Widget>,
+    resolve: ResolveDestination,
+    on_drop: DropHandler,
+    actions: gdk::DragAction,
+    hover: Option<Rc<dyn Fn(bool)>>,
+) {
     let formats = gdk::ContentFormats::builder()
         .add_type(gdk::FileList::static_type())
         .add_mime_type("text/uri-list")
@@ -285,20 +364,22 @@ pub fn attach_drop_target_with_actions_and_hover(
     });
     target.connect_drag_enter({
         let hover = hover.clone();
-        move |_, drop, _, _| {
+        let resolve = resolve.clone();
+        move |_, drop, x, y| {
             if let Some(hover) = &hover {
                 hover(true);
             }
-            negotiate_drop_action(drop, actions)
+            negotiate_drop_action_for(drop, actions, resolve(x, y).is_some())
         }
     });
     target.connect_drag_motion({
         let hover = hover.clone();
-        move |_, drop, _, _| {
+        let resolve = resolve.clone();
+        move |_, drop, x, y| {
             if let Some(hover) = &hover {
                 hover(true);
             }
-            negotiate_drop_action(drop, actions)
+            negotiate_drop_action_for(drop, actions, resolve(x, y).is_some())
         }
     });
     target.connect_drag_leave({
@@ -309,19 +390,16 @@ pub fn attach_drop_target_with_actions_and_hover(
             }
         }
     });
-    target.connect_drop(move |_, drop, _, _| {
+    target.connect_drop(move |_, drop, x, y| {
         if let Some(hover) = &hover {
             hover(false);
         }
         let Some(action) = choose_drop_action(drop, actions) else {
-            drop.finish(gdk::DragAction::empty());
-            return false;
+            return refuse_drop(|| drop.finish(gdk::DragAction::empty()));
         };
-        let Some(destination) = destination() else {
-            drop.finish(gdk::DragAction::empty());
-            return false;
+        let Some(destination) = resolve(x, y) else {
+            return refuse_drop(|| drop.finish(gdk::DragAction::empty()));
         };
-        let destination = destination.to_string();
         let read_drop = drop.clone();
         let callback_drop = drop.clone();
         let on_drop = on_drop.clone();
@@ -451,6 +529,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refusing_a_drop_completes_it_exactly_once_and_reports_it_as_handled() {
+        // The refusal completes the drop itself, so it must also report the
+        // drop as handled: GTK then stops the event and no other controller
+        // can finish (or read) the same `GdkDrop` a second time.
+        let completions = std::cell::Cell::new(0usize);
+        assert!(refuse_drop(|| completions.set(completions.get() + 1)));
+        assert_eq!(completions.get(), 1);
+    }
+
+    #[test]
     fn selected_action_must_be_offered_and_supported() {
         let both = gdk::DragAction::COPY | gdk::DragAction::MOVE;
         assert_eq!(
@@ -577,6 +665,56 @@ mod tests {
                 special
             ),
             None
+        );
+    }
+
+    #[test]
+    fn no_resolved_destination_declines_every_action() {
+        let offered = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+        // Without a destination under the pointer nothing may be offered,
+        // so an external source never believes a transfer will start.
+        assert_eq!(
+            destination_negotiation(offered, gdk::ModifierType::empty(), offered, false),
+            None
+        );
+        assert_eq!(
+            destination_negotiation(
+                gdk::DragAction::LINK,
+                gdk::ModifierType::CONTROL_MASK,
+                gdk::DragAction::COPY | gdk::DragAction::LINK,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_destination_negotiates_move_for_external_sources() {
+        let offered = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+        // The tab bar advertises COPY|MOVE like folder targets: an external
+        // MOVE drag stays selectable, so the feature is not silently
+        // downgraded to copy while the ack is deferred.
+        assert_eq!(
+            destination_negotiation(offered, gdk::ModifierType::empty(), offered, true),
+            Some(TransferAction::Move)
+        );
+        assert_eq!(
+            destination_negotiation(offered, gdk::ModifierType::CONTROL_MASK, offered, true),
+            Some(TransferAction::Copy)
+        );
+        assert_eq!(
+            destination_negotiation(offered, gdk::ModifierType::SHIFT_MASK, offered, true),
+            Some(TransferAction::Move)
+        );
+        // A COPY-only offer still resolves Copy.
+        assert_eq!(
+            destination_negotiation(
+                gdk::DragAction::COPY,
+                gdk::ModifierType::empty(),
+                gdk::DragAction::COPY,
+                true
+            ),
+            Some(TransferAction::Copy)
         );
     }
 

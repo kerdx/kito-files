@@ -94,9 +94,10 @@ the selected count.
   finishes only after the copy succeeds, allowing the source application to
   remove its originals safely. Dragging files out with Move sends the originals
   to Trash after the destination reports success
-- Drops onto a tab work for internal moves and external copies. External Move on
-  the tab strip is currently rejected because its synchronous callback cannot
-  wait for asynchronous transfer completion; drop onto the folder view instead
+- A drop onto a tab targets the folder under the pointer. Copy and internal Move
+  are supported; an external Move is acknowledged only after every item succeeds.
+  If any item fails, Kito does not ask the source to delete its originals, so
+  successfully transferred copies may remain in the destination.
 
 **Sidebar**
 

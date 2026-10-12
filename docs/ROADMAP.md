@@ -1,8 +1,11 @@
 # Kito Files — piano di sviluppo e confronto con Nautilus
 
-Bozza di lavoro aggiornata il **9 ottobre 2026**. Stato Kito rilevato dai sorgenti
-del checkout basato su `b770356`, comprese le modifiche locali presenti durante
-la ricognizione.
+Bozza di lavoro aggiornata il **12 ottobre 2026**. Stato Kito rilevato dai sorgenti
+del checkout basato su `f18b6b3` (`origin/master`), otto commit dopo la rilevazione
+precedente su `b770356`; albero di lavoro pulito al momento della ricognizione.
+Per gli aggiornamenti successivi non risultano nuove verifiche grafiche registrate
+in `docs/VERIFICATION.md` (ultime sezioni datate 8–9 ottobre): i residui grafici
+indicati qui sotto restano aperti e non vanno considerati superati.
 Questo documento pianifica il lavoro: non indica che le funzioni proposte siano già
 implementate o approvate nel dettaglio.
 
@@ -60,26 +63,31 @@ riuso di codice o asset richiede prima una verifica della compatibilità delle l
 |---|---|---|
 | Navigazione, breadcrumb, schede e cronologia | Presente | `main.rs`, `tabs.rs`; cronologia confermata dopo caricamento riuscito |
 | Percorso modificabile e autocompletamento locale | Presente | `path_completion.rs`; da collaudare insieme ai nuovi caricamenti |
-| Icone, Compatta, Dettagli | Presente | `file_list.rs`; dimensioni e colonne ancora poco configurabili |
+| Icone, Compatta, Dettagli | Presente | `file_list.rs`, `main.rs`; zoom, scelta e larghezze delle colonne persistenti, ordinamento dall'intestazione, icone dei file regolari nella colonna nome; nessuna verifica grafica registrata dopo `45cd17b` |
 | Caricamento asincrono e inserimenti in blocco | Presente | `tabs.rs`, `file_list.rs`; pagina Caricamento immediata ancora presente |
-| Copia/taglio/incolla, rinomina, cartelle | Presente | `ops.rs`, `kito-core`; errori operativi ancora poco dettagliati |
-| Operazioni su gruppi di file | Mancante | Le viste usano `SingleSelection` |
+| Copia/taglio/incolla, rinomina, cartelle | Presente | `ops.rs`, `kito-core`; esiti strutturati per elemento con ritentativi (B03); lavoro in coda seriale |
+| Operazioni su gruppi di file | Presente | Le viste usano `MultiSelection`; azioni di gruppo con URI e destinazione catturati (`ops.rs`, `tabs.rs`); verifica grafica residua (F01) |
 | Cestino, ripristino e cancellazione | Presente | Protezioni symlink e destinazioni di copia; verifiche locali/remote da estendere |
 | Conflitti e spostamenti tra filesystem | Parziale | Suffissi automatici; niente dialogo unisci/sostituisci; `move_to()` usa GIO senza fallback esplicito per cartelle |
-| Avanzamento, interruzione e undo delle operazioni | Mancante | Esiti via toast; nessun gestore generale delle operazioni |
-| Aggiornamento live della cartella aperta | Mancante | Monitor presenti per segnalibri, non un monitor generale dei contenuti della vista |
-| Segnalibri e cartelle XDG | Presente | Segnalibri GTK condivisi; gestione e riordino da ampliare |
+| Avanzamento, interruzione e undo delle operazioni | Parziale | `operation_queue.rs`: coda FIFO con worker, journal undo di 50 voci per rinomina/spostamento con identità invariata e cestino; risultati per elemento in `ops.rs`; nessuna UI di avanzamento, nessuna interruzione dei lavori, nessun redo |
+| Aggiornamento live della cartella aperta | Presente | `tabs.rs`: monitor GIO per scheda, batch coalesciati e riconciliazioni, con test automatici; verifica grafica residua (F04) |
+| Segnalibri e cartelle XDG | Presente | `kito-core/src/bookmarks.rs`: aggiunta, rinomina, riordino e rimozione con scrittura atomica e conservazione di permessi/etichette, monitor del file `bookmarks`; test automatici estesi, verifica grafica residua |
 | Dispositivi e rete | Parziale | Mount e voce network; la sidebar offre espulsione/smontaggio quando supportati da GIO; restano autenticazione e connessioni |
 | Proprietà | Parziale | Metadati di base; mancano modifica permessi e gestione completa delle selezioni |
-| Menu contestuali | Parziale | Popover manuali; sottomenu con chiusure a cascata, proprietà dello sfondo dipendenti dalla selezione |
-| Terminale e shell amministratore | Presente | Scelta emulatori; modifiche locali in corso, da preservare e verificare |
-| Preferenze, controlli finestra, inglese/italiano | Presente | Configurazione XDG e cataloghi Fluent |
-| Ricerca, miniature, archivi, Apri con | Mancante | Non individuate implementazioni nei moduli attuali |
+| Menu contestuali | Parziale | Popover manuali; sottomenu con chiusure a cascata, riga Preferiti sulle voci selezionate, proprietà del menu sfondo sulla cartella catturata e indipendenti dalla selezione |
+| Terminale e shell amministratore | Presente | `terminal.rs`; emulatori tra cui Ptyxis e percorsi non UTF-8 conservati in `OsString` (`c5b2a13`), 14 test automatici; prova grafica residua |
+| Preferenze, controlli finestra, inglese/italiano | Presente | Configurazione XDG e cataloghi Fluent; scorciatoie modificabili con cattura, conflitti e ripristino (`f18b6b3`), colonne/zoom e interruttori della barra di stato; verifica grafica residua |
+| Miniature | Parziale | `file_list.rs`: decodifica in background, cache con budget e coda limitata per immagini locali; nessuna opzione locale/remoto, nessuna preferenza utente, nessuna prova grafica |
+| Ricerca, archivi, Apri con | Mancante | Non individuate implementazioni nei moduli attuali; la ricerca nella sidebar resta un segnaposto |
 
 Moduli di riferimento: [UI](../crates/kito-gtk/src/main.rs),
 [schede](../crates/kito-gtk/src/tabs.rs), [operazioni](../crates/kito-gtk/src/ops.rs),
+[coda e undo](../crates/kito-gtk/src/operation_queue.rs),
 [backend](../crates/kito-core/src/lib.rs), [menu](../crates/kito-gtk/src/context_menu.rs),
-[preferenze](../crates/kito-gtk/src/preferences/model.rs).
+[preferenze](../crates/kito-gtk/src/preferences/model.rs),
+[scorciatoie](../crates/kito-gtk/src/shortcuts.rs),
+[sidebar](../crates/kito-gtk/src/sidebar.rs),
+[segnalibri](../crates/kito-core/src/bookmarks.rs).
 
 ## Cosa mantenere di Kito
 
@@ -101,26 +109,26 @@ Kito sono proposte progettuali. Difficoltà indicative, senza stime temporali.
 
 | ID | Funzione | Kito oggi | Fase proposta | Difficoltà |
 |---|---|---|---|---|
-| F01 | Selezione multipla, intervalli, seleziona tutto/inverti | Mancante | 1 | Media |
-| F02 | Trascinamento tra cartelle, schede, sidebar e altre app | Mancante | 1 | Alta |
+| F01 | Selezione multipla, intervalli, seleziona tutto/inverti | Presente | 1 | Media |
+| F02 | Trascinamento tra cartelle, schede, sidebar e altre app | Parziale | 1 | Alta |
 | F03 | Apri in nuova scheda/finestra; clic centrale e scorciatoie | Parziale | 1 | Bassa/media |
-| F04 | Aggiornamento live dei contenuti con monitor | Mancante | 1 | Media |
-| F05 | Ordinamento per nome, dimensione, tipo e data, inverso | Parziale: nome fisso | 1 | Media |
-| F06 | Zoom delle icone e colonne selezionabili/ordinabili | Mancante | 1 | Media |
-| F07 | Scorciatoie complete, focus e accessibilità | Parziale | Trasversale | Media |
-| F08 | Centro operazioni, avanzamento e interruzione | Mancante | 2 | Alta |
+| F04 | Aggiornamento live dei contenuti con monitor | Presente | 1 | Media |
+| F05 | Ordinamento per nome, dimensione, tipo e data, inverso | Presente | 1 | Media |
+| F06 | Zoom delle icone e colonne selezionabili/ordinabili | Presente | 1 | Media |
+| F07 | Scorciatoie complete, focus e accessibilità | Parziale: scorciatoie configurabili | Trasversale | Media |
+| F08 | Centro operazioni, avanzamento e interruzione | Parziale: coda seriale, nessun avanzamento | 2 | Alta |
 | F09 | Sostituisci, salta, conserva entrambi, unisci cartelle | Parziale: suffissi | 2 | Alta |
 | F10 | Spostamento affidabile tra filesystem | Parziale | 2 | Alta |
-| F11 | Annulla/ripeti per operazioni reversibili | Mancante | 2 | Alta |
+| F11 | Annulla/ripeti per operazioni reversibili | Parziale: undo rinomina/spostamento/cestino, nessun redo | 2 | Alta |
 | F12 | Copia in / Sposta in / Incolla nella cartella selezionata | Mancante | 2 | Media |
 | F13 | Creazione di collegamenti simbolici | Mancante | 2 | Media |
 | F14 | Ricerca per nome, ricorsiva, filtri tipo/data | Mancante | 3 | Alta |
 | F15 | Ricerca nel contenuto con backend opzionale | Mancante | 5 | Alta |
-| F16 | Miniature e cache; limiti per locale/remoto | Mancante | 3 | Alta |
+| F16 | Miniature e cache; limiti per locale/remoto | Parziale: immagini locali | 3 | Alta |
 | F17 | Anteprima rapida di file | Mancante | 3 | Alta |
 | F18 | Apri con, elenco applicazioni e predefinita MIME | Mancante | 3 | Media |
 | F19 | Recenti e rimozione dalla cronologia | Mancante | 3 | Media |
-| F20 | Preferiti separati dai segnalibri delle cartelle | Mancante | 3 | Media/alta |
+| F20 | Preferiti separati dai segnalibri delle cartelle | Parziale: vista virtuale Preferiti | 3 | Media/alta |
 | F21 | Rinomina multipla con anteprima | Mancante | 4 | Alta |
 | F22 | Modelli dalla directory XDG Templates | Mancante | 4 | Media |
 | F23 | Compressione ed estrazione integrate | Mancante | 4 | Alta |
@@ -186,7 +194,16 @@ non vanno sovrascritte. I prompt già discussi sono requisiti, non prove di comp
   scheda/finestra per cartelle selezionate, clic centrale in background, scorciatoie,
   cronologia in memoria di 20 schede chiuse con stato di navigazione e vista.
   Questa riapertura durante la sessione è distinta dalle sessioni salvate N02.
+  Da `f18b6b3` le scorciatoie sono modificabili dall'utente: catalogo condiviso fra
+  acceleratori applicativi e azioni locali alla vista, cattura nella pagina Preferenze,
+  disattivazione, conflitti e ripristino, valori invalidi o collisionali riportati ai
+  default e persistenza in `settings.conf`. Focus, accessibilità e riscontro visivo
+  restano da verificare.
   - [x] Test headless su limite di 20, round-trip dello snapshot e risultati obsoleti dopo chiusura.
+  Il sorgente include test per catalogo, fallback dei valori persistiti non validi,
+  conflitti, disattivazione e validazione degli acceleratori; tre sono marcati
+  `ignored` perché richiedono inizializzazione GTK. Non è registrata una prova grafica
+  dell'interfaccia.
   - [ ] Verifica grafica di apertura/chiusura, scorciatoie, accessibilità e focus.
 - [x] **UI01 — Icone coerenti. Implementazione completata; verifica grafica
   residua (F07).** Sidebar, toolbar, pulsanti delle
@@ -257,10 +274,14 @@ non vanno sovrascritte. I prompt già discussi sono requisiti, non prove di comp
     griglia Icone più ampia (quattro colonne a zoom 100% nella finestra di riferimento).
   - [x] `cargo check`, build workspace e test workspace (escluso il test che usa
     il cestino della sessione) superati.
+  - [x] Aggiornamenti di `d14cd5b`, `a5ea22d`, `9c9be38` e `d69aec5`: riga Preferiti
+    che apre la vista virtuale, segnalibri con aggiunta, rinomina, riordino e rimozione
+    dalla stessa sidebar, Posizioni personalizzate ereditate con rimozione contestuale
+    e pagina Preferenze della sidebar rimossa. Test automatici su segnalibri e sidebar.
   - [ ] Verifica grafica interattiva residua: trascinamento del divisore, finestre
-    strette, cambio scheda/lingua/tema, dinamica di preferiti e volumi; Wayland
-    provato all'avvio, non ispezionato a schermo. X11 controllato su XWayland,
-    non in una sessione X11 separata.
+    strette, cambio scheda/lingua/tema, dinamica di preferiti e volumi, riordino e
+    rinomina dei segnalibri; Wayland provato all'avvio, non ispezionato a schermo.
+    X11 controllato su XWayland, non in una sessione X11 separata.
 - [x] **F05/F06 — implementazione e verifiche automatiche completate.** Ordinamento
   naturale per nome/dimensione/tipo/data, per-scheda; zoom e colonne globali
   persistenti; selezione URI e ancora di scorrimento preservate. Metadati via GIO,
@@ -274,19 +295,29 @@ non vanno sovrascritte. I prompt già discussi sono requisiti, non prove di comp
   rilascia monitor e lavoro pendente.
   - [x] Test su raffiche, overflow, eventi conflittuali e risultati obsoleti.
   - [ ] Verifica grafica di creazione, modifica, rename, rimozione e navigazione rapida.
-- [ ] **F02 — parziale.** Drop interno su cartelle, sfondo, schede e sidebar; sorgente
-  GDK offre `FileList` e `text/uri-list`, destinazioni negoziano soltanto Copy/Move.
-  Trasferimenti esterni su cartelle usano il protocollo Move solo dopo il successo;
-  Copy su schede e Move interno sulla barra schede sono collegati. Move esterno sulla
-  barra schede viene rifiutato perché il callback libadwaita è sincrono e non può
-  confermare un trasferimento asincrono. Link, hover-apertura e autoscroll restano
+- [ ] **F02 — parziale.** Drop interno su cartelle, sfondo, schede, sidebar e sulle
+  destinazioni virtuali Preferiti/Aggiungi segnalibro; sorgente GDK offre `FileList`
+  e `text/uri-list`, le destinazioni di file negoziano Copy/Move mentre Preferiti
+  dichiara Copy/Link e con Copy/Link aggiunge la voce all'elenco, rifiutando il Move
+  con un messaggio. Trasferimenti esterni su cartelle usano il protocollo Move solo
+  dopo il successo; Copy su schede e Move interno sulla barra schede sono collegati.
+  Move esterno sulla barra schede è ora gestito da `GtkDropTargetAsync` installato
+  sulla `AdwTabBar`, non dal callback sincrono di libadwaita: la destinazione è la
+  cartella della scheda sotto il puntatore e il Move è confermato alla sorgente solo
+  dopo il successo completo, mentre errori e parziali non autorizzano la sorgente a
+  eliminare. La mappatura puntatore→scheda usa i gruppi pinned/regular e rifiuta
+  fail-closed le schede con URI non destinazioni (`recent:`, `search:`,
+  `network:///`) e le strutture inattese; limite tecnico: l'individuazione si
+  appoggia ai widget interni di `AdwTabBar`, coperti da test strutturali GTK ma
+  senza DND reale inter-app verificato. Link, hover-apertura e autoscroll restano
   fuori dal completamento.
   - [x] Test headless su negoziazione, MIME URI list, retry, protezione symlink e
     destinazioni sé-stesse/discendenti nel backend.
   - [ ] Verifica grafica di drop interni/esterni su tutte le destinazioni e con altre app.
 
 Uscita **non raggiunta**. Mancano verifiche grafiche e scambio reale con altre app;
-il Move esterno sulla barra schede resta rifiutato. La misura release su 50.000
+il Move esterno sulla barra schede è ora gestito ma resta da verificare con sorgenti
+reali: è coperto solo da test strutturali GTK. La misura release su 50.000
 elementi ha mostrato variabilità fra processi e, nell'ultima serie accoppiata,
 un totale dell'8.2% più alto; non si dichiara assenza di regressioni prestazionali.
 UI01 e UI02 restano inoltre attività separate, da coordinare con i controlli della
@@ -298,6 +329,11 @@ di chiudere la fase.
 - [ ] **F08:** introdurre job con ID, sorgenti/destinazione catturate, stato, avanzamento,
   cancellazione cooperativa e risultato per elemento; concorrenza limitata.
   UI centrale con dettagli; non inventare percentuali quando il totale è sconosciuto.
+  Stato al `f18b6b3`: esiste una coda FIFO con worker e journal undo in
+  `operation_queue.rs`, che serializza le mutazioni; i risultati strutturati per
+  elemento sono gestiti in `ops.rs` (B03), non dal registro dei job. Non ci sono
+  ID job mostrati, avanzamento, pannello delle operazioni né cancellazione
+  cooperativa dall'interfaccia.
 - [ ] **F09:** dialoghi conflitto e scelta applicabile ai successivi; nomi originali
   preservati; unione distinta dalla sostituzione; verifica scrivibilità solo indicativa.
 - [ ] **F10:** copia seguita da cancellazione per gli spostamenti che la richiedono;
@@ -311,6 +347,12 @@ di chiudere la fase.
 - [ ] **F11:** undo/redo sopra il registro dei job; copertura iniziale limitata a
   rinomina, spostamento, creazione e cestino. Gestire conflitti e modifiche esterne;
   nessuna promessa di annullare cancellazioni permanenti o svuotamento del cestino.
+  Stato al `f18b6b3`: l'undo copre rinomina, spostamento quando l'identità del file
+  resta invariata, e cestino; gli inversi verificano l'identità e rifiutano di
+  sovrascrivere. Il journal è limitato a 50 voci e l'undo è rifiutato mentre la
+  coda è occupata. Mancano redo, creazione, integrazione con un registro job e
+  annullamento dello svuotamento del cestino. L'azione è disponibile
+  dall'acceleratore locale alla vista, non da una voce di menu.
 
 Dipendenze: F01 prima delle azioni di gruppo; F08/F09 prima di F11. Non aggiungere
 una pila undo soltanto nella UI: servono esiti e identità effettive del backend.
@@ -322,6 +364,11 @@ una pila undo soltanto nella UI: servono esiti e identità effettive del backend
   della posizione originale e azioni sui risultati con contesto esplicito.
 - [ ] **F16:** miniature asincrone con cache e priorità agli elementi visibili;
   limiti di dimensione/concorrenza, invalidazione e opzione locale/mai/remoto.
+  Stato al `f18b6b3`: decodifica in background per sole immagini locali entro limiti
+  di dimensione, cache con budget (128 voci e 32 MiB), coda con 4 lavori attivi e 256
+  in attesa, scarto dei binding obsoleti e test automatici; la coda serve le widget
+  vive, cioè gli elementi visibili, senza ordine di priorità configurabile. Mancano
+  l'opzione locale/mai/remoto, il contenuto remoto e qualsiasi prova grafica.
 - [ ] **F17:** iniziare da immagini e testo o integrare un visualizzatore opzionale;
   spazio apre l'anteprima, Escape la chiude. PDF/video solo con dipendenze definite.
   La guida GNOME descrive l'anteprima come integrazione che può richiedere software aggiuntivo.
@@ -331,6 +378,12 @@ una pila undo soltanto nella UI: servono esiti e identità effettive del backend
   non elimina il file. Preferenze per privacy e disponibilità fuori da GNOME.
 - [ ] **F20:** distinguere cartelle appuntate e file preferiti; storage portabile,
   gestione di rinomina/spostamento e nessun indicizzatore obbligatorio.
+  Stato al `f18b6b3`: vista virtuale `favorites:///` con elenco salvato in
+  `settings.conf`, azione Aggiungi/Rimuovi dai Preferiti sulle voci dei file, drop su
+  Preferiti che accetta Copy/Link ed è separato dall'azione di segnalibro condiviso,
+  con riga dedicata nella sidebar. Manca l'aggiornamento delle voci durante
+  rinomina/spostamento e resta da definire cosa succede se l'elenco viene toccato
+  da un'altra applicazione.
 - [ ] **F29:** emblemi e metadati differiti senza bloccare il caricamento principale.
   Per i symlink mostrare la destinazione, consentire di raggiungerla e distinguere
   collegamenti interrotti o non accessibili. L'apertura della destinazione non
@@ -462,6 +515,11 @@ Le priorità sono proposte; completare prima le basi da cui ciascun extra dipend
   Nascondere una destinazione non cambia la cartella già aperta. Verificare
   persistenza, cambio lingua, finestre multiple e rimozione/ricomparsa di volumi
   e segnalibri. Coordinare con UI01, senza introdurre dipendenze dalle fasi avanzate.
+  Stato al `f18b6b3`: la chiave `sidebar-hidden` viene persistita e collaudata in
+  `settings.conf`, ma non esiste un'interfaccia che nasconda effettivamente una voce;
+  la pagina Preferenze della sidebar introdotta in `a5ea22d` è stata rimossa in
+  `d69aec5` e resta solo la rimozione delle posizioni legacy dal menu contestuale
+  della sidebar. Nessuna prova grafica registrata.
 
 ### Analisi e trasferimenti avanzati
 
