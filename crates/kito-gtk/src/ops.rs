@@ -179,6 +179,41 @@ impl OperationItemResult {
     }
 }
 
+/// An external MOVE may already have removed its source at the destination.
+/// Only that callback treats GIO NotFound as an already-completed item.
+fn external_move_trash_result(
+    uri: String,
+    result: Result<(), glib::Error>,
+    source_check: impl FnOnce() -> Result<(), glib::Error>,
+) -> Option<OperationItemResult> {
+    if result
+        .as_ref()
+        .is_err_and(|error| error.matches(gio::IOErrorEnum::NotFound))
+        && source_check().is_err_and(|error| error.matches(gio::IOErrorEnum::NotFound))
+    {
+        None
+    } else {
+        Some(OperationItemResult::from_result(
+            "operation-trash",
+            uri,
+            Some(kito_core::TRASH_URI.to_string()),
+            result,
+        ))
+    }
+}
+
+/// Queries the source without following symlinks. Only an explicit GIO
+/// NotFound proves the entry itself is absent; all other errors are uncertain.
+fn external_move_source_check(uri: &str) -> Result<(), glib::Error> {
+    gio::File::for_uri(uri)
+        .query_info(
+            "standard::type",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .map(|_| ())
+}
+
 /// Clipboard tracker: internal entries stay valid only while they match
 /// what Kito published. Ownership changes arrive via the GDK `changed`
 /// notification (not text comparison); paste-time text matching is only
@@ -506,7 +541,7 @@ impl Ctx {
         }
         match (destination.as_str(), action) {
             (kito_core::TRASH_URI, crate::dnd::TransferAction::Move) => {
-                self.trash_uris(uris, kito_core::TRASH_URI.to_string(), completion);
+                self.trash_uris(uris, kito_core::TRASH_URI.to_string(), completion, false);
             }
             (kito_core::TRASH_URI, crate::dnd::TransferAction::Copy) => {
                 self.toast(&crate::l10n::tr("drop-trash-copy-unsupported"));
@@ -537,7 +572,7 @@ impl Ctx {
             .parent()
             .map(|parent| parent.uri().to_string())
             .unwrap_or_default();
-        self.trash_uris(uris, folder, None);
+        self.trash_uris(uris, folder, None, true);
     }
 
     /// Ctrl+L: switches to path writing mode.
@@ -1095,7 +1130,7 @@ impl Ctx {
             return;
         }
         let folder = self.manager.selected_uri().unwrap_or_default();
-        self.trash_uris(uris, folder, None);
+        self.trash_uris(uris, folder, None, false);
     }
 
     fn trash_uris(
@@ -1103,6 +1138,7 @@ impl Ctx {
         uris: Vec<String>,
         folder: String,
         drop_completion: Option<DropCompletion>,
+        external_move: bool,
     ) {
         let this = self.clone();
         let retry_folder = folder.clone();
@@ -1127,12 +1163,24 @@ impl Ctx {
                                 Ok(()),
                             ));
                         }
-                        Err(error) => results.push(OperationItemResult::from_result(
-                            "operation-trash",
-                            uri,
-                            Some(kito_core::TRASH_URI.to_string()),
-                            Err(error),
-                        )),
+                        Err(error) => {
+                            let result = if external_move {
+                                let check_uri = uri.clone();
+                                external_move_trash_result(uri, Err(error), || {
+                                    external_move_source_check(&check_uri)
+                                })
+                            } else {
+                                Some(OperationItemResult::from_result(
+                                    "operation-trash",
+                                    uri,
+                                    Some(kito_core::TRASH_URI.to_string()),
+                                    Err(error),
+                                ))
+                            };
+                            if let Some(result) = result {
+                                results.push(result);
+                            }
+                        }
                     }
                 }
                 (results, undo)
@@ -1156,10 +1204,14 @@ impl Ctx {
                 if let Some(completion) = &drop_completion {
                     completion.finish(&results);
                 }
+                if external_move && results.is_empty() {
+                    this.manager
+                        .reload_if_current(kito_core::FAVORITES_URI);
+                }
                 let retry_this = this.clone();
                 let retry: RetryHandler = Rc::new(move |failed| {
                     let uris = failed.into_iter().map(|item| item.source).collect();
-                    retry_this.trash_uris(uris, retry_folder.clone(), None);
+                    retry_this.trash_uris(uris, retry_folder.clone(), None, false);
                 });
                 this.report_operation("operation-trash", results, Some(retry));
             },
@@ -1994,6 +2046,124 @@ mod tests {
 
     fn failed_error() -> glib::Error {
         glib::Error::new(gio::IOErrorEnum::Failed, "boom")
+    }
+
+    fn isolated_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        let uri = gio::File::for_path(&path).uri().to_string();
+        (dir, path, uri)
+    }
+
+    #[test]
+    fn external_move_ignores_only_missing_sources_without_fabricating_success() {
+        let (_dir, path, uri) = isolated_fixture();
+        std::fs::write(&path, "temporary fixture").unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // Model the exact GIO error returned when the destination has already
+        // removed this fixture. No trash operation is invoked by this test.
+        let result = external_move_trash_result(
+            uri.clone(),
+            Err(glib::Error::new(gio::IOErrorEnum::NotFound, "missing")),
+            || external_move_source_check(&uri),
+        );
+        assert!(result.is_none());
+        // Empty results are intentionally not reported (and hence produce no
+        // success toast) by report_operation.
+        assert!(std::fs::metadata(&path).is_err());
+    }
+
+    #[test]
+    fn external_move_keeps_other_trash_errors_visible_and_retryable() {
+        let (_dir, path, uri) = isolated_fixture();
+        std::fs::write(&path, "temporary fixture").unwrap();
+
+        let result = external_move_trash_result(
+            uri.clone(),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "permission denied",
+            )),
+            || external_move_source_check(&uri),
+        )
+        .expect("non-NotFound errors remain reportable");
+        assert_eq!(result.source, uri);
+        assert!(matches!(result.state, ItemState::Failed(_)));
+        assert!(result.needs_retry());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn external_move_keeps_not_found_when_source_still_exists() {
+        let (_dir, path, uri) = isolated_fixture();
+        std::fs::write(&path, "temporary fixture").unwrap();
+
+        let result = external_move_trash_result(
+            uri.clone(),
+            Err(glib::Error::new(gio::IOErrorEnum::NotFound, "trash backend")),
+            || external_move_source_check(&uri),
+        )
+        .expect("existing source means NotFound came from the trash backend");
+        assert_eq!(result.source, uri);
+        assert!(matches!(result.state, ItemState::Failed(_)));
+        assert!(result.needs_retry());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn external_move_keeps_not_found_when_source_check_is_uncertain() {
+        let (_dir, path, uri) = isolated_fixture();
+        std::fs::write(&path, "temporary fixture").unwrap();
+
+        let result = external_move_trash_result(
+            uri.clone(),
+            Err(glib::Error::new(gio::IOErrorEnum::NotFound, "trash backend")),
+            || {
+                Err(glib::Error::new(
+                    gio::IOErrorEnum::PermissionDenied,
+                    "cannot check source",
+                ))
+            },
+        )
+        .expect("an inconclusive source check must preserve the trash error");
+        assert_eq!(result.source, uri);
+        assert!(matches!(result.state, ItemState::Failed(_)));
+        assert!(result.needs_retry());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn external_move_batch_does_not_lose_other_item_outcomes() {
+        let (_removed_dir, removed_path, removed_uri) = isolated_fixture();
+        std::fs::write(&removed_path, "temporary fixture").unwrap();
+        std::fs::remove_file(&removed_path).unwrap();
+        let missing = external_move_trash_result(
+            removed_uri.clone(),
+            Err(glib::Error::new(gio::IOErrorEnum::NotFound, "missing")),
+            || external_move_source_check(&removed_uri),
+        );
+
+        let (_error_dir, error_path, error_uri) = isolated_fixture();
+        std::fs::write(&error_path, "temporary fixture").unwrap();
+        let failed = external_move_trash_result(
+            error_uri.clone(),
+            Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "denied")),
+            || external_move_source_check(&error_uri),
+        );
+
+        let (_success_dir, success_path, success_uri) = isolated_fixture();
+        std::fs::write(&success_path, "temporary fixture").unwrap();
+        let succeeded = external_move_trash_result(success_uri.clone(), Ok(()), || {
+            external_move_source_check(&success_uri)
+        });
+
+        let outcomes: Vec<_> = [missing, failed, succeeded].into_iter().flatten().collect();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].source, error_uri);
+        assert!(matches!(outcomes[0].state, ItemState::Failed(_)));
+        assert_eq!(outcomes[1].source, success_uri);
+        assert!(matches!(outcomes[1].state, ItemState::Succeeded));
     }
 
     #[test]

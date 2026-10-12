@@ -61,6 +61,43 @@ test); no other test was skipped. The isolated run used generated fixtures only.
 | E-01 | GDK negozia solo Copy/Move offerti e supportati; Link rifiutato; URI list interoperabile esposto. | Automatica, grafica | Test headless Linux | PARZIALE | Test di negoziazione e formati `FileList`/`text/uri-list` passati; scambio reale con altre app e drop su viste/sidebar non provati. |
 | E-02 | Drop interno su scheda usa la sua cartella; drop esterno Copy su scheda e Move esterno solo dopo completamento. | Sorgenti, grafica | Nessuna sessione GUI osservabile | PARZIALE | Drop interno ed esterno Copy sono collegati; Move esterno sulla barra schede è rifiutato perché il callback libadwaita è sincrono e non può confermare il risultato asincrono. |
 
+### Follow-up F02 (2026-10-12)
+
+L'utente ha segnalato che un drop da Nautilus sullo sfondo di una cartella vuota,
+con la build locale `2b35130`, non avviava alcuna operazione. Il target era
+collegato alla sola `GtkScrolledWindow`, mentre la pagina di stato “cartella
+vuota” è una sorella nella `GtkStack` e non raggiungeva quel controller. Il
+target è stato spostato all'`GtkOverlay` radice della pagina, condiviso dalla
+lista, dalla pagina vuota e dal pannello di caricamento. I target specifici delle
+righe cartella restano installati.
+
+`cargo check --workspace --locked --all-targets` e
+`cargo test --workspace --locked -- --skip restore_roundtrip_through_trash`
+sono passati (71 `kito-core`, 183 `kito-gtk`, 11 `kito-i18n`; 12 test GTK
+ignorati e il test Trash di sessione filtrato). Il test GTK esplicito
+`background_drop_target_covers_empty_and_nonempty_folder_content` è passato con
+fixture temporanee e verifica il target sulle pagine vuota e popolata, non invia
+un drop reale.
+
+L'utente ha inoltre riferito un Move da Kito a Nautilus completato (destinazione
+presente, sorgente assente) ma seguito da un falso errore ENOENT nel tentativo di
+ricestinare l'originale. Ora il callback di cleanup tratta NotFound come già
+consumato solo se una query GIO `NOFOLLOW_SYMLINKS` conferma che la sorgente non
+esiste; se esiste o la query è incerta, l'errore resta visibile e ritentabile.
+Test isolati coprono sorgente assente/presente, controllo incerto e batch misto,
+senza usare il Cestino reale.
+
+L'utente riferisce di aver completato su Wayland la matrice inter-app Copy/Move
+Nautilus↔Kito su cartelle vuote e popolate, righe, sidebar e schede. Il retest
+inbound iniziale è stato eseguito con la diagnostica `KITO_TRACE_DND=1`; l'esito
+complessivo è riferito dall'utente, senza log per caso, e non osservato
+indipendentemente. X11 separato resta da provare; Link, hover-apertura e autoscroll
+non fanno parte del comportamento completato.
+
+`./scripts/check.sh` resta bloccato perché manca `cargo fmt`; `cargo clippy` non è
+disponibile. Il coordinatore non ha osservato indipendentemente il drag inter-app.
+F02 resta parziale per le verifiche X11 e i comportamenti residui indicati sopra.
+
 ## UI01 — Icone coerenti (2026-10-08)
 
 `./scripts/check.sh` passed formatting, workspace compilation, all 44
@@ -167,18 +204,35 @@ did not stop the app from launching.
 
 | ID | Verifica richiesta | Esito | Evidenza e lavoro residuo |
 |---|---|---|---|
-| UI03-1 | Una sola divisione allineata tra intestazione sinistra/sidebar e intestazione di navigazione/contenuto, anche quando si sposta il divisore. | PARZIALE | Un unico `GtkPaned` e screenshot statici controllati su XWayland; il trascinamento non è stato provato. |
-| UI03-2 | Gruppi Home/Preferiti/rete/cestino, cartelle XDG, volumi; selezione della destinazione più vicina anche per sottocartelle e volumi. | PARZIALE | Test URI GIO e bookmark passati; screenshot mostra i gruppi e non espone URI grezzi. La lista espansa, la rimozione, le modifiche live e i comandi volume non sono stati provati graficamente. |
-| UI03-3 | Tema chiaro/scuro, lingue, finestre strette, schede, liste lunghe e accessibilità. | PARZIALE | Cataloghi inglese/italiano coperti dai test; tema scuro, interazioni, ridimensionamento, schede multiple e screen reader non verificati a schermo. |
-| UI03-4 | Clic fuori dall'editor del percorso torna ai breadcrumb; click nel campo o nei suggerimenti non chiude l'editor. | PARZIALE | Gestito dal controller click globale con esclusione del campo e del popover; flusso interattivo non provato manualmente. |
+| UI03-1 | Una sola divisione allineata tra intestazione sinistra/sidebar e intestazione di navigazione/contenuto, anche quando si sposta il divisore. | SUPERATO (conferma utente, Wayland) | L'utente riferisce verifica del divisore e del suo trascinamento; nessun log per caso fornito. Sessione X11 separata ancora da provare. |
+| UI03-2 | Gruppi Home/Preferiti/rete/cestino, cartelle XDG, volumi; selezione della destinazione più vicina anche per sottocartelle e volumi. | SUPERATO (conferma utente, Wayland) | L'utente riferisce verifica completa di Preferiti, volumi e segnalibri; nessun log per caso fornito. Sessione X11 separata ancora da provare. |
+| UI03-3 | Tema chiaro/scuro, lingue, finestre strette, schede, liste lunghe e accessibilità. | SUPERATO (conferma utente, Wayland) | L'utente riferisce verifica grafica completa di UI03, inclusi tema/lingua, finestre strette e schede; nessun log per caso fornito. Sessione X11 separata ancora da provare. |
+| UI03-4 | Clic fuori dall'editor del percorso torna ai breadcrumb; click nel campo o nei suggerimenti non chiude l'editor. | SUPERATO (conferma utente, Wayland) | Incluso nella conferma utente di verifica grafica completa UI03; nessun log per caso fornito. Sessione X11 separata ancora da provare. |
+
+### Follow-up grafico UI03 (2026-10-12, conferma utente)
+
+L'utente riferisce che le verifiche grafiche interattive di UI03 sono state
+completate con esito positivo in una sessione Wayland: divisore, finestre strette,
+tema e lingua, schede, Preferiti, volumi e segnalibri. Non sono stati forniti
+log o risultati distinti per caso e la prova non è stata osservata
+indipendentemente. Non è stata riferita una verifica in una sessione desktop X11
+separata; il precedente controllo su XWayland non la sostituisce.
+
+Una successiva modifica richiesta dall'utente ha ridotto la baseline delle icone
+della vista Icone da 96 a 64 px e la cella da 160 a 128 px a zoom 100%, lasciando
+invariati il valore zoom salvato e i controlli. La verifica grafica Wayland sopra
+precede questa modifica: il nuovo rendering non è ancora stato controllato a
+schermo.
 
 ### GUI e performance
 
-La sessione espone `XDG_SESSION_TYPE=wayland`, `WAYLAND_DISPLAY=wayland-0` e
-`DISPLAY=:0`; questi valori non dimostrano quale backend abbia usato Kito. Il
-controllo UI non ha esposto app o finestre controllabili. In questa verifica non
-sono state eseguite prove grafiche Wayland o X11: tre viste, selezione, scorciatoie,
-schede, monitor live, destinazioni DND e scambio con applicazioni restano da provare.
+Nel runner automatico e nelle misure del 9 ottobre la sessione esponeva
+`XDG_SESSION_TYPE=wayland`, `WAYLAND_DISPLAY=wayland-0` e `DISPLAY=:0`; questi valori
+non dimostravano quale backend avesse usato Kito. Il controllo UI non esponeva app
+o finestre controllabili e in quel runner non sono state eseguite prove grafiche:
+tre viste, selezione, scorciatoie, schede, monitor live, destinazioni DND e scambio
+con applicazioni restavano da provare. Il follow-up UI03 sopra è un successivo
+resoconto manuale dell'utente e non modifica questo esito del runner.
 
 Per il confronto è stato estratto in `/tmp` il commit base `fc4b1176b2120e08b642c12bfec36d943bfa9cb7` e usato lo stesso helper release e le stesse
 directory generate su tmpfs (10% cartelle, nomi con numeri, spazi e Unicode).

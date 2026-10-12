@@ -1883,7 +1883,18 @@ impl TabManager {
                 }
             })
         };
-        crate::dnd::attach_drop_target(&tab.scrolled, background_destination, background_drop);
+        // The background drop target lives on the tab's page content root,
+        // not on the scrolled list: after a load settles, a confirmed empty
+        // folder swaps the stack to the "empty" status page, which is a
+        // *sibling* of the scrolled window, so a target on the scrolled
+        // window alone is never in the event chain there. GTK then reports
+        // no accepted action to the compositor (`gtk_drop_end_event` leaves
+        // the drop status empty) and the source — Nautilus included — sees
+        // the operation cancelled with no copy, no move and no error. The
+        // content root covers every page the stack can show plus the
+        // loading panel; folder rows keep their own nearer targets, so they
+        // still win the drop and the destination stays this tab's folder.
+        crate::dnd::attach_drop_target(&overlay, background_destination, background_drop);
         self.tabs.borrow_mut().push(tab.clone());
         tab.loading_stop.connect_clicked({
             let tab = Rc::downgrade(&tab);
@@ -2740,6 +2751,188 @@ mod tab_bar_drop_tests {
             };
             assert!(rtl_settled, "RTL mirroring never appeared");
             assert_mapping(&[&two, &one, &three]);
+        });
+    }
+}
+
+#[cfg(test)]
+mod background_drop_tests {
+    use super::*;
+
+    /// Real tab structure backed by temporary folders: the background drop
+    /// target must sit above both the visible file content and the empty
+    /// status page. They are siblings in the stack, so a target on the
+    /// scrolled list alone cannot receive a drop over the empty page.
+    #[test]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn background_drop_target_covers_empty_and_nonempty_folder_content() {
+        gtk::test_synced(|| {
+            let app = adw::Application::new(
+                Some("org.example.KitoTabContentDndProbe"),
+                gio::ApplicationFlags::NON_UNIQUE,
+            );
+            app.register(None::<&gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::new(&app);
+            let toast = adw::ToastOverlay::new();
+            let tab_view = adw::TabView::new();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.append(&tab_view);
+            toast.set_child(Some(&content));
+            window.set_content(Some(&toast));
+            window.set_default_size(600, 400);
+            window.present();
+
+            // Preferences live in a temporary file: the test never touches
+            // the user's configuration.
+            let config_dir = tempfile::tempdir().unwrap();
+            let preferences = crate::preferences::PreferenceStore::at_path(
+                config_dir.path().join("settings.conf"),
+            );
+            let on_navigate: OnNavigate = Rc::new(|_, _, _| {});
+            let on_history: OnHistory = Rc::new(|_, _| {});
+            let on_status: OnStatus = Rc::new(|_, _| {});
+            let on_sort: OnSort = Rc::new(|_| {});
+            let manager = TabManager::new(
+                tab_view,
+                window.clone(),
+                on_navigate,
+                on_history,
+                on_status,
+                on_sort,
+                Rc::new(Cell::new(false)),
+                preferences.clone(),
+                Rc::new(|_| {}),
+            );
+            let ctx = Rc::new(crate::ops::Ctx {
+                window: window.clone(),
+                manager: manager.clone(),
+                toast: toast.clone(),
+                clipboard: Rc::new(RefCell::new(crate::ops::ClipTracker::default())),
+                operation_queue: Rc::new(crate::operation_queue::OperationQueue::default()),
+                preferences,
+                focus_path: Rc::new(|| {}),
+            });
+
+            // Temporary fixtures avoid user data and ensure both stack
+            // branches are reached through the real asynchronous load.
+            let empty_folder = tempfile::tempdir().unwrap();
+            let populated_folder = tempfile::tempdir().unwrap();
+            std::fs::write(populated_folder.path().join("fixture.txt"), "fixture").unwrap();
+            let empty_uri = gio::File::for_path(empty_folder.path()).uri().to_string();
+            let populated_uri = gio::File::for_path(populated_folder.path()).uri().to_string();
+            manager.open_tab(&empty_uri, &ctx);
+            manager.open_tab(&populated_uri, &ctx);
+
+            let (empty_tab, populated_tab) = {
+                let tabs = manager.tabs.borrow();
+                (tabs[0].clone(), tabs[1].clone())
+            };
+            let context = glib::MainContext::default();
+            let settle = |condition: &dyn Fn() -> bool| -> bool {
+                for _ in 0..400 {
+                    if condition() {
+                        return true;
+                    }
+                    while context.iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                condition()
+            };
+            let shows_status_page = || {
+                empty_tab.stack
+                    .visible_child()
+                    .is_some_and(|page| page.downcast::<adw::StatusPage>().is_ok())
+            };
+            assert!(settle(&shows_status_page), "empty page was never shown");
+            let shows_file_content = || {
+                populated_tab
+                    .stack
+                    .visible_child()
+                    .is_some_and(|page| {
+                        page == populated_tab.scrolled.clone().upcast::<gtk::Widget>()
+                    })
+                    && populated_tab.store.n_items() == 1
+            };
+            assert!(
+                settle(&shows_file_content),
+                "non-empty folder content was never shown"
+            );
+
+            let has_drop_target = |widget: &gtk::Widget| {
+                let controllers = widget.observe_controllers();
+                (0..controllers.n_items()).any(|index| {
+                    controllers
+                        .item(index)
+                        .and_downcast::<gtk::EventController>()
+                        .is_some_and(|controller| {
+                            controller.downcast::<gtk::DropTargetAsync>().is_ok()
+                        })
+                })
+            };
+            let drop_target_above = |mut widget: Option<gtk::Widget>| {
+                while let Some(current) = widget {
+                    if has_drop_target(&current) {
+                        return Some(current);
+                    }
+                    widget = current.parent();
+                }
+                None
+            };
+
+            let empty_visible = empty_tab
+                .stack
+                .visible_child()
+                .expect("visible status page");
+            let content_visible = populated_tab
+                .stack
+                .visible_child()
+                .expect("visible file content");
+            let from_status_page = drop_target_above(Some(empty_visible.clone()))
+                .expect("no drop target above the status page");
+            let from_content = drop_target_above(Some(content_visible.clone()))
+                .expect("no drop target above non-empty content");
+            // Each tab has a single shared target above its complete stack;
+            // the target on the empty tab is not accidentally obtained via
+            // the hidden scrolled list. Both target ancestors must be the
+            // corresponding page content roots.
+            assert_eq!(
+                from_status_page,
+                empty_visible
+                    .parent()
+                    .and_then(|stack| stack.parent())
+                    .expect("empty tab content root")
+            );
+            assert_eq!(
+                from_content,
+                content_visible
+                    .parent()
+                    .and_then(|stack| stack.parent())
+                    .expect("populated tab content root")
+            );
+            assert!(!has_drop_target(empty_tab.scrolled.upcast_ref::<gtk::Widget>()));
+            assert!(!has_drop_target(populated_tab.scrolled.upcast_ref::<gtk::Widget>()));
+
+            // Verify the reachable target advertises exactly the file
+            // formats and folder actions needed by local and Nautilus drops.
+            let assert_file_drop_target = |root: &gtk::Widget| {
+                let target = (0..root.observe_controllers().n_items())
+                    .filter_map(|index| {
+                        root.observe_controllers()
+                            .item(index)
+                            .and_downcast::<gtk::EventController>()
+                    })
+                    .find_map(|controller| controller.downcast::<gtk::DropTargetAsync>().ok())
+                    .expect("content root drop target");
+                let formats = target.formats().expect("drop target formats");
+                assert!(formats.contains_type(gtk::gdk::FileList::static_type()));
+                assert!(formats.contain_mime_type("text/uri-list"));
+                assert_eq!(
+                    target.actions(),
+                    gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE
+                );
+            };
+            assert_file_drop_target(&from_status_page);
+            assert_file_drop_target(&from_content);
         });
     }
 }

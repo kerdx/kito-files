@@ -356,12 +356,6 @@ fn attach_drop_target_resolving(
         .add_mime_type("text/uri-list")
         .build();
     let target = gtk::DropTargetAsync::new(Some(formats), actions);
-    target.connect_accept(move |_, drop| {
-        let formats = drop.formats();
-        (formats.contains_type(gdk::FileList::static_type())
-            || formats.contain_mime_type("text/uri-list"))
-            && drop.actions().intersects(actions)
-    });
     target.connect_drag_enter({
         let hover = hover.clone();
         let resolve = resolve.clone();
@@ -369,7 +363,8 @@ fn attach_drop_target_resolving(
             if let Some(hover) = &hover {
                 hover(true);
             }
-            negotiate_drop_action_for(drop, actions, resolve(x, y).is_some())
+            let valid = resolve(x, y).is_some();
+            negotiate_drop_action_for(drop, actions, valid)
         }
     });
     target.connect_drag_motion({
@@ -379,7 +374,8 @@ fn attach_drop_target_resolving(
             if let Some(hover) = &hover {
                 hover(true);
             }
-            negotiate_drop_action_for(drop, actions, resolve(x, y).is_some())
+            let valid = resolve(x, y).is_some();
+            negotiate_drop_action_for(drop, actions, valid)
         }
     });
     target.connect_drag_leave({

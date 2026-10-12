@@ -250,9 +250,10 @@ non vanno sovrascritte. I prompt già discussi sono requisiti, non prove di comp
     righe disabilitate, cambio lingua, allineamento/contrasto, focus nei campi e
     conferme. Sessione grafica non disponibile in questa verifica; vedere
     `docs/VERIFICATION.md`.
-- [ ] **UI03 — Composizione coordinata di intestazione e sidebar.** Ispirandosi
-  al riferimento visivo fornito dall'utente, organizzare la finestra in due aree
-  verticali coerenti dall'intestazione fino al contenuto: a sinistra i controlli
+- [x] **UI03 — Composizione coordinata di intestazione e sidebar.** Implementazione
+  completata; verifica grafica Wayland confermata dall'utente il 12 ottobre 2026.
+  Ispirandosi al riferimento visivo fornito dall'utente, organizzare la finestra
+  in due aree verticali coerenti dall'intestazione fino al contenuto: a sinistra i controlli
   e la sidebar, a destra navigazione/percorso e area dei file. Il confine deve
   restare allineato quando si ridimensiona il divisore dei pannelli; preservare
   controlli finestra, percorso modificabile, navigazione, schede e selettore vista,
@@ -271,17 +272,20 @@ non vanno sovrascritte. I prompt già discussi sono requisiti, non prove di comp
     un'immagine informativa finché F14 non fornisce una funzione reale. Sidebar raggruppata, Preferiti
     espandibile per i bookmark di cartelle, etichette URI leggibili, deduplicazione
     XDG, selezione per antenato GIO, azioni volume accessibili quando supportate e
-    griglia Icone più ampia (quattro colonne a zoom 100% nella finestra di riferimento).
+    griglia Icone a baseline compatta: 64 px per icona e cella da 112 px a zoom
+    100%; la percentuale salvata, i controlli e la scala dello zoom non cambiano.
   - [x] `cargo check`, build workspace e test workspace (escluso il test che usa
     il cestino della sessione) superati.
   - [x] Aggiornamenti di `d14cd5b`, `a5ea22d`, `9c9be38` e `d69aec5`: riga Preferiti
     che apre la vista virtuale, segnalibri con aggiunta, rinomina, riordino e rimozione
     dalla stessa sidebar, Posizioni personalizzate ereditate con rimozione contestuale
     e pagina Preferenze della sidebar rimossa. Test automatici su segnalibri e sidebar.
-  - [ ] Verifica grafica interattiva residua: trascinamento del divisore, finestre
-    strette, cambio scheda/lingua/tema, dinamica di preferiti e volumi, riordino e
-    rinomina dei segnalibri; Wayland provato all'avvio, non ispezionato a schermo.
-    X11 controllato su XWayland, non in una sessione X11 separata.
+  - [x] Verifica grafica interattiva su Wayland (conferma utente): divisore,
+    finestre strette, tema/lingua, schede, Preferiti, volumi e segnalibri.
+  - [ ] Ricontrollare a schermo la nuova dimensione base delle icone a zoom 100%;
+    il precedente riscontro grafico Wayland precede questa modifica.
+  - [ ] X11 in una sessione separata non ancora verificato; il precedente controllo
+    su XWayland non equivale a una sessione desktop X11.
 - [x] **F05/F06 — implementazione e verifiche automatiche completate.** Ordinamento
   naturale per nome/dimensione/tipo/data, per-scheda; zoom e colonne globali
   persistenti; selezione URI e ancora di scorrimento preservate. Metadati via GIO,
@@ -301,6 +305,9 @@ non vanno sovrascritte. I prompt già discussi sono requisiti, non prove di comp
   dichiara Copy/Link e con Copy/Link aggiunge la voce all'elenco, rifiutando il Move
   con un messaggio. Trasferimenti esterni su cartelle usano il protocollo Move solo
   dopo il successo; Copy su schede e Move interno sulla barra schede sono collegati.
+  Nel Move da Kito verso un'altra applicazione, le sorgenti ancora presenti vanno
+  al Cestino; NotFound è considerato già consumato solo quando GIO conferma che la
+  sorgente è assente. Altri errori del Cestino restano visibili e ritentabili.
   Move esterno sulla barra schede è ora gestito da `GtkDropTargetAsync` installato
   sulla `AdwTabBar`, non dal callback sincrono di libadwaita: la destinazione è la
   cartella della scheda sotto il puntatore e il Move è confermato alla sorgente solo
@@ -308,16 +315,25 @@ non vanno sovrascritte. I prompt già discussi sono requisiti, non prove di comp
   eliminare. La mappatura puntatore→scheda usa i gruppi pinned/regular e rifiuta
   fail-closed le schede con URI non destinazioni (`recent:`, `search:`,
   `network:///`) e le strutture inattese; limite tecnico: l'individuazione si
-  appoggia ai widget interni di `AdwTabBar`, coperti da test strutturali GTK ma
-  senza DND reale inter-app verificato. Link, hover-apertura e autoscroll restano
+  appoggia ai widget interni di `AdwTabBar`. L'utente riferisce la matrice
+  inter-app Copy/Move su Wayland superata, inclusi drop sulla barra.
+  Link, hover-apertura e autoscroll restano
   fuori dal completamento.
   - [x] Test headless su negoziazione, MIME URI list, retry, protezione symlink e
     destinazioni sé-stesse/discendenti nel backend.
-  - [ ] Verifica grafica di drop interni/esterni su tutte le destinazioni e con altre app.
+  - [x] Test GTK con fixture temporanee vuota e popolata: il target di sfondo
+    copre le pagine dello stack. È un test strutturale, non un drop end-to-end
+    da Nautilus.
+  - [x] Test su sorgenti già rimosse durante un Move esterno: solo NotFound
+    confermato da GIO viene omesso; altri errori restano nel riepilogo/ritentativo.
+  - [x] Test inter-app riferito dall'utente: Copy/Move Nautilus↔Kito, cartelle
+    vuote/popolate, righe, sidebar e schede su Wayland.
+  - [ ] X11 separato ancora da verificare; Link, hover-apertura e autoscroll
+    restano fuori dal completamento.
 
-Uscita **non raggiunta**. Mancano verifiche grafiche e scambio reale con altre app;
-il Move esterno sulla barra schede è ora gestito ma resta da verificare con sorgenti
-reali: è coperto solo da test strutturali GTK. La misura release su 50.000
+Uscita **non raggiunta**. Il test inter-app Wayland è riferito dall'utente ma non
+osservato indipendentemente; restano da provare X11 e le voci Link/hover/autoscroll.
+La misura release su 50.000
 elementi ha mostrato variabilità fra processi e, nell'ultima serie accoppiata,
 un totale dell'8.2% più alto; non si dichiara assenza di regressioni prestazionali.
 UI01 e UI02 restano inoltre attività separate, da coordinare con i controlli della

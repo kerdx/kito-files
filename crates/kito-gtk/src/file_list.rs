@@ -184,8 +184,9 @@ use crate::dnd::{self, DropHandler};
 pub use crate::preferences::model::ViewMode;
 use crate::preferences::model::{DetailColumnWidths, OpenItems};
 
-const ICON_VIEW_BASE_SIZE: i32 = 96;
-const ICON_VIEW_BASE_CELL_WIDTH: i32 = 160;
+const ICON_VIEW_BASE_SIZE: i32 = 64;
+const ICON_VIEW_BASE_CELL_WIDTH: i32 = 112;
+const ICON_VIEW_MIN_CELL_WIDTH: i32 = 88;
 const NAME_ICON_MIN_SIZE: i32 = 26;
 
 fn name_icon_pixel_size(base_size: i32, zoom: u8) -> i32 {
@@ -197,7 +198,7 @@ fn icon_pixel_size(zoom: u8) -> i32 {
 }
 
 fn icon_cell_width(zoom: u8) -> i32 {
-    (ICON_VIEW_BASE_CELL_WIDTH * i32::from(zoom) / 100).max(96)
+    (ICON_VIEW_BASE_CELL_WIDTH * i32::from(zoom) / 100).max(ICON_VIEW_MIN_CELL_WIDTH)
 }
 
 #[derive(Clone, Copy)]
@@ -1111,11 +1112,11 @@ fn build_icons(
     factory.connect_setup(move |_, list_item| {
         let cell = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(4)
-            .margin_start(6)
-            .margin_end(6)
-            .margin_top(8)
-            .margin_bottom(8)
+            .spacing(2)
+            .margin_start(4)
+            .margin_end(4)
+            .margin_top(4)
+            .margin_bottom(4)
             .build();
         cell.set_size_request(icon_cell_width(zoom), -1);
         cell.add_css_class("file-item");
@@ -1759,13 +1760,13 @@ mod tests {
     }
 
     #[test]
-    fn icon_zoom_matches_the_larger_grid_reference() {
-        assert_eq!(icon_pixel_size(60), 57);
-        assert_eq!(icon_pixel_size(100), 96);
-        assert_eq!(icon_pixel_size(180), 172);
-        assert_eq!(icon_cell_width(60), 96);
-        assert_eq!(icon_cell_width(100), 160);
-        assert_eq!(icon_cell_width(180), 288);
+    fn icon_zoom_scales_the_compact_grid_from_its_base_size() {
+        assert_eq!(icon_pixel_size(60), 38);
+        assert_eq!(icon_pixel_size(100), 64);
+        assert_eq!(icon_pixel_size(180), 115);
+        assert_eq!(icon_cell_width(60), 88);
+        assert_eq!(icon_cell_width(100), 112);
+        assert_eq!(icon_cell_width(180), 201);
     }
 
     #[test]
