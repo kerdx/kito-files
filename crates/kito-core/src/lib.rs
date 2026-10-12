@@ -511,6 +511,158 @@ pub fn trash(uri: &str) -> Result<(), glib::Error> {
     gio::File::for_uri(uri).trash(gio::Cancellable::NONE)
 }
 
+/// Backend identity required before an operation can safely be undone. Some
+/// virtual/remote filesystems do not expose both fields; those objects fail
+/// closed rather than receiving a weaker path-only identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub filesystem: String,
+    pub file: String,
+}
+
+pub fn file_identity(uri: &str) -> Result<FileIdentity, glib::Error> {
+    let info = gio::File::for_uri(uri).query_info(
+        "id::filesystem,id::file",
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        gio::Cancellable::NONE,
+    )?;
+    let filesystem = info.attribute_string("id::filesystem");
+    let file = info.attribute_string("id::file");
+    match (filesystem, file) {
+        (Some(filesystem), Some(file)) if !filesystem.is_empty() && !file.is_empty() => {
+            Ok(FileIdentity {
+                filesystem: filesystem.to_string(),
+                file: file.to_string(),
+            })
+        }
+        _ => Err(io_error(
+            "Filesystem does not provide a stable file identity",
+        )),
+    }
+}
+
+/// Moves to a directory and returns the exact effective URI (including any
+/// collision suffix). Kept separate from `move_to` to preserve its API.
+pub fn move_to_exact_result(src_uri: &str, dest_dir_uri: &str) -> Result<String, glib::Error> {
+    let src = gio::File::for_uri(src_uri);
+    let dest_dir = gio::File::for_uri(dest_dir_uri);
+    if src.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+        == gio::FileType::Directory
+        && dest_inside_src(&src, &dest_dir)
+    {
+        return Err(io_error(
+            "Cannot move a folder into itself or one of its subfolders",
+        ));
+    }
+    if src.parent().is_some_and(|parent| parent.equal(&dest_dir)) {
+        return Err(io_error("Source is already in the destination folder"));
+    }
+    let name = src
+        .basename()
+        .and_then(|n| n.into_string().ok())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| io_error("Invalid file name"))?;
+    let dest = unique_child(&dest_dir, OsStr::new(&name));
+    src.move_(
+        &dest,
+        gio::FileCopyFlags::NONE,
+        gio::Cancellable::NONE,
+        Some(&mut |_, _| {}),
+    )?;
+    Ok(dest.uri().to_string())
+}
+
+/// Exact inverse used by Undo: checks object identity and destination vacancy,
+/// then uses GIO move semantics without selecting a collision suffix.
+pub fn move_exact_checked(
+    src_uri: &str,
+    dest_uri: &str,
+    expected: &FileIdentity,
+) -> Result<(), glib::Error> {
+    if file_identity(src_uri)? != *expected {
+        return Err(io_error("File identity changed"));
+    }
+    let dest = gio::File::for_uri(dest_uri);
+    if dest.query_exists(gio::Cancellable::NONE) {
+        return Err(io_error("Undo destination is already occupied"));
+    }
+    gio::File::for_uri(src_uri).move_(
+        &dest,
+        gio::FileCopyFlags::NONE,
+        gio::Cancellable::NONE,
+        Some(&mut |_, _| {}),
+    )
+}
+
+/// Trash an item only retaining an undo target when a unique Trash entry can
+/// be matched by original-path metadata and stable backend identity.
+pub fn trash_with_identity(uri: &str) -> Result<Option<(String, FileIdentity)>, glib::Error> {
+    let identity = file_identity(uri).ok();
+    let original = gio::File::for_uri(uri).path();
+    gio::File::for_uri(uri).trash(gio::Cancellable::NONE)?;
+    let (Some(identity), Some(original)) = (identity, original) else {
+        return Ok(None);
+    };
+    let wanted = original.as_os_str().as_bytes();
+    let Ok(children) = gio::File::for_uri(TRASH_URI).enumerate_children(
+        "standard::name,trash::orig-path,id::filesystem,id::file",
+        gio::FileQueryInfoFlags::NONE,
+        gio::Cancellable::NONE,
+    ) else {
+        return Ok(None);
+    };
+    let mut matches = Vec::new();
+    loop {
+        let info = match children.next_file(gio::Cancellable::NONE) {
+            Ok(Some(info)) => info,
+            Ok(None) => break,
+            Err(_) => return Ok(None),
+        };
+        let candidate = children.child(&info);
+        if file_info_byte_string(&info, c"trash::orig-path").as_deref() == Some(wanted)
+            && file_identity(candidate.uri().as_ref()).as_ref() == Ok(&identity)
+        {
+            matches.push(candidate.uri().to_string());
+        }
+    }
+    Ok((matches.len() == 1).then(|| (matches.remove(0), identity)))
+}
+
+/// Strict Trash restore for Undo: original location must be free, and the
+/// candidate must retain the captured identity and exact original-path.
+pub fn restore_exact_checked(
+    uri: &str,
+    original_uri: &str,
+    expected: &FileIdentity,
+) -> Result<(), glib::Error> {
+    if file_identity(uri)? != *expected {
+        return Err(io_error("File identity changed"));
+    }
+    let original = gio::File::for_uri(original_uri);
+    if original.query_exists(gio::Cancellable::NONE) {
+        return Err(io_error("Undo destination is already occupied"));
+    }
+    let info = gio::File::for_uri(uri).query_info(
+        gio::FILE_ATTRIBUTE_TRASH_ORIG_PATH.as_str(),
+        gio::FileQueryInfoFlags::NONE,
+        gio::Cancellable::NONE,
+    )?;
+    let path = original
+        .path()
+        .ok_or_else(|| io_error("Non-local Trash origin cannot be verified"))?;
+    if file_info_byte_string(&info, c"trash::orig-path").as_deref()
+        != Some(path.as_os_str().as_bytes())
+    {
+        return Err(io_error("Trash origin changed"));
+    }
+    gio::File::for_uri(uri).move_(
+        &original,
+        gio::FileCopyFlags::NONE,
+        gio::Cancellable::NONE,
+        Some(&mut |_, _| {}),
+    )
+}
+
 /// Permanent recursive deletion. The UI asks for confirmation first.
 /// Symbolic links are never followed: deleting a
 /// symlink removes only the link, even if it points to a
@@ -1369,6 +1521,59 @@ mod tests {
 
         delete_recursive(&uri(&tmp.path().join("docs"))).unwrap();
         assert!(!tmp.path().join("docs").exists());
+    }
+
+    #[test]
+    fn checked_move_inverse_restores_only_matching_identity_and_never_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        let moved = tmp.path().join("moved");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(origin.join("item"), b"payload").unwrap();
+        let source = gio::File::for_path(origin.join("item")).uri().to_string();
+        let target = gio::File::for_path(moved.join("item")).uri().to_string();
+        let identity = file_identity(&source).unwrap();
+        move_to_exact_result(&source, gio::File::for_path(&moved).uri().as_ref()).unwrap();
+        move_exact_checked(&target, &source, &identity).unwrap();
+        assert_eq!(std::fs::read(origin.join("item")).unwrap(), b"payload");
+
+        let new_target =
+            move_to_exact_result(&source, gio::File::for_path(&moved).uri().as_ref()).unwrap();
+        std::fs::write(origin.join("item"), b"keep existing").unwrap();
+        assert!(move_exact_checked(&new_target, &source, &identity).is_err());
+        assert_eq!(
+            std::fs::read(origin.join("item")).unwrap(),
+            b"keep existing"
+        );
+        assert_eq!(std::fs::read(moved.join("item")).unwrap(), b"payload");
+
+        let wrong = FileIdentity {
+            filesystem: "wrong filesystem".into(),
+            file: "wrong file".into(),
+        };
+        assert!(move_exact_checked(
+            &new_target,
+            gio::File::for_path(other.join("item")).uri().as_ref(),
+            &wrong
+        )
+        .is_err());
+        assert_eq!(std::fs::read(moved.join("item")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn strict_restore_destination_conflict_check_does_not_choose_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("present");
+        std::fs::write(&dest, b"untouched").unwrap();
+        let uri = gio::File::for_path(&dest).uri().to_string();
+        let expected = FileIdentity {
+            filesystem: "x".into(),
+            file: "y".into(),
+        };
+        assert!(restore_exact_checked(&uri, &uri, &expected).is_err());
+        assert_eq!(std::fs::read(dest).unwrap(), b"untouched");
     }
 
     #[test]

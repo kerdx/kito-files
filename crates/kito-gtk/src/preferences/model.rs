@@ -187,6 +187,9 @@ impl WindowControls {
 /// tying persistence to the dialog implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preferences {
+    /// Per-binding overrides: `Some(accelerator)` replaces the default and
+    /// `None` explicitly disables the binding. Missing keys use defaults.
+    pub keyboard_shortcuts: std::collections::BTreeMap<String, Option<String>>,
     pub default_view: ViewMode,
     pub open_items: OpenItems,
     pub terminal: TerminalChoice,
@@ -210,6 +213,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            keyboard_shortcuts: std::collections::BTreeMap::new(),
             default_view: ViewMode::default(),
             open_items: OpenItems::default(),
             terminal: TerminalChoice::default(),
@@ -241,6 +245,7 @@ impl Preferences {
                 continue;
             };
             match key.trim() {
+                "keyboard-shortcuts" => result.keyboard_shortcuts = decode_shortcuts(value),
                 "default-view" => {
                     result.default_view = ViewMode::parse(value).unwrap_or_default();
                 }
@@ -318,8 +323,12 @@ impl Preferences {
         result
     }
 
-    pub fn config_entries(&self) -> [(&'static str, String); 21] {
+    pub fn config_entries(&self) -> [(&'static str, String); 22] {
         [
+            (
+                "keyboard-shortcuts",
+                encode_shortcuts(&self.keyboard_shortcuts),
+            ),
             (
                 "default-view",
                 self.default_view.as_config_value().to_string(),
@@ -385,6 +394,54 @@ impl Preferences {
             ),
         ]
     }
+}
+
+// Hex-encoded `id<TAB>value` records; `-` is an explicit disabled value.
+// Encoding the complete map in one setting makes reset deletion-safe with
+// the shared merge writer and preserves unknown future IDs.
+fn encode_shortcuts(values: &std::collections::BTreeMap<String, Option<String>>) -> String {
+    values
+        .iter()
+        .map(|(id, value)| {
+            let record = format!("{}\t{}", id, value.as_deref().unwrap_or("-"));
+            record
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_shortcuts(value: &str) -> std::collections::BTreeMap<String, Option<String>> {
+    value
+        .trim()
+        .split(',')
+        .filter_map(|encoded| {
+            if encoded.len() % 2 != 0 {
+                return None;
+            }
+            let bytes = (0..encoded.len())
+                .step_by(2)
+                .map(|i| {
+                    Some(
+                        hex_digit(encoded.as_bytes()[i])? * 16
+                            + hex_digit(encoded.as_bytes()[i + 1])?,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let text = String::from_utf8(bytes).ok()?;
+            let (id, shortcut) = text.split_once('\t')?;
+            if id.is_empty() {
+                return None;
+            }
+            Some((
+                id.to_string(),
+                (shortcut != "-").then(|| shortcut.to_string()),
+            ))
+        })
+        .collect()
 }
 
 fn parse_width(value: &str, min: i32, max: i32, default: i32) -> i32 {
@@ -471,6 +528,27 @@ mod tests {
         );
         assert!(preferences.hidden_sidebar_ids.is_empty());
         assert!(preferences.custom_sidebar_uris.is_empty());
+        assert!(preferences.keyboard_shortcuts.is_empty());
+    }
+
+    #[test]
+    fn shortcut_overrides_round_trip_disabled_unknown_and_escaped_values() {
+        let mut shortcuts = std::collections::BTreeMap::new();
+        shortcuts.insert("undo".into(), Some("<Control><Shift>z".into()));
+        shortcuts.insert("paste".into(), None);
+        shortcuts.insert("future-binding".into(), Some("custom,\nvalue".into()));
+        let preferences = Preferences {
+            keyboard_shortcuts: shortcuts,
+            ..Preferences::default()
+        };
+        let text = preferences
+            .config_entries()
+            .iter()
+            .map(|(key, value)| format!("{key}={value}\n"))
+            .collect::<String>();
+        assert_eq!(Preferences::from_config_text(&text), preferences);
+        let invalid = Preferences::from_config_text("keyboard-shortcuts=xx,ff\n");
+        assert!(invalid.keyboard_shortcuts.is_empty());
     }
 
     #[test]

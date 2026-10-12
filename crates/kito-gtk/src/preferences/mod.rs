@@ -16,6 +16,7 @@ type WindowControlsListener = Rc<dyn Fn(WindowControls)>;
 type DisplayListener = Rc<dyn Fn(Preferences)>;
 type SidebarListener = Rc<dyn Fn(Preferences)>;
 type BookmarkListener = Rc<dyn Fn()>;
+type ShortcutListener = Rc<dyn Fn(Preferences)>;
 
 /// Process-wide settings state shared by every window.
 pub struct PreferenceStore {
@@ -28,6 +29,7 @@ pub struct PreferenceStore {
     display_listeners: RefCell<Vec<DisplayListener>>,
     sidebar_listeners: RefCell<Vec<SidebarListener>>,
     bookmark_listeners: RefCell<Vec<BookmarkListener>>,
+    shortcut_listeners: RefCell<Vec<ShortcutListener>>,
 }
 
 impl PreferenceStore {
@@ -52,6 +54,7 @@ impl PreferenceStore {
             display_listeners: RefCell::new(Vec::new()),
             sidebar_listeners: RefCell::new(Vec::new()),
             bookmark_listeners: RefCell::new(Vec::new()),
+            shortcut_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -67,6 +70,7 @@ impl PreferenceStore {
             display_listeners: RefCell::new(Vec::new()),
             sidebar_listeners: RefCell::new(Vec::new()),
             bookmark_listeners: RefCell::new(Vec::new()),
+            shortcut_listeners: RefCell::new(Vec::new()),
         })
     }
 
@@ -76,6 +80,59 @@ impl PreferenceStore {
 
     pub fn snapshot(&self) -> Preferences {
         self.current.borrow().clone()
+    }
+
+    pub fn set_shortcut(&self, id: &str, value: Option<String>) -> io::Result<()> {
+        let previous = self.snapshot();
+        if let Some(value) = value {
+            self.current
+                .borrow_mut()
+                .keyboard_shortcuts
+                .insert(id.to_string(), Some(value));
+        } else {
+            self.current.borrow_mut().keyboard_shortcuts.remove(id);
+        }
+        if let Err(error) = self.save() {
+            *self.current.borrow_mut() = previous;
+            return Err(error);
+        }
+        self.notify_shortcuts();
+        Ok(())
+    }
+
+    pub fn disable_shortcut(&self, id: &str) -> io::Result<()> {
+        let previous = self.snapshot();
+        self.current
+            .borrow_mut()
+            .keyboard_shortcuts
+            .insert(id.to_string(), None);
+        if let Err(error) = self.save() {
+            *self.current.borrow_mut() = previous;
+            return Err(error);
+        }
+        self.notify_shortcuts();
+        Ok(())
+    }
+
+    pub fn reset_shortcuts(&self) -> io::Result<()> {
+        let previous = self.snapshot();
+        self.current.borrow_mut().keyboard_shortcuts.clear();
+        if let Err(error) = self.save() {
+            *self.current.borrow_mut() = previous;
+            return Err(error);
+        }
+        self.notify_shortcuts();
+        Ok(())
+    }
+
+    pub fn subscribe_shortcuts(&self, listener: ShortcutListener) {
+        self.shortcut_listeners.borrow_mut().push(listener);
+    }
+    fn notify_shortcuts(&self) {
+        let snapshot = self.snapshot();
+        for listener in self.shortcut_listeners.borrow().iter() {
+            listener(snapshot.clone());
+        }
     }
 
     pub fn set_default_view(&self, view: ViewMode) -> io::Result<()> {
@@ -369,6 +426,35 @@ mod tests {
         store.set_open_items(OpenItems::SingleClick).unwrap();
         assert_eq!(store.shared().borrow().open_items, OpenItems::SingleClick);
         assert_eq!(*notified.borrow(), Some(OpenItems::SingleClick));
+    }
+
+    #[test]
+    fn shortcut_edit_disable_reset_persist_and_notify_process_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.conf");
+        let store = PreferenceStore::at_path(path.clone());
+        let seen = Rc::new(RefCell::new(0));
+        store.subscribe_shortcuts({
+            let seen = seen.clone();
+            Rc::new(move |_| *seen.borrow_mut() += 1)
+        });
+        store
+            .set_shortcut("undo", Some("<Control><Shift>z".into()))
+            .unwrap();
+        assert_eq!(
+            storage::load_from(&path).keyboard_shortcuts.get("undo"),
+            Some(&Some("<Control><Shift>z".into()))
+        );
+        store.disable_shortcut("undo").unwrap();
+        assert_eq!(
+            storage::load_from(&path).keyboard_shortcuts.get("undo"),
+            Some(&None)
+        );
+        store.set_shortcut("undo", None).unwrap();
+        assert!(!storage::load_from(&path)
+            .keyboard_shortcuts
+            .contains_key("undo"));
+        assert_eq!(*seen.borrow(), 3);
     }
 
     #[test]

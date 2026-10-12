@@ -320,7 +320,9 @@ fn mode_for_new_tab(preferences: &Preferences) -> ViewMode {
 
 /// Wires GTK activation (pointer or Enter) to the freshly created view.
 fn wire_activate(tab: &Rc<FileTab>, widget: &gtk::Widget) {
-    file_list::add_file_shortcuts(widget);
+    if let Some(manager) = tab.manager.upgrade() {
+        file_list::add_file_shortcuts(widget, &manager.preference_store);
+    }
     let suppress_modified_click = file_list::add_modified_click_guard(widget);
     if let Ok(view) = widget.clone().downcast::<gtk::ColumnView>() {
         let tab = tab.clone();

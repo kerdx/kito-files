@@ -15,6 +15,7 @@ const THUMB_CACHE_LIMIT: usize = 128;
 const THUMB_CACHE_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const THUMB_MAX_ACTIVE: usize = 4;
 const THUMB_MAX_WAITING: usize = 256;
+thread_local! { static FILE_SHORTCUT_CONTROLLERS: std::cell::RefCell<Vec<(glib::WeakRef<gtk::ShortcutController>, Vec<gtk::Shortcut>)>> = const { std::cell::RefCell::new(Vec::new()) }; }
 
 #[derive(Clone)]
 struct ThumbnailPixels {
@@ -1223,18 +1224,73 @@ pub fn build_view(
 
 /// Attaches file-view-local shortcuts so text entries and dialogs keep their
 /// normal keyboard behavior.
-pub fn add_file_shortcuts(widget: &gtk::Widget) {
+pub fn add_file_shortcuts(
+    widget: &gtk::Widget,
+    preferences: &std::rc::Rc<crate::preferences::PreferenceStore>,
+) {
     let controller = gtk::ShortcutController::new();
     controller.set_scope(gtk::ShortcutScope::Local);
-    for (accelerator, name) in crate::shortcuts::FILE_VIEW_SHORTCUTS {
-        if let (Some(trigger), Some(action)) = (
-            gtk::ShortcutTrigger::parse_string(accelerator),
-            gtk::ShortcutAction::parse_string(name),
-        ) {
-            controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    let installed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<gtk::Shortcut>::new()));
+    let apply = move |controller: &gtk::ShortcutController,
+                      installed: &std::rc::Rc<std::cell::RefCell<Vec<gtk::Shortcut>>>,
+                      prefs: &crate::preferences::model::Preferences| {
+        for shortcut in installed.borrow_mut().drain(..) {
+            controller.remove_shortcut(&shortcut);
         }
-    }
+        for binding in crate::shortcuts::CATALOG
+            .iter()
+            .filter(|binding| binding.local)
+        {
+            if let (Some(accelerator), Some(action)) = (
+                crate::shortcuts::effective(binding, prefs),
+                gtk::ShortcutAction::parse_string(binding.action),
+            ) {
+                if let Some(trigger) = gtk::ShortcutTrigger::parse_string(&accelerator) {
+                    let shortcut = gtk::Shortcut::new(Some(trigger), Some(action));
+                    controller.add_shortcut(shortcut.clone());
+                    installed.borrow_mut().push(shortcut);
+                }
+            }
+        }
+    };
+    apply(&controller, &installed, &preferences.snapshot());
+    FILE_SHORTCUT_CONTROLLERS.with(|controllers| {
+        let mut controllers = controllers.borrow_mut();
+        controllers.retain(|(weak, _)| weak.upgrade().is_some());
+        controllers.push((controller.downgrade(), installed.borrow().clone()));
+    });
     widget.add_controller(controller);
+}
+
+pub fn subscribe_file_shortcuts(preferences: &std::rc::Rc<crate::preferences::PreferenceStore>) {
+    preferences.subscribe_shortcuts(std::rc::Rc::new(|prefs| {
+        FILE_SHORTCUT_CONTROLLERS.with(|controllers| {
+            controllers.borrow_mut().retain_mut(|(weak, installed)| {
+                let Some(controller) = weak.upgrade() else {
+                    return false;
+                };
+                for shortcut in installed.drain(..) {
+                    controller.remove_shortcut(&shortcut);
+                }
+                for binding in crate::shortcuts::CATALOG
+                    .iter()
+                    .filter(|binding| binding.local)
+                {
+                    if let (Some(accel), Some(action)) = (
+                        crate::shortcuts::effective(binding, &prefs),
+                        gtk::ShortcutAction::parse_string(binding.action),
+                    ) {
+                        if let Some(trigger) = gtk::ShortcutTrigger::parse_string(&accel) {
+                            let shortcut = gtk::Shortcut::new(Some(trigger), Some(action));
+                            controller.add_shortcut(shortcut.clone());
+                            installed.push(shortcut);
+                        }
+                    }
+                }
+                true
+            })
+        });
+    }));
 }
 
 /// True while a Ctrl/Shift pointer activation should only change selection.

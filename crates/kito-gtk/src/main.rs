@@ -7,6 +7,7 @@ mod dnd;
 mod file_list;
 mod icons;
 mod l10n;
+mod operation_queue;
 mod ops;
 mod path_completion;
 mod preferences;
@@ -273,7 +274,7 @@ fn register_actions(
     single_item_actions: Rc<RefCell<Vec<gio::SimpleAction>>>,
 ) {
     let group = gio::SimpleActionGroup::new();
-    let defs: [ActionDef; 45] = [
+    let defs: [ActionDef; 46] = [
         ("open", ops::Ctx::open_selected),
         ("open-in-new-tab", ops::Ctx::open_selected_in_new_tabs),
         ("open-in-new-window", ops::Ctx::open_selected_in_new_window),
@@ -305,6 +306,7 @@ fn register_actions(
         ("trash", ops::Ctx::trash_selected),
         ("delete", ops::Ctx::delete_selected),
         ("rename", ops::Ctx::rename_selected),
+        ("undo", ops::Ctx::undo),
         ("edit-path", |c| c.focus_path()),
         ("reload", |c| c.manager.reload_selected()),
         ("about", |c| show_about(&c.window)),
@@ -347,13 +349,18 @@ fn register_actions(
     }
     let action = gio::SimpleAction::new("preferences", None);
     let preferences_window = window.clone();
+    let dialog_preferences = preferences.clone();
     action.connect_activate(move |_, _| {
-        preferences_dialog::present(&preferences_window, &preferences, &preferences_dialog);
+        preferences_dialog::present(
+            &preferences_window,
+            &dialog_preferences,
+            &preferences_dialog,
+        );
     });
     group.add_action(&action);
     window.insert_action_group("win", Some(&group));
 
-    shortcuts::register_application_accelerators(app);
+    shortcuts::register_application_accelerators(app, &preferences.snapshot());
 }
 
 /// Button with ordered system-theme icon candidates. Callers put symbolic
@@ -756,15 +763,30 @@ fn main() -> glib::ExitCode {
         .application_id("it.kito.KitoFiles")
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
+    preferences.subscribe_shortcuts({
+        let app = app.clone();
+        Rc::new(move |snapshot| shortcuts::register_application_accelerators(&app, &snapshot))
+    });
+    file_list::subscribe_file_shortcuts(&preferences);
+    let operation_queue = Rc::new(operation_queue::OperationQueue::default());
 
     app.connect_activate({
         let preferences = preferences.clone();
-        move |app| build_window(app, Vec::new(), preferences.clone())
+        let operation_queue = operation_queue.clone();
+        move |app| {
+            build_window(
+                app,
+                Vec::new(),
+                preferences.clone(),
+                operation_queue.clone(),
+            )
+        }
     });
     // `kito-files ~/Downloads`, "open folder with Kito Files": one tab per file.
     // If it is a file (not a folder), opens the folder containing it.
     app.connect_open({
         let preferences = preferences.clone();
+        let operation_queue = operation_queue.clone();
         move |app, files, _hint| {
             let mut uris = Vec::new();
             for file in files {
@@ -777,7 +799,7 @@ fn main() -> glib::ExitCode {
                     uris.push(parent.uri().to_string());
                 }
             }
-            build_window(app, uris, preferences.clone());
+            build_window(app, uris, preferences.clone(), operation_queue.clone());
         }
     });
 
@@ -798,6 +820,7 @@ fn build_window(
     app: &adw::Application,
     initial_uris: Vec<String>,
     preferences: Rc<PreferenceStore>,
+    operation_queue: Rc<operation_queue::OperationQueue>,
 ) {
     load_pathbar_css();
     let window = adw::ApplicationWindow::builder()
@@ -1399,7 +1422,8 @@ fn build_window(
     let open_window: Rc<dyn Fn(Vec<String>)> = Rc::new({
         let app = app.clone();
         let preferences = preferences.clone();
-        move |uris| build_window(&app, uris, preferences.clone())
+        let operation_queue = operation_queue.clone();
+        move |uris| build_window(&app, uris, preferences.clone(), operation_queue.clone())
     });
     let manager = tabs::TabManager::new(
         tab_view,
@@ -1612,6 +1636,7 @@ fn build_window(
         manager: manager.clone(),
         toast: toast_overlay.clone(),
         clipboard: Rc::new(RefCell::new(ops::ClipTracker::default())),
+        operation_queue,
         preferences: preferences.clone(),
         focus_path: select_path_entry,
     });

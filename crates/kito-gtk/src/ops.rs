@@ -1,12 +1,16 @@
 //! File operations: clipboard, trash, delete, rename, copy/move.
-//! Copy/move/delete run in a thread; the outcome returns to the main loop
-//! with toast + reload. No `%` progress for now (next step).
+//! Mutations use the application-wide FIFO on a worker; read-only background
+//! work uses the regular helper. Results return to GTK for toast + reload.
 
+use crate::operation_queue::{OperationQueue, UndoRecord, UndoStartError};
 use crate::preferences::PreferenceStore;
 use crate::tabs::TabManager;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 #[derive(Clone, Default)]
 pub struct Clipboard {
@@ -61,10 +65,23 @@ struct OperationItemResult {
 
 type RetryHandler = Rc<dyn Fn(Vec<OperationItemResult>)>;
 
-#[derive(Clone)]
+/// An inverse may only target an object whose backend identity survived the
+/// operation. In particular, GIO may implement a cross-filesystem move as
+/// copy+delete, so an undo record must not retain the pre-move identity.
+fn unchanged_undo_identity(
+    before: Option<kito_core::FileIdentity>,
+    after: Option<kito_core::FileIdentity>,
+) -> Option<kito_core::FileIdentity> {
+    match (before, after) {
+        (Some(before), Some(after)) if before == after => Some(after),
+        _ => None,
+    }
+}
+
 struct DropCompletion {
     drop: gdk::Drop,
     action: crate::dnd::TransferAction,
+    finished: Cell<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +94,9 @@ struct CapturedTransfer {
 
 impl DropCompletion {
     fn finish(&self, results: &[OperationItemResult]) {
+        if self.finished.get() {
+            return;
+        }
         let succeeded = results
             .iter()
             .filter(|result| matches!(result.state, ItemState::Succeeded))
@@ -90,7 +110,16 @@ impl DropCompletion {
             crate::dnd::TransferAction::Link if succeeded > 0 => gdk::DragAction::LINK,
             _ => gdk::DragAction::empty(),
         };
+        self.finished.set(true);
         self.drop.finish(action);
+    }
+}
+
+impl Drop for DropCompletion {
+    fn drop(&mut self) {
+        if !self.finished.replace(true) {
+            self.drop.finish(gdk::DragAction::empty());
+        }
     }
 }
 
@@ -274,6 +303,41 @@ impl ClipTracker {
     }
 }
 
+/// A worker callback owns this guard after a cut was marked in flight. If
+/// delivery fails or a completion callback panics before applying the result,
+/// dropping it releases the mark without consuming clipboard entries.
+struct CutCompletionGuard {
+    clipboard: Rc<RefCell<ClipTracker>>,
+    generation: Option<u64>,
+    completed: bool,
+}
+
+impl CutCompletionGuard {
+    fn new(clipboard: Rc<RefCell<ClipTracker>>, generation: Option<u64>) -> Self {
+        Self {
+            clipboard,
+            generation,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CutCompletionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Some(generation) = self.generation {
+                if let Ok(mut clipboard) = self.clipboard.try_borrow_mut() {
+                    clipboard.cancel_cut(generation);
+                }
+            }
+        }
+    }
+}
+
 /// `file://` lines from foreign clipboard text (interop with other
 /// apps). Anything else is ignored by the caller.
 fn parse_external_uris(text: &str) -> Vec<String> {
@@ -290,6 +354,7 @@ pub struct Ctx {
     pub manager: Rc<TabManager>,
     pub toast: adw::ToastOverlay,
     pub(crate) clipboard: Rc<RefCell<ClipTracker>>,
+    pub(crate) operation_queue: Rc<OperationQueue>,
     pub preferences: Rc<PreferenceStore>,
     /// Shows the path entry (Ctrl+L). Set by main.
     pub focus_path: Rc<dyn Fn()>,
@@ -345,7 +410,11 @@ impl Ctx {
         internal: bool,
         drop: Option<gdk::Drop>,
     ) {
-        let completion = drop.map(|drop| DropCompletion { drop, action });
+        let completion = drop.map(|drop| DropCompletion {
+            drop,
+            action,
+            finished: Cell::new(false),
+        });
         if destination == kito_core::ADD_BOOKMARK_URI {
             let mut results = Vec::new();
             let mut added = false;
@@ -473,6 +542,10 @@ impl Ctx {
             .build();
         dialog.add_response("ok", &crate::l10n::tr("dialog-ok"));
         dialog.present(Some(&self.window));
+    }
+
+    fn operation_worker_failed(&self) {
+        self.toast(&crate::l10n::tr("operation-worker-failed"));
     }
 
     /// Reports one batch once, with expandable per-item details. A retry
@@ -870,25 +943,71 @@ impl Ctx {
         };
         let is_cut = transfer.cut;
         let retry_dest = transfer.destination.clone();
-        Self::run_in_thread(
+        this.operation_queue.clone().submit(
             move || {
                 let mut results = Vec::with_capacity(transfer.uris.len());
+                let mut undo = Vec::new();
                 for uri in &transfer.uris {
-                    let r = if transfer.move_with_backend {
-                        kito_core::move_to(uri, &transfer.destination)
+                    let identity_before = transfer
+                        .move_with_backend
+                        .then(|| kito_core::file_identity(uri).ok())
+                        .flatten();
+                    if transfer.move_with_backend {
+                        match kito_core::move_to_exact_result(uri, &transfer.destination) {
+                            Ok(target) => {
+                                let identity = unchanged_undo_identity(
+                                    identity_before,
+                                    kito_core::file_identity(&target).ok(),
+                                );
+                                if let Some(identity) = identity {
+                                    undo.push(UndoRecord::Move {
+                                        source: uri.clone(),
+                                        target: target.clone(),
+                                        identity,
+                                    });
+                                }
+                                results.push(OperationItemResult {
+                                    operation: result_operation,
+                                    source: uri.clone(),
+                                    destination: Some(target),
+                                    state: ItemState::Succeeded,
+                                });
+                            }
+                            Err(error) => results.push(OperationItemResult::from_result(
+                                result_operation,
+                                uri.clone(),
+                                Some(transfer.destination.clone()),
+                                Err(error),
+                            )),
+                        }
                     } else {
-                        kito_core::copy_to(uri, &transfer.destination)
-                    };
-                    results.push(OperationItemResult::from_result(
-                        result_operation,
-                        uri.clone(),
-                        Some(transfer.destination.clone()),
-                        r,
-                    ));
+                        results.push(OperationItemResult::from_result(
+                            result_operation,
+                            uri.clone(),
+                            Some(transfer.destination.clone()),
+                            kito_core::copy_to(uri, &transfer.destination),
+                        ));
+                    }
                 }
-                results
+                (results, undo)
             },
-            move |results: Vec<OperationItemResult>| {
+            move |outcome| {
+                let mut cut_guard = CutCompletionGuard::new(this.clipboard.clone(), cut_op);
+                let (results, undo): (Vec<OperationItemResult>, Vec<UndoRecord>) = match outcome {
+                    Ok(result) => result,
+                    Err(_) => {
+                        drop(cut_guard);
+                        this.manager.reload_if_current(&retry_dest);
+                        if let Some(completion) = &drop_completion {
+                            completion.finish(&[]);
+                        }
+                        this.operation_worker_failed();
+                        return;
+                    }
+                };
+                for record in undo {
+                    this.operation_queue.push_undo(record);
+                }
                 let cut_finish = cut_op.map(|op_generation| {
                     let failed_uris: Vec<String> = results
                         .iter()
@@ -899,6 +1018,7 @@ impl Ctx {
                         .borrow_mut()
                         .finish_cut(op_generation, &failed_uris)
                 });
+                cut_guard.complete();
                 if cut_finish == Some(CutFinish::Consumed) {
                     this.clear_system_clipboard();
                 }
@@ -976,20 +1096,52 @@ impl Ctx {
     ) {
         let this = self.clone();
         let retry_folder = folder.clone();
-        Self::run_in_thread(
+        this.operation_queue.clone().submit(
             move || {
-                uris.into_iter()
-                    .map(|uri| {
-                        OperationItemResult::from_result(
+                let mut results = Vec::new();
+                let mut undo = Vec::new();
+                for uri in uris {
+                    match kito_core::trash_with_identity(&uri) {
+                        Ok(target) => {
+                            if let Some((target, identity)) = target {
+                                undo.push(UndoRecord::Trash {
+                                    source: uri.clone(),
+                                    target,
+                                    identity,
+                                });
+                            }
+                            results.push(OperationItemResult::from_result(
+                                "operation-trash",
+                                uri,
+                                Some(kito_core::TRASH_URI.to_string()),
+                                Ok(()),
+                            ));
+                        }
+                        Err(error) => results.push(OperationItemResult::from_result(
                             "operation-trash",
-                            uri.clone(),
+                            uri,
                             Some(kito_core::TRASH_URI.to_string()),
-                            kito_core::trash(&uri),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                            Err(error),
+                        )),
+                    }
+                }
+                (results, undo)
             },
-            move |results| {
+            move |outcome| {
+                let (results, undo) = match outcome {
+                    Ok(result) => result,
+                    Err(_) => {
+                        this.manager.reload_if_current(&folder);
+                        if let Some(completion) = &drop_completion {
+                            completion.finish(&[]);
+                        }
+                        this.operation_worker_failed();
+                        return;
+                    }
+                };
+                for record in undo {
+                    this.operation_queue.push_undo(record);
+                }
                 this.manager.reload_if_current(&folder);
                 if let Some(completion) = &drop_completion {
                     completion.finish(&results);
@@ -1023,7 +1175,7 @@ impl Ctx {
     fn restore_uris(&self, uris: Vec<String>, trash_uri: String) {
         let this = self.clone();
         let retry_trash_uri = trash_uri.clone();
-        Self::run_in_thread(
+        this.operation_queue.clone().submit(
             move || {
                 uris.into_iter()
                     .map(|uri| match kito_core::restore(&uri) {
@@ -1042,7 +1194,15 @@ impl Ctx {
                     })
                     .collect::<Vec<_>>()
             },
-            move |results| {
+            move |outcome| {
+                let results = match outcome {
+                    Ok(results) => results,
+                    Err(_) => {
+                        this.manager.reload_if_current(&trash_uri);
+                        this.operation_worker_failed();
+                        return;
+                    }
+                };
                 this.manager.reload_if_current(&trash_uri);
                 let retry_this = this.clone();
                 let retry: RetryHandler = Rc::new(move |failed| {
@@ -1071,7 +1231,7 @@ impl Ctx {
                 return;
             }
             let this = this.clone();
-            Self::run_in_thread(
+            this.operation_queue.clone().submit(
                 move || match kito_core::empty_trash_detailed() {
                     Ok(items) => items
                         .into_iter()
@@ -1091,7 +1251,15 @@ impl Ctx {
                         Err(error),
                     )],
                 },
-                move |results| {
+                move |outcome| {
+                    let results = match outcome {
+                        Ok(results) => results,
+                        Err(_) => {
+                            this.manager.reload_if_current(kito_core::TRASH_URI);
+                            this.operation_worker_failed();
+                            return;
+                        }
+                    };
                     this.manager.reload_if_current(kito_core::TRASH_URI);
                     if results.is_empty() {
                         this.toast(&crate::l10n::tr("trash-already-empty"));
@@ -1139,7 +1307,7 @@ impl Ctx {
             let this = this.clone();
             let retry_folder = folder.clone();
             let completion_folder = folder.clone();
-            Self::run_in_thread(
+            this.operation_queue.clone().submit(
                 move || {
                     uris.into_iter()
                         .map(|uri| {
@@ -1152,7 +1320,15 @@ impl Ctx {
                         })
                         .collect::<Vec<_>>()
                 },
-                move |results| {
+                move |outcome| {
+                    let results = match outcome {
+                        Ok(results) => results,
+                        Err(_) => {
+                            this.manager.reload_if_current(&completion_folder);
+                            this.operation_worker_failed();
+                            return;
+                        }
+                    };
                     this.manager.reload_if_current(&completion_folder);
                     let retry_this = this.clone();
                     let retry: RetryHandler = Rc::new(move |failed| {
@@ -1342,10 +1518,33 @@ impl Ctx {
                 let operation_uri = uri.clone();
                 let destination_parent = parent.clone();
                 let this = this.clone();
-                Self::run_in_thread(
-                    move || kito_core::rename(&operation_uri, &text),
-                    move |result| {
+                this.operation_queue.clone().submit(
+                    move || {
+                        let before = kito_core::file_identity(&operation_uri).ok();
+                        let result = kito_core::rename(&operation_uri, &text);
+                        let after = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|target| kito_core::file_identity(target).ok());
+                        (result, unchanged_undo_identity(before, after))
+                    },
+                    move |outcome| {
+                        let (result, identity) = match outcome {
+                            Ok(result) => result,
+                            Err(_) => {
+                                this.manager.reload_if_current(&destination_parent);
+                                this.operation_worker_failed();
+                                return;
+                            }
+                        };
                         this.manager.reload_if_current(&destination_parent);
+                        if let (Ok(target), Some(identity)) = (&result, identity) {
+                            this.operation_queue.push_undo(UndoRecord::Move {
+                                source: source.clone(),
+                                target: target.clone(),
+                                identity,
+                            });
+                        }
                         let item = OperationItemResult::from_destination_result(
                             "operation-rename",
                             source,
@@ -1355,6 +1554,75 @@ impl Ctx {
                         this.report_operation("operation-rename", vec![item], None);
                     },
                 );
+            },
+        );
+    }
+
+    /// Undo one confirmed operation. A failed/stale inverse remains at the
+    /// top of history for a safe retry. Undo is refused while any queued or
+    /// running mutation could make the captured inverse stale.
+    pub fn undo(&self) {
+        let record = match self.operation_queue.begin_undo() {
+            Ok(record) => record,
+            Err(UndoStartError::Busy | UndoStartError::InProgress) => {
+                self.toast(&crate::l10n::tr("undo-in-progress"));
+                return;
+            }
+            Err(UndoStartError::Empty) => {
+                self.toast(&crate::l10n::tr("undo-empty"));
+                return;
+            }
+        };
+        let this = self.clone();
+        let worker_record = record.record.clone();
+        this.operation_queue.clone().submit(
+            move || match &worker_record {
+                UndoRecord::Move {
+                    source,
+                    target,
+                    identity,
+                } => kito_core::move_exact_checked(target, source, identity),
+                UndoRecord::Trash {
+                    source,
+                    target,
+                    identity,
+                } => kito_core::restore_exact_checked(target, source, identity),
+            },
+            move |outcome| {
+                let (source, target) = match &record.record {
+                    UndoRecord::Move { source, target, .. }
+                    | UndoRecord::Trash { source, target, .. } => (source.clone(), target.clone()),
+                };
+                let result = match outcome {
+                    Ok(result) => result,
+                    Err(_) => {
+                        this.operation_queue.finish_undo(record.id, false);
+                        if let Some(parent) = gio::File::for_uri(&source).parent() {
+                            this.manager.reload_if_current(&parent.uri());
+                        }
+                        if let Some(parent) = gio::File::for_uri(&target).parent() {
+                            this.manager.reload_if_current(&parent.uri());
+                        }
+                        this.manager.reload_if_current(kito_core::TRASH_URI);
+                        this.manager.reload_if_current(kito_core::FAVORITES_URI);
+                        this.operation_worker_failed();
+                        return;
+                    }
+                };
+                this.operation_queue.finish_undo(record.id, result.is_ok());
+                if let Some(parent) = gio::File::for_uri(&source).parent() {
+                    this.manager.reload_if_current(&parent.uri());
+                }
+                if let Some(parent) = gio::File::for_uri(&target).parent() {
+                    this.manager.reload_if_current(&parent.uri());
+                }
+                this.manager.reload_if_current(kito_core::TRASH_URI);
+                if result.is_ok() {
+                    this.toast(&crate::l10n::tr("undo-success"));
+                } else {
+                    this.toast(&crate::l10n::tr("undo-conflict"));
+                }
+                this.manager.reload_if_current(kito_core::FAVORITES_URI);
             },
         );
     }
@@ -1379,9 +1647,17 @@ impl Ctx {
                 let parent = dest.clone();
                 let operation_dest = dest.clone();
                 let this = this.clone();
-                Self::run_in_thread(
+                this.operation_queue.clone().submit(
                     move || kito_core::mkdir(&operation_dest, &text),
-                    move |result| {
+                    move |outcome| {
+                        let result = match outcome {
+                            Ok(result) => result,
+                            Err(_) => {
+                                this.manager.reload_if_current(&parent);
+                                this.operation_worker_failed();
+                                return;
+                            }
+                        };
                         this.manager.reload_if_current(&parent);
                         let item = OperationItemResult::from_destination_result(
                             "operation-create-folder",
@@ -1431,9 +1707,17 @@ impl Ctx {
                 let parent = dest.clone();
                 let operation_dest = dest.clone();
                 let this = this.clone();
-                Self::run_in_thread(
+                this.operation_queue.clone().submit(
                     move || kito_core::create_file(&operation_dest, &text),
-                    move |result| {
+                    move |outcome| {
+                        let result = match outcome {
+                            Ok(result) => result,
+                            Err(_) => {
+                                this.manager.reload_if_current(&parent);
+                                this.operation_worker_failed();
+                                return;
+                            }
+                        };
                         this.manager.reload_if_current(&parent);
                         let item = OperationItemResult::from_destination_result(
                             "operation-create-file",
@@ -1690,6 +1974,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn undo_records_require_identity_to_survive_the_move() {
+        let before = kito_core::FileIdentity {
+            filesystem: "fs".into(),
+            file: "inode-before".into(),
+        };
+        let same = before.clone();
+        assert_eq!(
+            unchanged_undo_identity(Some(before.clone()), Some(same)),
+            Some(before.clone())
+        );
+
+        let copied = kito_core::FileIdentity {
+            filesystem: "other-fs".into(),
+            file: "new-inode".into(),
+        };
+        assert_eq!(unchanged_undo_identity(Some(before), Some(copied)), None);
+        assert_eq!(unchanged_undo_identity(None, None), None);
+    }
+
+    #[test]
     fn current_bookmark_destination_allows_local_and_remote_gio_locations_only() {
         for uri in ["file:///tmp", "smb://server/share", "sftp://host/home/user"] {
             assert!(current_location_bookmarkable(uri), "{uri}");
@@ -1854,6 +2158,21 @@ mod tests {
         assert!(clip.entries.as_ref().unwrap().cut);
         assert_eq!(clip.published_text.as_deref(), Some(published.as_str()));
         assert_eq!(clip.begin_cut(), Some(op));
+    }
+
+    #[test]
+    fn abandoned_cut_completion_releases_in_flight_state_for_retry() {
+        let mut tracker = ClipTracker::default();
+        tracker.publish(entries(&[A, B], true));
+        let operation = tracker.begin_cut().unwrap();
+        let tracker = Rc::new(RefCell::new(tracker));
+
+        drop(CutCompletionGuard::new(tracker.clone(), Some(operation)));
+
+        let tracker = tracker.borrow();
+        assert_eq!(tracker.cut_in_flight, None);
+        assert_eq!(tracker.entries.as_ref().unwrap().uris, vec![A, B]);
+        assert!(tracker.entries.as_ref().unwrap().cut);
     }
 
     #[test]

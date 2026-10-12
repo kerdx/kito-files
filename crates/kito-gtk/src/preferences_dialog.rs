@@ -11,6 +11,16 @@ pub struct PreferencesDialogState {
     pub dialog: adw::PreferencesDialog,
     general_page: adw::PreferencesPage,
     integration_page: adw::PreferencesPage,
+    shortcuts_page: adw::PreferencesPage,
+    shortcuts_group: adw::PreferencesGroup,
+    shortcut_rows: Vec<(
+        adw::ActionRow,
+        gtk::Button,
+        gtk::Button,
+        gtk::Button,
+        &'static str,
+    )>,
+    shortcut_reset_all: gtk::Button,
     status_group: adw::PreferencesGroup,
     status_count_row: adw::SwitchRow,
     status_zoom_row: adw::SwitchRow,
@@ -242,6 +252,92 @@ pub fn present(
     general_page.add(&status_group);
     dialog.add(&general_page);
 
+    let shortcuts_page = adw::PreferencesPage::builder()
+        .title(crate::l10n::tr("prefs-shortcuts"))
+        .icon_name("input-keyboard-symbolic")
+        .build();
+    let shortcuts_group = adw::PreferencesGroup::builder()
+        .title(crate::l10n::tr("prefs-shortcuts-group"))
+        .description(crate::l10n::tr("prefs-shortcuts-note"))
+        .build();
+    let reset_all = gtk::Button::with_label(&crate::l10n::tr("prefs-shortcuts-reset-all"));
+    {
+        let store = store.clone();
+        let weak_group = shortcuts_group.downgrade();
+        reset_all.connect_clicked(move |_| {
+            let result = store.reset_shortcuts();
+            if let Some(group) = weak_group.upgrade() {
+                group.set_description(Some(&match result {
+                    Ok(()) => crate::l10n::tr("prefs-shortcuts-note"),
+                    Err(error) => save_error(&error),
+                }));
+            }
+        });
+    }
+    shortcuts_group.set_header_suffix(Some(&reset_all));
+    let mut shortcut_rows = Vec::new();
+    for binding in crate::shortcuts::CATALOG {
+        let row = adw::ActionRow::builder()
+            .title(crate::l10n::tr(&format!("shortcut-{}", binding.id)))
+            .build();
+        let current = crate::shortcuts::effective(binding, &store.snapshot())
+            .and_then(|accel| {
+                gtk::accelerator_parse(&accel)
+                    .map(|(key, mods)| gtk::accelerator_get_label(key, mods).to_string())
+            })
+            .unwrap_or_else(|| crate::l10n::tr("prefs-shortcuts-disabled"));
+        row.set_subtitle(&current);
+        let edit = gtk::Button::with_label(&crate::l10n::tr("prefs-shortcuts-edit"));
+        let clear = gtk::Button::with_label(&crate::l10n::tr("prefs-shortcuts-clear"));
+        let reset = gtk::Button::with_label(&crate::l10n::tr("prefs-shortcuts-reset"));
+        let store_edit = store.clone();
+        let id = binding.id;
+        edit.connect_clicked(move |button| {
+            let Some(root) = button.root().and_downcast::<gtk::Window>() else {
+                return;
+            };
+            capture_shortcut(&root, store_edit.clone(), id);
+        });
+        let store_clear = store.clone();
+        let id = binding.id;
+        let weak_row = row.downgrade();
+        clear.connect_clicked(move |_| {
+            if let Err(error) = store_clear.disable_shortcut(id) {
+                if let Some(row) = weak_row.upgrade() {
+                    row.set_subtitle(&save_error(&error));
+                }
+            }
+        });
+        let store_reset = store.clone();
+        let id = binding.id;
+        let weak_row = row.downgrade();
+        reset.connect_clicked(move |_| {
+            if let Err(error) = store_reset.set_shortcut(id, None) {
+                if let Some(row) = weak_row.upgrade() {
+                    row.set_subtitle(&save_error(&error));
+                }
+            }
+        });
+        row.add_suffix(&edit);
+        row.add_suffix(&clear);
+        row.add_suffix(&reset);
+        shortcuts_group.add(&row);
+        shortcut_rows.push((row, edit, clear, reset, binding.id));
+    }
+    let weak_rows = shortcut_rows
+        .iter()
+        .map(|(row, _, _, _, id)| (row.downgrade(), *id))
+        .collect::<Vec<_>>();
+    store.subscribe_shortcuts(Rc::new(move |prefs| {
+        for (weak, id) in &weak_rows {
+            if let Some(row) = weak.upgrade() {
+                row.set_subtitle(&shortcut_label(id, &prefs));
+            }
+        }
+    }));
+    shortcuts_page.add(&shortcuts_group);
+    dialog.add(&shortcuts_page);
+
     let integration_page = adw::PreferencesPage::builder()
         .title(crate::l10n::tr("prefs-integration"))
         .icon_name("applications-system-symbolic")
@@ -286,6 +382,10 @@ pub fn present(
         dialog: dialog.clone(),
         general_page,
         integration_page,
+        shortcuts_page,
+        shortcuts_group,
+        shortcut_rows,
+        shortcut_reset_all: reset_all,
         status_group,
         status_count_row,
         status_zoom_row,
@@ -317,6 +417,74 @@ pub fn present(
     dialog.present(Some(window));
 }
 
+fn capture_shortcut(parent: &gtk::Window, store: Rc<PreferenceStore>, id: &'static str) {
+    let dialog = gtk::Window::builder()
+        .title(crate::l10n::tr("prefs-shortcuts-capture-title"))
+        .transient_for(parent)
+        .modal(true)
+        .default_width(360)
+        .default_height(120)
+        .build();
+    let label = gtk::Label::new(Some(&crate::l10n::tr("prefs-shortcuts-capture-note")));
+    label.set_margin_top(24);
+    label.set_margin_bottom(24);
+    label.set_margin_start(18);
+    label.set_margin_end(18);
+    dialog.set_child(Some(&label));
+    let controller = gtk::EventControllerKey::new();
+    let weak = dialog.downgrade();
+    controller.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gtk::gdk::Key::Escape {
+            if let Some(dialog) = weak.upgrade() {
+                dialog.close();
+            }
+            return gtk::glib::Propagation::Stop;
+        }
+        let relevant = modifiers
+            & (gtk::gdk::ModifierType::CONTROL_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SHIFT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK);
+        let printable = key.to_unicode().is_some_and(|c| !c.is_control());
+        if relevant.is_empty() && printable {
+            return gtk::glib::Propagation::Stop;
+        }
+        let accelerator = gtk::accelerator_name(key, relevant).to_string();
+        let Some((parsed_key, parsed_mods)) = gtk::accelerator_parse(&accelerator) else {
+            return gtk::glib::Propagation::Stop;
+        };
+        if !crate::shortcuts::valid_accelerator(&accelerator) {
+            return gtk::glib::Propagation::Stop;
+        }
+        if let Some(conflict) = crate::shortcuts::CATALOG
+            .iter()
+            .filter(|item| item.id != id)
+            .find(|item| {
+                crate::shortcuts::effective(item, &store.snapshot()).is_some_and(|value| {
+                    gtk::accelerator_parse(&value) == Some((parsed_key, parsed_mods))
+                })
+            })
+        {
+            label.set_text(&crate::l10n::tr_with_one(
+                "prefs-shortcuts-conflict",
+                "action",
+                &crate::l10n::tr(&format!("shortcut-{}", conflict.id)),
+            ));
+            return gtk::glib::Propagation::Stop;
+        }
+        if let Err(error) = store.set_shortcut(id, Some(accelerator)) {
+            label.set_text(&save_error(&error));
+            return gtk::glib::Propagation::Stop;
+        }
+        if let Some(dialog) = weak.upgrade() {
+            dialog.close();
+        }
+        gtk::glib::Propagation::Stop
+    });
+    dialog.add_controller(controller);
+    dialog.present();
+}
+
 /// Relabels the open dialog in place without changing the selected values.
 pub fn retranslate(state: &PreferencesDialogState, store: &PreferenceStore) {
     let snapshot = store.snapshot();
@@ -327,6 +495,25 @@ pub fn retranslate(state: &PreferencesDialogState, store: &PreferenceStore) {
     state
         .integration_page
         .set_title(&crate::l10n::tr("prefs-integration"));
+    state
+        .shortcuts_page
+        .set_title(&crate::l10n::tr("prefs-shortcuts"));
+    state
+        .shortcuts_group
+        .set_title(&crate::l10n::tr("prefs-shortcuts-group"));
+    state
+        .shortcuts_group
+        .set_description(Some(&crate::l10n::tr("prefs-shortcuts-note")));
+    state
+        .shortcut_reset_all
+        .set_label(&crate::l10n::tr("prefs-shortcuts-reset-all"));
+    for (row, edit, clear, reset, id) in &state.shortcut_rows {
+        row.set_title(&crate::l10n::tr(&format!("shortcut-{id}")));
+        row.set_subtitle(&shortcut_label(id, &snapshot));
+        edit.set_label(&crate::l10n::tr("prefs-shortcuts-edit"));
+        clear.set_label(&crate::l10n::tr("prefs-shortcuts-clear"));
+        reset.set_label(&crate::l10n::tr("prefs-shortcuts-reset"));
+    }
     state
         .status_group
         .set_title(&crate::l10n::tr("prefs-status-bar"));
@@ -553,6 +740,18 @@ fn terminal_missing(program: &str) -> String {
 
 fn save_error(error: &std::io::Error) -> String {
     crate::l10n::tr_with_one("prefs-save-error", "error", &error.to_string())
+}
+
+fn shortcut_label(id: &str, preferences: &crate::preferences::model::Preferences) -> String {
+    crate::shortcuts::CATALOG
+        .iter()
+        .find(|binding| binding.id == id)
+        .and_then(|binding| crate::shortcuts::effective(binding, preferences))
+        .and_then(|accelerator| {
+            gtk::accelerator_parse(&accelerator)
+                .map(|(key, mods)| gtk::accelerator_get_label(key, mods).to_string())
+        })
+        .unwrap_or_else(|| crate::l10n::tr("prefs-shortcuts-disabled"))
 }
 
 fn save_status(result: std::io::Result<()>) -> String {
