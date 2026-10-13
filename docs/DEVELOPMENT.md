@@ -251,6 +251,18 @@ their completions have run. A closed tab or window is not updated by a later UI
 completion, and this is not a persistence guarantee: quitting or crashing the
 process can still interrupt work.
 
+The internal clipboard tracker is also application-scoped: `main()` passes the
+same tracker to every window `Ctx`. URI lists, cut generations, provider
+identity and MOVE retry-identity guards therefore survive switching windows; a
+cut in one Kito window pasted into another remains a MOVE. The GDK clipboard's
+current content-provider identity, not matching text, identifies Kito's own
+publication. A foreign provider change invalidates the shared internal state,
+and a new publication in any Kito window replaces the prior generation.
+
+The application likewise owns one `JobCenter` and one `OperationQueue`.
+Operations dialogs are per window, but they present the same process-wide job
+registry and work queue.
+
 Job states are `queued`, `running`, `cancelling`, `completed`, `partial`,
 `failed`, `cancelled`. Queued cancellation stays visible and must bypass the
 worker when the FIFO reaches it; its completion still runs to release clipboard
@@ -266,16 +278,74 @@ keeps its records. The Operations dialog (per window, shared registry) lists
 every job with status, sources/destination, progress, a cancel command and
 per-item details. At most 100 terminal jobs are retained; active jobs are never
 evicted. Interrupted GIO copies or moves may leave partial output, but remain
-errors rather than successes; no cleanup is attempted. The error detail
-identifies the target URI and disables blind retry; do not delete it without
-verified ownership. Collision and absent-source errors remain retryable.
-Terminal history is capped at 100, but the pending FIFO remains
-uncapped: submissions are not rejected because each already owns a completion
-and may own clipboard/drop state. Sustained submission faster than processing
-can grow pending memory. This remaining cleanup limitation keeps F08 incomplete. Rename and
+errors rather than successes; no cleanup is attempted. After a failed copy or
+move, the worker checks the selected target without following symlinks. A
+verified-present target is reported by URI and blind retry is withheld. For a
+copy, target `NotFound` preserves the original error and retry remains
+available because the source is not mutated. A move can have side effects on
+both endpoints: GIO may implement it as copy+delete across filesystems. If its
+target lookup returns `NotFound`, the worker also queries the source with
+`NOFOLLOW_SYMLINKS` and `Cancellable::NONE`; retry preserves the original error
+only when this identity and the stable identity captured before `move_` are both
+available and exactly equal. Identity capture uses `NOFOLLOW_SYMLINKS` and the
+job cancellable. `OperationItemResult` retains that identity only for a failed
+MOVE and never displays it. If a backend does not provide a stable identity, the
+initial move is still attempted, but a later source lookup cannot authorize
+retry. A changed, missing or unavailable identity marks the move outcome/source
+status uncertain, reports that the target was not verified present, includes the
+target URI, preserves the original GIO error domain/code, and withholds retry.
+Other target lookup failures likewise report the candidate URI as status unknown
+and withhold retry without claiming it exists. `Exists` is retryable only when
+the target is verified absent and, for a move, the source identity is unchanged.
+A MOVE failure without a pre-operation stable identity is never automatically
+retryable; an initially missing source has no identity to authorize a retry.
+Before a MOVE retry, the worker carries the original URI-to-identity mapping
+and the core compares that identity immediately before `move_`; a missing,
+unavailable or changed identity returns
+`retry withheld: MOVE source identity changed` without calling `move_`. COPY
+retries are unchanged. The internal cut clipboard retains per-source MOVE
+guards after a failure. A stable identity is retained only for an outcome
+classified as retryable; partial, uncertain and identity-changed results become
+`Withheld` and manual Ctrl+V records a failed job without calling `move_`. A
+worker panic or closed result channel makes every URI in that dispatch
+`Unavailable`, since its filesystem outcome is unknown; queue rejection, spawn
+failure and cancellation before start preserve existing guards. Unresolved cut
+entries remain in the clipboard, and retrying a safe subset leaves entries
+outside that subset untouched. This reduces but cannot eliminate the
+path-based TOCTOU interval between the identity query and GIO's `move_`; no
+portable atomic compare-and-move API is available. Do not delete uncertain
+output without verified ownership.
+A fully consumed cut also leaves the system clipboard untouched. `finish_cut`
+keeps an internal tombstone (`uris` empty) instead of clearing the provider,
+because GDK has no atomic compare-and-clear: clearing after the asynchronous
+move could overwrite content another app published meanwhile. The system
+provider can therefore still expose the previously published plain-text URI
+list. That is harmless: the tombstone keeps the same published text, so a later
+paste resolves it as an internal, consumed clipboard and reports an empty
+clipboard (`clip-empty`) without dispatching a MOVE job and without pasting the
+stale URIs as foreign copy data. The decision is taken by `paste_action`, which
+is free of GDK access and covered by unit tests. Kito never empties the system
+clipboard on its own; it only publishes (or replaces) its own provider, and a
+failed publish is reported instead of being declared a successful copy or cut.
+Terminal history is capped at 100. The FIFO accepts at most 128 pending tasks,
+excluding its single running worker. Further submissions are rejected before
+worker start and without acquiring an application hold; their completion still
+runs on the GTK main thread exactly once. Registered jobs finish as `failed`
+without item outcomes, users see a localized queue-full notification, and no
+filesystem mutation or undo invalidation occurs. Clipboard and drop completions
+still run their cleanup on rejection. Automatic cleanup of partial output is
+deliberately not attempted: GIO does not provide a portable ownership guarantee
+that makes deleting an uncertain path safe across backends. Preserve and report
+uncertain output instead. Rename and
 short creation actions are outside the F08 job center. Worker panics and spawn failures mark the job failed without
 implying per-element outcomes, and undo history invalidation rules stay
 exactly the ones in `operation_queue.rs`.
+
+A completion guard also finalizes an active job as `failed` if its completion
+callback returns or unwinds before recording a terminal outcome. It preserves
+any terminal status already recorded; worker failures finalized before the
+callback do not trigger a second notification. The queue's application hold
+continues to cover this cleanup.
 
 `job_center.rs` regression tests run workers against temporary directories
 (cancel-in-flight, full success) and classified cancellations without touching

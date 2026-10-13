@@ -80,15 +80,16 @@ pub(crate) enum WorkerFailure {
     ChannelClosed,
     SpawnFailed,
     CancelledBeforeStart,
+    QueueFull,
 }
 
 type Task = Box<dyn FnOnce(Rc<OperationQueue>)>;
 
+pub(crate) const MAX_PENDING_TASKS: usize = 128;
+
 /// One application-wide serializer. Jobs run on worker threads, but each
 /// completion runs on the GTK thread before the next worker is started.
-/// The pending FIFO is intentionally uncapped: rejecting an already-submitted
-/// mutation would need to run its domain-specific completion/cleanup callback.
-/// Sustained submission faster than completion can therefore grow this queue.
+/// The pending FIFO is capped independently of its single running worker.
 #[derive(Default)]
 pub(crate) struct OperationQueue {
     pending: RefCell<VecDeque<Task>>,
@@ -208,6 +209,15 @@ impl OperationQueue {
     ) where
         R: Send + 'static,
     {
+        // Reject before acquiring an application hold or touching the worker
+        // pump. Completion still runs on the caller (GTK main) thread so
+        // domain-specific cleanup is never silently skipped.
+        if self.pending.borrow().len() >= MAX_PENDING_TASKS {
+            if catch_unwind(AssertUnwindSafe(|| done(Err(WorkerFailure::QueueFull)))).is_err() {
+                eprintln!("Kito full-queue completion callback panicked");
+            }
+            return;
+        }
         // Pending work must also prevent application shutdown, not only the
         // worker currently at the head of the FIFO.
         let application_hold = self.acquire_application_hold();
@@ -271,7 +281,10 @@ impl OperationQueue {
     }
 
     fn invalidate_for_worker_failure(&self, failure: &WorkerFailure) {
-        if !matches!(failure, WorkerFailure::SpawnFailed | WorkerFailure::CancelledBeforeStart) {
+        if !matches!(
+            failure,
+            WorkerFailure::SpawnFailed | WorkerFailure::CancelledBeforeStart | WorkerFailure::QueueFull
+        ) {
             self.invalidate_undo();
         }
     }
@@ -534,6 +547,107 @@ mod tests {
                 assert_eq!(queue.active_application_holds(), 0);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn pending_fifo_is_bounded_and_rejected_completion_runs_on_main_thread() {
+        let context = MainContext::new();
+        context.with_thread_default(|| {
+            let queue = Rc::new(OperationQueue::default());
+            queue.set_application(gio::Application::new(
+                Some("it.kito.KitoFiles.BoundedQueueTest"),
+                gio::ApplicationFlags::NON_UNIQUE,
+            ));
+            queue.push_undo(test_record("preserved"));
+            let center = crate::job_center::JobCenter::new();
+            let (overflow_job, _) = center.begin_job(
+                "operation-copy",
+                vec!["file:///overflow-source".into()],
+                Some("file:///destination".into()),
+            );
+            let gate = Arc::new(AtomicBool::new(false));
+            let worker_started = Arc::new(AtomicBool::new(false));
+            let worker_count = Arc::new(AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let main_thread = std::thread::current().id();
+
+            queue.submit(
+                {
+                    let gate = gate.clone();
+                    let started = worker_started.clone();
+                    let count = worker_count.clone();
+                    move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        started.store(true, Ordering::Release);
+                        while !gate.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                },
+                |_| {},
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !worker_started.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "gate worker did not start");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            for id in 0..MAX_PENDING_TASKS {
+                let events_worker = events.clone();
+                let count = worker_count.clone();
+                queue.submit(
+                    move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        events_worker.lock().unwrap().push(id);
+                    },
+                    {
+                        let events_done = events.clone();
+                        move |result| {
+                            result.unwrap();
+                            events_done.lock().unwrap().push(MAX_PENDING_TASKS + id);
+                        }
+                    },
+                );
+            }
+            assert_eq!(queue.pending.borrow().len(), MAX_PENDING_TASKS);
+            assert_eq!(queue.active_application_holds(), MAX_PENDING_TASKS + 1);
+
+            let rejected_called = Rc::new(Cell::new(0));
+            let rejected_called_cb = rejected_called.clone();
+            let failed_job = overflow_job.clone();
+            let center_for_rejection = center.clone();
+            let marker = Arc::new(AtomicBool::new(false));
+            let marker_worker = marker.clone();
+            queue.submit(
+                move || marker_worker.store(true, Ordering::Release),
+                move |result| {
+                    assert_eq!(std::thread::current().id(), main_thread);
+                    assert!(matches!(result, Err(WorkerFailure::QueueFull)));
+                    center_for_rejection.finish_worker_failure(&failed_job);
+                    rejected_called_cb.set(rejected_called_cb.get() + 1);
+                },
+            );
+            assert_eq!(rejected_called.get(), 1);
+            assert_eq!(overflow_job.status(), crate::job_center::JobStatus::Failed);
+            assert!(overflow_job.items_summary().is_empty());
+            assert_eq!(worker_count.load(Ordering::SeqCst), 1);
+            assert!(!marker.load(Ordering::Acquire));
+            assert_eq!(queue.active_application_holds(), MAX_PENDING_TASKS + 1);
+
+            gate.store(true, Ordering::Release);
+            drive_until_idle(&context, &queue);
+            assert_eq!(worker_count.load(Ordering::SeqCst), MAX_PENDING_TASKS + 1);
+            assert!(!marker.load(Ordering::Acquire));
+            assert_eq!(queue.active_application_holds(), 0);
+            let undo = queue.begin_undo().expect("queue full must preserve undo");
+            queue.finish_undo(undo.id, false);
+            let observed = events.lock().unwrap();
+            let expected = (0..MAX_PENDING_TASKS)
+                .flat_map(|id| [id, MAX_PENDING_TASKS + id])
+                .collect::<Vec<_>>();
+            assert_eq!(*observed, expected);
+        })
+        .unwrap();
     }
 
     #[test]

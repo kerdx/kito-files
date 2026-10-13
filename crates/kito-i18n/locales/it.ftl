@@ -160,6 +160,7 @@ clip-empty = Appunti vuoti
 clip-changed = Appunti modificati, riprova
 clip-moving = Spostamento già in corso
 clip-nofiles = Gli appunti non contengono file
+clip-publish-failed = Impossibile pubblicare negli appunti
 pasted-items =
     { $count ->
         [one] Incollato { $count } elemento
@@ -232,6 +233,7 @@ operation-create-folder = Creazione cartella
 operation-create-file = Creazione file
 operation-result-title = Risultato dell’operazione
 operation-worker-failed = Impossibile completare l’operazione sui file in sicurezza. Controlla i file interessati.
+operation-queue-full = La coda delle operazioni è piena; riprova più tardi.
 operation-result-success = { $operation }: { $count ->
     [one] completato un elemento.
    *[other] completati { $count } elementi.

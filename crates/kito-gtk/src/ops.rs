@@ -2,7 +2,7 @@
 //! Mutations use the application-wide FIFO on a worker; read-only background
 //! work uses the regular helper. Results return to GTK for toast + reload.
 
-use crate::job_center::{JobCenter, JobItemState};
+use crate::job_center::{JobCenter, JobCompletionGuard, JobItemState};
 use crate::operation_queue::{OperationQueue, UndoRecord, UndoStartError};
 use crate::preferences::PreferenceStore;
 use crate::tabs::TabManager;
@@ -10,8 +10,12 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 #[derive(Clone, Default)]
@@ -20,14 +24,35 @@ pub struct Clipboard {
     pub cut: bool,
 }
 
+/// A previously failed cut may be retried only with the object identity
+/// captured before its first MOVE. `Unavailable` is an explicit fail-closed
+/// policy, not the absence of a prior failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MoveIdentityGuard {
+    Stable(kito_core::FileIdentity),
+    /// A known partial, uncertain or otherwise non-retryable MOVE result.
+    /// Keep its diagnostic marker and never attempt another move from Ctrl+V.
+    Withheld(String),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CutDispatch {
+    generation: u64,
+    uris: Vec<String>,
+    identity_guards: HashMap<String, MoveIdentityGuard>,
+}
+
 /// Outcome of applying a finished cut: what the completion may do
 /// with the system clipboard (only when it still belongs to the op).
 #[derive(Debug, PartialEq)]
 enum CutFinish {
-    /// Everything moved: state consumed, caller clears the system
-    /// clipboard so the moved-away URIs cannot be pasted again.
+    /// Everything moved: internal state consumed. GDK has no atomic
+    /// compare-and-clear, so the published text remains rather than risking
+    /// replacing a foreign provider which raced the asynchronous move.
     Consumed,
-    /// Some entries failed: only they are kept for retry.
+    /// Some entries failed or were not part of this dispatch: unresolved
+    /// cut entries remain in the internal clipboard.
     Partial,
     /// Clipboard moved on meanwhile: leave the new state alone.
     Untouched,
@@ -47,6 +72,64 @@ enum PasteDecision {
     Unsupported,
 }
 
+/// What the UI must do for a resolved paste, including the tracker
+/// interaction. Free of GDK and widgets so the consumed-cut tombstone, the
+/// refusal of a concurrent move and the tracker borrow discipline are
+/// testable.
+#[derive(Debug, PartialEq)]
+enum PasteAction {
+    /// Show this localized message; start no job.
+    Explain(&'static str),
+    /// Paste these URIs as copies; never move.
+    Copy(Vec<String>),
+    /// Start this cut move.
+    Move(CutDispatch),
+    /// A move for this generation is already running.
+    MoveRefused,
+}
+
+fn paste_action(
+    clipboard: &RefCell<ClipTracker>,
+    decision: &PasteDecision,
+    text: Option<&str>,
+) -> PasteAction {
+    match decision {
+        PasteDecision::Stale => PasteAction::Explain("clip-changed"),
+        PasteDecision::Internal { uris, cut: true } if uris.is_empty() => {
+            // A successfully moved cut keeps a consumed tombstone because
+            // the system provider may still hold its published URI text.
+            // Those items are gone: explain the empty clipboard instead of
+            // dispatching another MOVE job for them.
+            PasteAction::Explain("clip-empty")
+        }
+        PasteDecision::Internal { cut: true, .. } => match clipboard.borrow_mut().begin_cut() {
+            Some(dispatch) => PasteAction::Move(dispatch),
+            None => PasteAction::MoveRefused,
+        },
+        PasteDecision::Internal { uris, cut: false } => PasteAction::Copy(uris.clone()),
+        PasteDecision::External { uris } => PasteAction::Copy(uris.clone()),
+        PasteDecision::Unsupported => {
+            let key = if text.is_none_or(|t| t.trim().is_empty()) {
+                "clip-empty"
+            } else {
+                "clip-nofiles"
+            };
+            PasteAction::Explain(key)
+        }
+    }
+}
+
+/// Toast key for a copy/cut publish attempt. Success is declared only when
+/// the provider really reached the system clipboard: a failed publish never
+/// reports `Copied`/`Cut`, whatever the requested action was.
+fn publish_toast_key(published: bool, cut: bool) -> &'static str {
+    match (published, cut) {
+        (true, false) => "toast-copied",
+        (true, true) => "toast-cut",
+        (false, _) => "clip-publish-failed",
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ItemState {
     Succeeded,
@@ -63,7 +146,15 @@ struct OperationItemResult {
     source: String,
     destination: Option<String>,
     state: ItemState,
+    /// Stable MOVE source identity captured before the first mutation. Kept
+    /// only for retry authorization; never included in user-facing details.
+    retry_identity: Option<kito_core::FileIdentity>,
 }
+
+const MOVE_RETRY_IDENTITY_CHANGED_MARKER: &str =
+    kito_core::MOVE_RETRY_IDENTITY_CHANGED_MARKER;
+const MOVE_RETRY_IDENTITY_UNAVAILABLE_MARKER: &str =
+    "retry withheld: MOVE source identity unavailable";
 
 type RetryHandler = Rc<dyn Fn(Vec<OperationItemResult>)>;
 
@@ -117,12 +208,33 @@ impl OperationItemResult {
 
 /// Cut clipboard state must retain every unsuccessful source, independently
 /// of whether the Operations dialog offers a safe retry for that outcome.
+#[cfg(test)]
 fn failed_cut_uris(results: &[OperationItemResult]) -> Vec<String> {
     results
         .iter()
         .filter(|result| !matches!(result.state, ItemState::Succeeded))
         .map(|result| result.source.clone())
         .collect()
+}
+
+/// Captures only the entries which passed the retry policy. MOVE identities
+/// remain private to this transfer state and are checked again in the worker.
+fn retry_transfer_capture(
+    results: Vec<OperationItemResult>,
+) -> (Vec<String>, HashMap<String, MoveIdentityGuard>) {
+    let mut uris = Vec::new();
+    let mut identities = HashMap::new();
+    for item in results.into_iter().filter(OperationItemResult::needs_retry) {
+        if item.operation == "operation-move" {
+            if let Some(identity) = item.retry_identity {
+                identities
+                    .entry(item.source.clone())
+                    .or_insert(MoveIdentityGuard::Stable(identity));
+            }
+        }
+        uris.push(item.source);
+    }
+    (uris, identities)
 }
 
 fn operation_summary_args(
@@ -167,6 +279,52 @@ struct CapturedTransfer {
     destination: String,
     cut: bool,
     move_with_backend: bool,
+    identity_guards: HashMap<String, MoveIdentityGuard>,
+}
+
+enum MoveIdentityAttempt {
+    Authorized(Option<kito_core::FileIdentity>),
+    Withheld(String),
+}
+
+/// Resolves the worker's MOVE authorization. Fresh moves capture the current
+/// identity; retried moves use only the original guard, and an unavailable
+/// original identity is never upgraded by querying the current path.
+fn move_identity_attempt(
+    uri: &str,
+    guards: &HashMap<String, MoveIdentityGuard>,
+    capture: impl FnOnce() -> Option<kito_core::FileIdentity>,
+) -> MoveIdentityAttempt {
+    match guards.get(uri) {
+        Some(MoveIdentityGuard::Stable(identity)) => {
+            MoveIdentityAttempt::Authorized(Some(identity.clone()))
+        }
+        Some(MoveIdentityGuard::Withheld(marker)) => {
+            MoveIdentityAttempt::Withheld(marker.clone())
+        }
+        Some(MoveIdentityGuard::Unavailable) => {
+            MoveIdentityAttempt::Withheld(MOVE_RETRY_IDENTITY_UNAVAILABLE_MARKER.to_string())
+        }
+        None => MoveIdentityAttempt::Authorized(capture()),
+    }
+}
+
+fn worker_failure_has_unknown_outcome(failure: &crate::operation_queue::WorkerFailure) -> bool {
+    matches!(
+        failure,
+        crate::operation_queue::WorkerFailure::Panicked
+            | crate::operation_queue::WorkerFailure::ChannelClosed
+    )
+}
+
+/// Provider identity is compared as a pointer value so this decision can be
+/// tested without constructing or touching the process clipboard.
+fn clipboard_provider_is_owned(current: Option<usize>, owned: Option<usize>) -> bool {
+    matches!((current, owned), (Some(current), Some(owned)) if current == owned)
+}
+
+fn content_provider_identity(provider: Option<&gdk::ContentProvider>) -> Option<usize> {
+    provider.map(|provider| provider.as_ptr() as usize)
 }
 
 impl DropCompletion {
@@ -229,6 +387,34 @@ impl OperationItemResult {
             source,
             destination,
             state,
+            retry_identity: None,
+        }
+    }
+
+    fn from_move_result(
+        operation: &'static str,
+        source: String,
+        destination_on_error: String,
+        retry_identity: Option<kito_core::FileIdentity>,
+        result: Result<String, glib::Error>,
+    ) -> Self {
+        match result {
+            Ok(destination) => Self::from_destination_result(
+                operation,
+                source,
+                destination_on_error,
+                Ok(destination),
+            ),
+            Err(error) => {
+                let mut item = Self::from_result(
+                    operation,
+                    source,
+                    Some(destination_on_error),
+                    Err(error),
+                );
+                item.retry_identity = retry_identity;
+                item
+            }
         }
     }
 
@@ -244,6 +430,7 @@ impl OperationItemResult {
                 source,
                 destination: Some(destination),
                 state: ItemState::Succeeded,
+                retry_identity: None,
             },
             Err(error) => {
                 Self::from_result(operation, source, Some(destination_on_error), Err(error))
@@ -254,13 +441,15 @@ impl OperationItemResult {
     fn needs_retry(&self) -> bool {
         match &self.state {
             ItemState::Failed(error) | ItemState::Cancelled(error) => {
-                !error.contains("partial copy output may remain at")
+                let safe_error = !error.contains("partial copy output may remain at")
                     && !error.contains("partial move output may remain at")
+                    && !error.contains(MOVE_RETRY_IDENTITY_CHANGED_MARKER);
+                safe_error
+                    && (self.operation != "operation-move" || self.retry_identity.is_some())
             }
             ItemState::Succeeded => false,
         }
     }
-
 }
 
 /// An external MOVE may already have removed its source at the destination.
@@ -324,12 +513,13 @@ pub(crate) struct ClipTracker {
     own_change_pending: bool,
     /// Provider we published with: pointer identity (not text) proves
     /// a `changed` notification is ours.
-    /// Provider we published with: pointer identity (not text) proves
-    /// a `changed` notification is ours.
     our_provider: Option<gdk::ContentProvider>,
-    /// In-flight cut move, bound to its dispatch generation: repeated
-    /// pastes of the same cut refuse to start a concurrent move.
-    cut_in_flight: Option<u64>,
+    /// In-flight cut move, bound to its dispatch generation and URI subset:
+    /// repeated pastes refuse to start a concurrent move, and completion may
+    /// consume only the dispatched entries.
+    cut_in_flight: Option<CutDispatch>,
+    /// Identity policy for unresolved cut entries, private to this process.
+    cut_identity_guards: HashMap<String, MoveIdentityGuard>,
 }
 
 impl ClipTracker {
@@ -342,6 +532,8 @@ impl ClipTracker {
         self.published_text = Some(text.clone());
         self.own_change_pending = true;
         self.generation += 1;
+        self.cut_in_flight = None;
+        self.cut_identity_guards.clear();
         text
     }
 
@@ -358,58 +550,192 @@ impl ClipTracker {
         self.entries = None;
         self.published_text = None;
         self.own_change_pending = false;
+        self.our_provider = None;
         self.generation += 1;
+        self.cut_in_flight = None;
+        self.cut_identity_guards.clear();
     }
 
-    /// Starts a cut move: marks this generation in flight so repeated
-    /// pastes cannot duplicate it. Returns the operation generation, or
-    /// `None` when a move for the current state is already running.
-    fn begin_cut(&mut self) -> Option<u64> {
-        self.begin_cut_for(self.generation)
+    /// Starts a cut move for every current entry. Returns its generation,
+    /// URI subset, and any stored identity guards; repeated pastes cannot
+    /// duplicate the same generation while it is in flight.
+    fn begin_cut(&mut self) -> Option<CutDispatch> {
+        let uris = self.entries.as_ref()?.uris.clone();
+        self.begin_cut_for(self.generation, &uris)
     }
 
-    /// Starts a retry only while the internal clipboard still belongs to
-    /// the same cut generation. A newer clipboard can never be moved by an
-    /// old operation's completion dialog.
-    fn begin_cut_for(&mut self, generation: u64) -> Option<u64> {
+    /// Starts a move subset only while the internal clipboard still belongs
+    /// to the same cut generation and contains every requested URI. A newer
+    /// clipboard can never be moved by an old completion dialog.
+    fn begin_cut_for(&mut self, generation: u64, uris: &[String]) -> Option<CutDispatch> {
         if self.generation != generation
-            || !self.entries.as_ref().is_some_and(|entries| entries.cut)
-            || self.cut_in_flight == Some(generation)
+            || !self.entries.as_ref().is_some_and(|entries| {
+                entries.cut && uris.iter().all(|uri| entries.uris.contains(uri))
+            })
+            || uris.is_empty()
+            || self
+                .cut_in_flight
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.generation == generation)
         {
             return None;
         }
-        self.cut_in_flight = Some(generation);
-        Some(generation)
+        let dispatch = CutDispatch {
+            generation,
+            uris: uris.to_vec(),
+            identity_guards: uris
+                .iter()
+                .filter_map(|uri| {
+                    self.cut_identity_guards
+                        .get(uri)
+                        .cloned()
+                        .map(|guard| (uri.clone(), guard))
+                })
+                .collect(),
+        };
+        self.cut_in_flight = Some(dispatch.clone());
+        Some(dispatch)
     }
 
     /// Retires a cut dispatch rejected before it starts, without consuming
     /// clipboard entries. Only the matching operation may clear the mark.
     fn cancel_cut(&mut self, op_generation: u64) {
-        if self.cut_in_flight == Some(op_generation) {
+        if self
+            .cut_in_flight
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.generation == op_generation)
+        {
             self.cut_in_flight = None;
         }
     }
 
+    /// Abandons exactly the dispatch captured by its completion guard. For an
+    /// uncertain outcome, identity guards are invalidated before the in-flight
+    /// mark is retired, but only while the same clipboard generation survives.
+    fn abandon_cut_dispatch(
+        &mut self,
+        op_generation: u64,
+        dispatched_uris: &[String],
+        outcome_unknown: bool,
+    ) {
+        let matches_dispatch = self.cut_in_flight.as_ref().is_some_and(|dispatch| {
+            dispatch.generation == op_generation && dispatch.uris == dispatched_uris
+        });
+        if !matches_dispatch {
+            return;
+        }
+        if outcome_unknown
+            && self.generation == op_generation
+            && self.entries.as_ref().is_some_and(|entries| {
+                entries.cut && dispatched_uris.iter().all(|uri| entries.uris.contains(uri))
+            })
+        {
+            for uri in dispatched_uris {
+                self.cut_identity_guards
+                    .insert(uri.clone(), MoveIdentityGuard::Unavailable);
+            }
+        }
+        self.cut_in_flight = None;
+    }
+
     /// Applies a finished cut move. Always retires a matching in-flight
     /// mark; touches entries only when the clipboard still belongs to
-    /// this operation (same generation): full success consumes the cut,
-    /// partial success keeps just the failed entries, and anything else
-    /// leaves a newer state alone. Never converts to copy.
-    fn finish_cut(&mut self, op_generation: u64, failed_uris: &[String]) -> CutFinish {
-        if self.cut_in_flight == Some(op_generation) {
-            self.cut_in_flight = None;
-        }
+    /// this operation (same generation): successful entries in its subset
+    /// are consumed, failed entries retain their identity policy, and entries
+    /// outside the subset remain unresolved. Never converts to copy.
+    fn finish_cut(&mut self, op_generation: u64, results: &[OperationItemResult]) -> CutFinish {
+        let Some(dispatch) = self
+            .cut_in_flight
+            .as_ref()
+            .filter(|dispatch| dispatch.generation == op_generation)
+            .cloned()
+        else {
+            return CutFinish::Untouched;
+        };
         if self.generation != op_generation {
+            self.cut_in_flight = None;
             return CutFinish::Untouched;
         }
-        if failed_uris.is_empty() {
-            self.entries = None;
-            return CutFinish::Consumed;
+        let Some(entries) = self.entries.as_ref() else {
+            self.cut_in_flight = None;
+            return CutFinish::Untouched;
+        };
+        let results_by_uri: HashMap<_, _> = results
+            .iter()
+            .map(|result| (result.source.as_str(), result))
+            .collect();
+        let mut unresolved = Vec::with_capacity(entries.uris.len());
+        let mut next_identity_guards = self.cut_identity_guards.clone();
+        for uri in &entries.uris {
+            if !dispatch.uris.contains(uri) {
+                unresolved.push(uri.clone());
+                continue;
+            }
+            match results_by_uri.get(uri.as_str()).copied() {
+                Some(result) if matches!(result.state, ItemState::Succeeded) => {
+                    next_identity_guards.remove(uri);
+                }
+                Some(result) => {
+                    let guard = match (result.needs_retry(), result.retry_identity.clone()) {
+                        (true, Some(identity)) => MoveIdentityGuard::Stable(identity),
+                        (false, Some(_)) => {
+                            let marker = match &result.state {
+                                ItemState::Failed(marker) | ItemState::Cancelled(marker) => {
+                                    marker.clone()
+                                }
+                                ItemState::Succeeded => unreachable!("handled above"),
+                            };
+                            MoveIdentityGuard::Withheld(marker)
+                        }
+                        (_, None) => {
+                            // A normal Ctrl+V may have been refused by an
+                            // existing guard. Preserve that more specific
+                            // policy instead of replacing it with Unavailable.
+                            match (
+                                next_identity_guards.get(uri),
+                                &result.state,
+                            ) {
+                                (
+                                    Some(MoveIdentityGuard::Withheld(existing)),
+                                    ItemState::Failed(marker) | ItemState::Cancelled(marker),
+                                ) if marker == existing => {
+                                    MoveIdentityGuard::Withheld(existing.clone())
+                                }
+                                _ => MoveIdentityGuard::Unavailable,
+                            }
+                        }
+                    };
+                    next_identity_guards.insert(uri.clone(), guard);
+                    unresolved.push(uri.clone());
+                }
+                None => {
+                    // A missing worker result cannot prove success or provide
+                    // a safe identity for a future MOVE.
+                    next_identity_guards.insert(uri.clone(), MoveIdentityGuard::Unavailable);
+                    unresolved.push(uri.clone());
+                }
+            }
         }
-        if let Some(entries) = self.entries.as_mut() {
-            entries.uris.retain(|u| failed_uris.contains(u));
+        if unresolved.is_empty() {
+            // Keep a consumed internal tombstone for the published text. If
+            // we interpreted it as foreign URI data on the next paste, a
+            // completed cut could silently turn back into a copy.
+            self.entries = Some(Clipboard {
+                uris: Vec::new(),
+                cut: true,
+            });
+            self.cut_identity_guards.clear();
+            self.cut_in_flight = None;
+            CutFinish::Consumed
+        } else {
+            self.entries
+                .as_mut()
+                .expect("entries checked above")
+                .uris = unresolved;
+            self.cut_identity_guards = next_identity_guards;
+            self.cut_in_flight = None;
+            CutFinish::Partial
         }
-        CutFinish::Partial
     }
 
     /// Synchronous paste hint for menu enablement: true only while internal
@@ -422,12 +748,28 @@ impl ClipTracker {
             .is_some_and(|entries| !entries.uris.is_empty())
     }
 
+    #[cfg(test)]
     fn resolve(&self, text: Option<&str>, read_generation: u64) -> PasteDecision {
-        if read_generation != self.generation {
+        // Existing GDK-free tracker tests model the provider Kito published.
+        self.resolve_with_provider_snapshot(text, read_generation, Some(1), Some(1), Some(1))
+    }
+
+    fn resolve_with_provider_snapshot(
+        &self,
+        text: Option<&str>,
+        read_generation: u64,
+        provider_at_read: Option<usize>,
+        provider_current: Option<usize>,
+        our_provider: Option<usize>,
+    ) -> PasteDecision {
+        if read_generation != self.generation || provider_at_read != provider_current {
             return PasteDecision::Stale;
         }
         match (&self.entries, &self.published_text, text) {
-            (Some(entries), Some(published), Some(current)) if current == published => {
+            (Some(entries), Some(published), Some(current))
+                if clipboard_provider_is_owned(provider_current, our_provider)
+                    && current == published =>
+            {
                 PasteDecision::Internal {
                     uris: entries.uris.clone(),
                     cut: entries.cut,
@@ -452,16 +794,32 @@ impl ClipTracker {
 struct CutCompletionGuard {
     clipboard: Rc<RefCell<ClipTracker>>,
     generation: Option<u64>,
+    dispatched_uris: Vec<String>,
+    worker_started: Arc<AtomicBool>,
+    worker_failure_unknown: Cell<Option<bool>>,
     completed: bool,
 }
 
 impl CutCompletionGuard {
-    fn new(clipboard: Rc<RefCell<ClipTracker>>, generation: Option<u64>) -> Self {
+    fn new(
+        clipboard: Rc<RefCell<ClipTracker>>,
+        generation: Option<u64>,
+        dispatched_uris: Vec<String>,
+        worker_started: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             clipboard,
             generation,
+            dispatched_uris,
+            worker_started,
+            worker_failure_unknown: Cell::new(None),
             completed: false,
         }
+    }
+
+    fn worker_failed(&self, failure: &crate::operation_queue::WorkerFailure) {
+        self.worker_failure_unknown
+            .set(Some(worker_failure_has_unknown_outcome(failure)));
     }
 
     fn complete(&mut self) {
@@ -474,7 +832,15 @@ impl Drop for CutCompletionGuard {
         if !self.completed {
             if let Some(generation) = self.generation {
                 if let Ok(mut clipboard) = self.clipboard.try_borrow_mut() {
-                    clipboard.cancel_cut(generation);
+                    let outcome_unknown = self
+                        .worker_failure_unknown
+                        .get()
+                        .unwrap_or_else(|| self.worker_started.load(Ordering::Acquire));
+                    clipboard.abandon_cut_dispatch(
+                        generation,
+                        &self.dispatched_uris,
+                        outcome_unknown,
+                    );
                 }
             }
         }
@@ -530,7 +896,10 @@ impl Ctx {
         let ours = (|| {
             let current = gdk::Display::default()?.clipboard().content()?;
             let owned = self.clipboard.borrow().our_provider.clone()?;
-            Some(current.as_ptr() == owned.as_ptr())
+            Some(clipboard_provider_is_owned(
+                Some(current.as_ptr() as usize),
+                Some(owned.as_ptr() as usize),
+            ))
         })()
         .unwrap_or(false);
         let mut tracker = self.clipboard.borrow_mut();
@@ -587,6 +956,7 @@ impl Ctx {
             move || queued_cancellable.is_cancelled(),
             move || start_job.start(total_known),
             move |outcome| {
+                let _completion_guard = JobCompletionGuard::new(job_center.clone(), job.clone());
                 let cancelled_before_start = matches!(
                     outcome.as_ref(),
                     Err(crate::operation_queue::WorkerFailure::CancelledBeforeStart)
@@ -730,6 +1100,7 @@ impl Ctx {
                     None,
                     completion,
                     internal && action == crate::dnd::TransferAction::Move,
+                    HashMap::new(),
                 );
             }
         }
@@ -762,8 +1133,15 @@ impl Ctx {
         dialog.present(Some(&self.window));
     }
 
-    fn operation_worker_failed(&self) {
-        self.toast(&crate::l10n::tr("operation-worker-failed"));
+    fn operation_worker_failed(&self, failure: &crate::operation_queue::WorkerFailure) {
+        self.toast(&crate::l10n::tr(if matches!(
+            failure,
+            crate::operation_queue::WorkerFailure::QueueFull
+        ) {
+            "operation-queue-full"
+        } else {
+            "operation-worker-failed"
+        }));
     }
 
     /// Reports one batch once, with expandable per-item details. A retry
@@ -1028,7 +1406,11 @@ impl Ctx {
         self.change_zoom(100);
     }
 
-    /// Ctrl+C / Ctrl+X: internal state + `text/uri-list` for other apps.
+    /// Ctrl+C / Ctrl+X: internal state plus a system publish as a
+    /// newline-separated URI list. The provider wraps a plain string, so
+    /// other apps read the URIs from its text; Kito does not advertise
+    /// `text/uri-list` and never claims a format it does not publish.
+    /// Success is reported only when GDK accepts the provider.
     pub fn copy_selected(&self, cut: bool) {
         let uris: Vec<String> = self
             .manager
@@ -1043,19 +1425,29 @@ impl Ctx {
         // Publish internally first, then to the system clipboard (plain
         // text stays readable by other apps, as before).
         let text = self.clipboard.borrow_mut().publish(Clipboard { uris, cut });
+        let mut published = false;
         if let Some(display) = gdk::Display::default() {
             let clipboard = display.clipboard();
-            clipboard.set_text(&text);
-            self.clipboard.borrow_mut().our_provider = clipboard.content();
+            // A GValue string provider has the same interoperable text
+            // serializers as `Clipboard::set_text`, while letting us record
+            // its identity before GDK emits the changed notification.
+            let provider = gdk::ContentProvider::for_value(&text.to_value());
+            self.clipboard.borrow_mut().our_provider = Some(provider.clone());
+            published = clipboard.set_content(Some(&provider)).is_ok();
+            if !published {
+                // Nothing reached the clipboard: drop the internal state as
+                // well, so it cannot describe content that was never
+                // published. The foreign clipboard stays untouched.
+                let mut tracker = self.clipboard.borrow_mut();
+                tracker.on_external_changed();
+                tracker.our_provider = None;
+            }
         } else {
-            // Nothing published to the system: no owned provider.
-            self.clipboard.borrow_mut().our_provider = None;
+            // No system clipboard to publish to: no owned provider, and
+            // nothing to declare success about.
+            self.clipboard.borrow_mut().on_external_changed();
         }
-        self.toast(&crate::l10n::tr(if cut {
-            "toast-cut"
-        } else {
-            "toast-copied"
-        }));
+        self.toast(&crate::l10n::tr(publish_toast_key(published, cut)));
     }
 
     pub fn paste(&self) {
@@ -1078,47 +1470,73 @@ impl Ctx {
         // against the internal state captured now. A change in between
         // retires this read instead of pasting stale entries.
         let generation = self.clipboard.borrow().generation;
+        let clipboard = display.clipboard();
+        let provider_at_read = clipboard.content();
+        let provider_at_read_id = content_provider_identity(provider_at_read.as_ref());
+        let our_provider_id =
+            content_provider_identity(self.clipboard.borrow().our_provider.as_ref());
+        // Retain the provider across the async read so its pointer identity
+        // cannot be recycled before the callback compares current content.
+        let provider_snapshot = provider_at_read;
+        let clipboard_for_callback = clipboard.clone();
         let this = self.clone();
-        display
-            .clipboard()
-            .read_text_async(gio::Cancellable::NONE, move |result| {
-                let text = result.ok().flatten().map(|s| s.to_string());
-                match this.clipboard.borrow().resolve(text.as_deref(), generation) {
-                    PasteDecision::Stale => this.toast(&crate::l10n::tr("clip-changed")),
-                    PasteDecision::Internal { uris, cut } => {
-                        // Cuts move asynchronously: keep the state until
-                        // completion, and refuse concurrent duplicate moves.
-                        let cut_op = if cut {
-                            match this.clipboard.borrow_mut().begin_cut() {
-                                Some(op_generation) => Some(op_generation),
-                                None => {
-                                    this.toast(&crate::l10n::tr("clip-moving"));
-                                    return;
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        this.paste_uris(uris, cut, dest, cut_op);
-                    }
-                    PasteDecision::External { uris } => {
-                        this.paste_uris(uris, false, dest, None);
-                    }
-                    PasteDecision::Unsupported => {
-                        if text.as_ref().is_none_or(|t| t.trim().is_empty()) {
-                            this.toast(&crate::l10n::tr("clip-empty"));
-                        } else {
-                            this.toast(&crate::l10n::tr("clip-nofiles"));
-                        }
-                    }
+        clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
+            let _provider_snapshot = provider_snapshot;
+            let provider_current = clipboard_for_callback.content();
+            let provider_current_id = content_provider_identity(provider_current.as_ref());
+            let text = result.ok().flatten().map(|s| s.to_string());
+            // The decision is bound first: the tracker borrow ends with
+            // this statement, so the action below can start (or refuse)
+            // a move without holding a shared borrow.
+            let decision = this.clipboard.borrow().resolve_with_provider_snapshot(
+                text.as_deref(),
+                generation,
+                provider_at_read_id,
+                provider_current_id,
+                our_provider_id,
+            );
+            match paste_action(&this.clipboard, &decision, text.as_deref()) {
+                PasteAction::Explain(key) => this.toast(&crate::l10n::tr(key)),
+                PasteAction::Copy(uris) => this.paste_uris(uris, false, dest, None),
+                // Cuts move asynchronously: the tracker keeps the state
+                // until completion and refuses a concurrent duplicate.
+                PasteAction::Move(dispatch) => this.paste_uris_with_identity_guards(
+                    dispatch.uris,
+                    true,
+                    dest,
+                    Some(dispatch.generation),
+                    dispatch.identity_guards,
+                ),
+                PasteAction::MoveRefused => {
+                    this.toast(&crate::l10n::tr("clip-moving"));
                 }
-            });
+            }
+        });
     }
 
     /// Copies (or moves, for a cut) `uris` into `dest`. `cut_op` is the
     /// dispatch generation of a cut move, applied at completion.
     fn paste_uris(&self, uris: Vec<String>, cut: bool, dest: String, cut_op: Option<u64>) {
-        self.paste_uris_with_drop(uris, cut, dest, cut_op, None, cut);
+        self.paste_uris_with_identity_guards(uris, cut, dest, cut_op, HashMap::new());
+    }
+
+    fn paste_uris_with_identity_guards(
+        &self,
+        uris: Vec<String>,
+        cut: bool,
+        dest: String,
+        cut_op: Option<u64>,
+        identity_guards: HashMap<String, MoveIdentityGuard>,
+    ) {
+        self.paste_uris_with_drop(
+            uris,
+            cut,
+            dest,
+            cut_op,
+            None,
+            cut,
+            identity_guards,
+        );
     }
 
     fn paste_uris_with_drop(
@@ -1129,6 +1547,7 @@ impl Ctx {
         cut_op: Option<u64>,
         drop_completion: Option<DropCompletion>,
         move_with_backend: bool,
+        identity_guards: HashMap<String, MoveIdentityGuard>,
     ) {
         if dest == kito_core::FAVORITES_URI {
             self.toast(&crate::l10n::tr("favorites-not-a-folder"));
@@ -1153,6 +1572,7 @@ impl Ctx {
             destination: dest,
             cut,
             move_with_backend: cut && move_with_backend,
+            identity_guards,
         };
         let result_operation = if transfer.cut {
             "operation-move"
@@ -1167,6 +1587,21 @@ impl Ctx {
         // blind retry without attempting unsafe cleanup.
         let this = Rc::new(self.clone());
         let this_rc = this.clone();
+        let worker_started = Arc::new(AtomicBool::new(false));
+        let worker_started_by_job = worker_started.clone();
+        let dispatched_uris = if cut_op.is_some() {
+            transfer.uris.clone()
+        } else {
+            Vec::new()
+        };
+        // Capture before submission: this guard also runs if the queue's
+        // completion wrapper panics before invoking the UI `done` callback.
+        let completion_guard = CutCompletionGuard::new(
+            this.clipboard.clone(),
+            cut_op,
+            dispatched_uris,
+            worker_started,
+        );
         Ctx::submit_job(
             &this_rc,
             result_operation,
@@ -1174,42 +1609,59 @@ impl Ctx {
             Some(transfer.destination.clone()),
             Some(transfer.uris.len() as u64),
             move |cancellable| {
+                worker_started_by_job.store(true, Ordering::Release);
                 let mut results = Vec::with_capacity(transfer.uris.len());
                 let mut undo = Vec::new();
                 for uri in &transfer.uris {
                     let outcome: OperationItemResult = if transfer.move_with_backend {
-                        let identity_before =
-                            kito_core::file_identity_cancellable(uri, cancellable).ok();
-                        match kito_core::move_to_exact_result_cancellable(
-                            uri,
-                            &transfer.destination,
-                            cancellable,
-                        ) {
-                            Ok(target) => {
-                                let identity = unchanged_undo_identity(
-                                    identity_before,
-                                    kito_core::file_identity(&target).ok(),
-                                );
-                                if let Some(identity) = identity {
-                                    undo.push(UndoRecord::Move {
-                                        source: uri.clone(),
-                                        target: target.clone(),
-                                        identity,
-                                    });
-                                }
-                                OperationItemResult::from_destination_result(
+                        match move_identity_attempt(uri, &transfer.identity_guards, || {
+                            kito_core::file_identity_cancellable(uri, cancellable).ok()
+                        }) {
+                            MoveIdentityAttempt::Withheld(marker) => {
+                                OperationItemResult::from_move_result(
                                     result_operation,
                                     uri.clone(),
                                     transfer.destination.clone(),
-                                    Ok(target),
+                                    None,
+                                    Err(glib::Error::new(gio::IOErrorEnum::Failed, &marker)),
                                 )
                             }
-                            Err(error) => OperationItemResult::from_result(
-                                result_operation,
-                                uri.clone(),
-                                Some(transfer.destination.clone()),
-                                Err(error),
-                            ),
+                            MoveIdentityAttempt::Authorized(retry_identity) => {
+                                match kito_core::move_to_exact_result_cancellable_if_identity(
+                                    uri,
+                                    &transfer.destination,
+                                    cancellable,
+                                    retry_identity.as_ref(),
+                                ) {
+                                    Ok(target) => {
+                                        let identity = unchanged_undo_identity(
+                                            retry_identity.clone(),
+                                            kito_core::file_identity(&target).ok(),
+                                        );
+                                        if let Some(identity) = identity {
+                                            undo.push(UndoRecord::Move {
+                                                source: uri.clone(),
+                                                target: target.clone(),
+                                                identity,
+                                            });
+                                        }
+                                        OperationItemResult::from_move_result(
+                                            result_operation,
+                                            uri.clone(),
+                                            transfer.destination.clone(),
+                                            retry_identity.clone(),
+                                            Ok(target),
+                                        )
+                                    }
+                                    Err(error) => OperationItemResult::from_move_result(
+                                        result_operation,
+                                        uri.clone(),
+                                        transfer.destination.clone(),
+                                        retry_identity,
+                                        Err(error),
+                                    ),
+                                }
+                            }
                         }
                     } else {
                         let report_bytes = gio::File::for_uri(uri).query_file_type(
@@ -1256,17 +1708,18 @@ impl Ctx {
                 (results, undo)
             },
             move |this, finished_job, outcome| {
-                let mut cut_guard = CutCompletionGuard::new(this.clipboard.clone(), cut_op);
+                let mut cut_guard = completion_guard;
                 let (results, undo): (Vec<OperationItemResult>, Vec<UndoRecord>) = match outcome {
                     Ok(result) => result,
                     Err(failure) => {
+                        cut_guard.worker_failed(&failure);
                         drop(cut_guard);
                         this.manager.reload_if_current(&retry_dest);
                         if let Some(completion) = &drop_completion {
                             completion.finish(&[]);
                         }
                         if !is_queued_cancellation(&failure) {
-                            this.operation_worker_failed();
+                            this.operation_worker_failed(&failure);
                         }
                         return;
                     }
@@ -1283,15 +1736,11 @@ impl Ctx {
                         .collect(),
                 );
                 let cut_finish = cut_op.map(|op_generation| {
-                    let failed_uris = failed_cut_uris(&results);
                     this.clipboard
                         .borrow_mut()
-                        .finish_cut(op_generation, &failed_uris)
+                        .finish_cut(op_generation, &results)
                 });
                 cut_guard.complete();
-                if cut_finish == Some(CutFinish::Consumed) {
-                    this.clear_system_clipboard();
-                }
                 this.manager.reload_if_current(&retry_dest);
                 if let Some(completion) = &drop_completion {
                     completion.finish(&results);
@@ -1301,11 +1750,19 @@ impl Ctx {
                         (Some(op_generation), Some(CutFinish::Partial)) => {
                             let this = this.clone();
                             Some(Rc::new(move |failed: Vec<OperationItemResult>| {
-                                let uris = failed.into_iter().map(|item| item.source).collect();
-                                let next_op =
-                                    this.clipboard.borrow_mut().begin_cut_for(op_generation);
-                                if let Some(next_op) = next_op {
-                                    this.paste_uris(uris, true, retry_dest.clone(), Some(next_op));
+                                let (uris, _) = retry_transfer_capture(failed);
+                                let next_op = this
+                                    .clipboard
+                                    .borrow_mut()
+                                    .begin_cut_for(op_generation, &uris);
+                                if let Some(dispatch) = next_op {
+                                    this.paste_uris_with_identity_guards(
+                                        dispatch.uris,
+                                        true,
+                                        retry_dest.clone(),
+                                        Some(dispatch.generation),
+                                        dispatch.identity_guards,
+                                    );
                                 } else {
                                     this.toast(&crate::l10n::tr("clip-changed"));
                                 }
@@ -1314,8 +1771,15 @@ impl Ctx {
                         (None, _) => {
                             let this = this.clone();
                             Some(Rc::new(move |failed: Vec<OperationItemResult>| {
-                                let uris = failed.into_iter().map(|item| item.source).collect();
-                                this.paste_uris(uris, true, retry_dest.clone(), None);
+                                let (uris, retry_identities) =
+                                    retry_transfer_capture(failed);
+                                this.paste_uris_with_identity_guards(
+                                    uris,
+                                    true,
+                                    retry_dest.clone(),
+                                    None,
+                                    retry_identities,
+                                );
                             }))
                         }
                         _ => None,
@@ -1330,17 +1794,6 @@ impl Ctx {
                 this.report_operation(result_operation, results, retry);
             },
         );
-    }
-
-    /// Empties the system clipboard after a fully consumed cut, so the
-    /// moved-away URIs cannot be pasted again. Called only when the
-    /// clipboard still belongs to the completed operation.
-    fn clear_system_clipboard(&self) {
-        if let Some(display) = gdk::Display::default() {
-            let clipboard = display.clipboard();
-            clipboard.set_text("");
-            self.clipboard.borrow_mut().our_provider = clipboard.content();
-        }
     }
 
     pub fn trash_selected(&self) {
@@ -1433,7 +1886,7 @@ impl Ctx {
                             completion.finish(&[]);
                         }
                         if !is_queued_cancellation(&failure) {
-                            this.operation_worker_failed();
+                            this.operation_worker_failed(&failure);
                         }
                         return;
                     }
@@ -1502,6 +1955,7 @@ impl Ctx {
                                 source: uri,
                                 destination: Some(destination),
                                 state: ItemState::Succeeded,
+                                retry_identity: None,
                             }
                         }
                         Err(error) => {
@@ -1531,7 +1985,7 @@ impl Ctx {
                     Err(failure) => {
                         this.manager.reload_if_current(&trash_uri);
                         if !is_queued_cancellation(&failure) {
-                            this.operation_worker_failed();
+                            this.operation_worker_failed(&failure);
                         }
                         return;
                     }
@@ -1613,7 +2067,7 @@ impl Ctx {
                         Err(failure) => {
                             this.manager.reload_if_current(kito_core::TRASH_URI);
                             if !is_queued_cancellation(&failure) {
-                                this.operation_worker_failed();
+                                this.operation_worker_failed(&failure);
                             }
                             return;
                         }
@@ -1700,7 +2154,7 @@ impl Ctx {
                         Err(failure) => {
                             this.manager.reload_if_current(&completion_folder);
                             if !is_queued_cancellation(&failure) {
-                                this.operation_worker_failed();
+                                this.operation_worker_failed(&failure);
                             }
                             return;
                         }
@@ -1914,9 +2368,9 @@ impl Ctx {
                     move |outcome| {
                         let (result, identity) = match outcome {
                             Ok(result) => result,
-                            Err(_) => {
+                            Err(failure) => {
                                 this.manager.reload_if_current(&destination_parent);
-                                this.operation_worker_failed();
+                                this.operation_worker_failed(&failure);
                                 return;
                             }
                         };
@@ -1978,7 +2432,7 @@ impl Ctx {
                 };
                 let result = match outcome {
                     Ok(result) => result,
-                    Err(_) => {
+                    Err(failure) => {
                         this.operation_queue.finish_undo(record.id, false);
                         if let Some(parent) = gio::File::for_uri(&source).parent() {
                             this.manager.reload_if_current(&parent.uri());
@@ -1988,7 +2442,7 @@ impl Ctx {
                         }
                         this.manager.reload_if_current(kito_core::TRASH_URI);
                         this.manager.reload_if_current(kito_core::FAVORITES_URI);
-                        this.operation_worker_failed();
+                        this.operation_worker_failed(&failure);
                         return;
                     }
                 };
@@ -2035,9 +2489,9 @@ impl Ctx {
                     move |outcome| {
                         let result = match outcome {
                             Ok(result) => result,
-                            Err(_) => {
+                            Err(failure) => {
                                 this.manager.reload_if_current(&parent);
-                                this.operation_worker_failed();
+                                this.operation_worker_failed(&failure);
                                 return;
                             }
                         };
@@ -2095,9 +2549,9 @@ impl Ctx {
                     move |outcome| {
                         let result = match outcome {
                             Ok(result) => result,
-                            Err(_) => {
+                            Err(failure) => {
                                 this.manager.reload_if_current(&parent);
-                                this.operation_worker_failed();
+                                this.operation_worker_failed(&failure);
                                 return;
                             }
                         };
@@ -2718,6 +3172,37 @@ mod tests {
     const A: &str = "file:///tmp/A.txt";
     const B: &str = "file:///tmp/B.txt";
 
+    fn finish_cut_with_failed_uris(
+        clip: &mut ClipTracker,
+        op: u64,
+        failed_uris: &[String],
+    ) -> CutFinish {
+        let dispatch = clip.cut_in_flight.as_ref().unwrap().clone();
+        let results = dispatch
+            .uris
+            .iter()
+            .map(|uri| {
+                if failed_uris.contains(uri) {
+                    OperationItemResult::from_move_result(
+                        "operation-move",
+                        uri.clone(),
+                        "file:///tmp/destination".into(),
+                        None,
+                        Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "test failure")),
+                    )
+                } else {
+                    OperationItemResult::from_result(
+                        "operation-move",
+                        uri.clone(),
+                        Some("file:///tmp/destination".into()),
+                        Ok(()),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        clip.finish_cut(op, &results)
+    }
+
     #[test]
     fn captured_group_transfer_is_independent_of_later_selection_changes() {
         let mut selection = vec![A.to_string(), B.to_string()];
@@ -2726,6 +3211,7 @@ mod tests {
             destination: "file:///tmp/destination".into(),
             cut: true,
             move_with_backend: true,
+            identity_guards: HashMap::new(),
         };
         selection.clear();
         selection.push("file:///tmp/other.txt".into());
@@ -2770,19 +3256,287 @@ mod tests {
     }
 
     #[test]
+    fn foreign_clipboard_provider_is_not_authorized_for_mutation() {
+        let our_provider = 0x10usize;
+        let foreign_provider = 0x20usize;
+
+        assert!(clipboard_provider_is_owned(
+            Some(our_provider),
+            Some(our_provider)
+        ));
+        assert!(!clipboard_provider_is_owned(
+            Some(foreign_provider),
+            Some(our_provider)
+        ));
+        assert!(!clipboard_provider_is_owned(None, Some(our_provider)));
+        assert!(!clipboard_provider_is_owned(Some(our_provider), None));
+
+        // Model the decision without constructing a display or mutating the
+        // process clipboard: a foreign provider must leave its text untouched.
+        let foreign_text = B.to_string();
+        let mut simulated_clipboard_text = foreign_text.clone();
+        if clipboard_provider_is_owned(Some(foreign_provider), Some(our_provider)) {
+            simulated_clipboard_text.clear();
+        }
+        assert_eq!(simulated_clipboard_text, foreign_text);
+    }
+
+    #[test]
+    fn paste_resolution_requires_the_same_owned_provider_as_the_async_read() {
+        let mut tracker = ClipTracker::default();
+        let published = tracker.publish(entries(&[A], true));
+        let generation = tracker.generation;
+        let owned_provider = 0x10usize;
+
+        let internal = tracker.resolve_with_provider_snapshot(
+            Some(&published),
+            generation,
+            Some(owned_provider),
+            Some(owned_provider),
+            Some(owned_provider),
+        );
+        assert_eq!(
+            internal,
+            PasteDecision::Internal {
+                uris: vec![A.to_string()],
+                cut: true,
+            }
+        );
+
+        // Equal URI text from a foreign provider remains an external COPY;
+        // it cannot dispatch a MOVE against the internal cut tracker.
+        let foreign_provider = 0x20usize;
+        let external = tracker.resolve_with_provider_snapshot(
+            Some(&published),
+            generation,
+            Some(foreign_provider),
+            Some(foreign_provider),
+            Some(owned_provider),
+        );
+        assert_eq!(
+            external,
+            PasteDecision::External {
+                uris: vec![A.to_string()],
+            }
+        );
+        let shared_tracker = RefCell::new(tracker);
+        assert_eq!(
+            paste_action(&shared_tracker, &external, Some(&published)),
+            PasteAction::Copy(vec![A.to_string()])
+        );
+        assert!(shared_tracker.borrow().cut_in_flight.is_none());
+
+        // If the provider changes after read_text_async starts, discard its
+        // text entirely, even if that text equals the formerly owned cut.
+        let stale = shared_tracker.borrow().resolve_with_provider_snapshot(
+            Some(&published),
+            generation,
+            Some(owned_provider),
+            Some(foreign_provider),
+            Some(owned_provider),
+        );
+        assert_eq!(stale, PasteDecision::Stale);
+        assert_eq!(
+            paste_action(&shared_tracker, &stale, Some(&published)),
+            PasteAction::Explain("clip-changed")
+        );
+        assert!(shared_tracker.borrow().cut_in_flight.is_none());
+        assert_eq!(shared_tracker.borrow().entries.as_ref().unwrap().uris, vec![A]);
+    }
+
+    #[test]
     fn successful_move_consumes_cut() {
         let mut clip = ClipTracker::default();
         let published = clip.publish(entries(&[A, B], true));
         clip.on_own_changed();
-        let op = clip.begin_cut().expect("first move dispatches");
-        assert_eq!(clip.finish_cut(op, &[]), CutFinish::Consumed);
-        // Consumed: no retry, not even from the old text.
+        let op = clip.begin_cut().expect("first move dispatches").generation;
+        assert_eq!(finish_cut_with_failed_uris(&mut clip, op, &[]), CutFinish::Consumed);
+        // The old URI text remains published, but resolves to an empty
+        // internal tombstone instead of falling back to a foreign copy.
         assert_eq!(
             clip.resolve(Some(&published), clip.generation),
-            PasteDecision::External {
-                uris: vec![A.to_string(), B.to_string()]
+            PasteDecision::Internal {
+                uris: Vec::new(),
+                cut: true,
             }
         );
+        assert_eq!(clip.published_text.as_deref(), Some(published.as_str()));
+        assert!(!clip.has_usable_entries());
+        assert_eq!(clip.begin_cut(), None);
+    }
+
+    /// Regression: after a completed cut the system provider may still
+    /// publish the old URI text (Kito never empties a clipboard it cannot
+    /// claim). Resolving that tombstone must explain an empty clipboard and
+    /// must not start a MOVE job or dispatch anything.
+    #[test]
+    fn completed_cut_tombstone_plans_empty_clipboard_instead_of_a_move() {
+        let mut clip = ClipTracker::default();
+        let published = clip.publish(entries(&[A, B], true));
+        clip.on_own_changed();
+        let op = clip.begin_cut().expect("first move dispatches").generation;
+        assert_eq!(
+            finish_cut_with_failed_uris(&mut clip, op, &[]),
+            CutFinish::Consumed
+        );
+        let clipboard = RefCell::new(clip);
+
+        let decision = clipboard
+            .borrow()
+            .resolve(Some(&published), clipboard.borrow().generation);
+        assert!(matches!(
+            &decision,
+            PasteDecision::Internal { uris, cut: true } if uris.is_empty()
+        ));
+        assert_eq!(
+            paste_action(&clipboard, &decision, Some(&published)),
+            PasteAction::Explain("clip-empty")
+        );
+        // Nothing was dispatched and nothing can be: the tombstone is never
+        // reinterpreted as foreign copy data nor as a new cut.
+        assert!(clipboard.borrow().cut_in_flight.is_none());
+        assert_eq!(clipboard.borrow_mut().begin_cut(), None);
+        assert!(!clipboard.borrow().has_usable_entries());
+    }
+
+    #[test]
+    fn live_cut_dispatches_one_move_while_copy_plans_copies() {
+        let clipboard = RefCell::new(ClipTracker::default());
+        let cut_text = clipboard.borrow_mut().publish(entries(&[A], true));
+        let generation = clipboard.borrow().generation;
+        let decision = clipboard.borrow().resolve(Some(&cut_text), generation);
+        let action = paste_action(&clipboard, &decision, Some(&cut_text));
+        assert!(matches!(
+            &action,
+            PasteAction::Move(dispatch)
+                if dispatch.generation == generation && dispatch.uris == vec![A.to_string()]
+        ));
+        // While that move runs, the same text resolves to a refusal instead
+        // of a second dispatch, and the tracker stays mutably reachable.
+        let decision = clipboard.borrow().resolve(Some(&cut_text), generation);
+        assert_eq!(
+            paste_action(&clipboard, &decision, Some(&cut_text)),
+            PasteAction::MoveRefused
+        );
+        assert!(clipboard.borrow().cut_in_flight.is_some());
+
+        let copy_text = clipboard.borrow_mut().publish(entries(&[B], false));
+        let decision = clipboard
+            .borrow()
+            .resolve(Some(&copy_text), clipboard.borrow().generation);
+        assert!(matches!(
+            paste_action(&clipboard, &decision, Some(&copy_text)),
+            PasteAction::Copy(uris) if uris == vec![B.to_string()]
+        ));
+    }
+
+    #[test]
+    fn cut_clipboard_is_shared_between_windows_and_new_publish_stales_old_guard() {
+        // These handles model the `Ctx` stored by two windows. A failed first
+        // MOVE retains its original identity for a retry from the other one.
+        let shared = Rc::new(RefCell::new(ClipTracker::default()));
+        let window_a_clipboard = shared.clone();
+        let window_b_clipboard = shared.clone();
+        let published_text = window_a_clipboard
+            .borrow_mut()
+            .publish(entries(&[A], true));
+        let generation = window_a_clipboard.borrow().generation;
+        let first_dispatch = window_a_clipboard.borrow_mut().begin_cut().unwrap();
+        let original_identity = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "original-object".into(),
+        };
+        let first_failure = OperationItemResult::from_move_result(
+            "operation-move",
+            A.to_string(),
+            "file:///tmp/destination".into(),
+            Some(original_identity.clone()),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "retryable failure",
+            )),
+        );
+        assert_eq!(
+            window_a_clipboard
+                .borrow_mut()
+                .finish_cut(first_dispatch.generation, &[first_failure]),
+            CutFinish::Partial
+        );
+
+        // The second window reads the same system text and resolves it using
+        // the process-wide tracker, so it receives a guarded MOVE, not COPY.
+        let decision = window_b_clipboard
+            .borrow()
+            .resolve(Some(&published_text), generation);
+        let PasteAction::Move(retry_dispatch) =
+            paste_action(&window_b_clipboard, &decision, Some(&published_text))
+        else {
+            panic!("a second window must resolve the shared cut as a move");
+        };
+        assert_eq!(retry_dispatch.generation, generation);
+        assert_eq!(retry_dispatch.uris, vec![A]);
+        assert_eq!(
+            retry_dispatch.identity_guards.get(A),
+            Some(&MoveIdentityGuard::Stable(original_identity))
+        );
+
+        // A publication in either window retires the shared generation and
+        // identity policy. A late completion from the prior window cannot
+        // alter the new cut or consume its in-flight dispatch.
+        let replacement_text = window_a_clipboard
+            .borrow_mut()
+            .publish(entries(&[B], true));
+        let replacement_dispatch = window_a_clipboard.borrow_mut().begin_cut().unwrap();
+        assert_ne!(window_b_clipboard.borrow().generation, generation);
+        assert_eq!(
+            window_b_clipboard
+                .borrow()
+                .resolve(Some(&published_text), generation),
+            PasteDecision::Stale
+        );
+        assert!(window_b_clipboard
+            .borrow()
+            .cut_identity_guards
+            .is_empty());
+        assert_eq!(
+            window_b_clipboard.borrow_mut().finish_cut(
+                retry_dispatch.generation,
+                &[OperationItemResult::from_result(
+                    "operation-move",
+                    A.to_string(),
+                    Some("file:///tmp/destination".into()),
+                    Ok(()),
+                )],
+            ),
+            CutFinish::Untouched
+        );
+        let tracker = window_b_clipboard.borrow();
+        assert_eq!(tracker.published_text.as_deref(), Some(replacement_text.as_str()));
+        assert_eq!(tracker.entries.as_ref().unwrap().uris, vec![B]);
+        assert_eq!(tracker.cut_in_flight, Some(replacement_dispatch));
+    }
+
+    /// Regression: a publish rejected by GDK resets the internal state and
+    /// must never declare Copied/Cut. Both catalogs carry the message.
+    #[test]
+    fn failed_clipboard_publish_never_reports_success() {
+        assert_eq!(publish_toast_key(false, false), "clip-publish-failed");
+        assert_eq!(publish_toast_key(false, true), "clip-publish-failed");
+        assert_eq!(publish_toast_key(true, false), "toast-copied");
+        assert_eq!(publish_toast_key(true, true), "toast-cut");
+
+        let mut tracker = ClipTracker::default();
+        tracker.publish(entries(&[A], true));
+        assert!(tracker.has_usable_entries());
+        tracker.on_external_changed();
+        assert!(!tracker.has_usable_entries());
+
+        for lang in [kito_i18n::AppLang::English, kito_i18n::AppLang::Italian] {
+            let i18n = kito_i18n::I18n::new(lang, None);
+            let message = i18n.tr("clip-publish-failed");
+            assert_ne!(message, "clip-publish-failed", "missing catalog entry");
+            assert!(!message.is_empty());
+        }
     }
 
     #[test]
@@ -2790,9 +3544,9 @@ mod tests {
         let mut clip = ClipTracker::default();
         let published = clip.publish(entries(&[A, B], true));
         clip.on_own_changed();
-        let op = clip.begin_cut().expect("first move dispatches");
+        let op = clip.begin_cut().expect("first move dispatches").generation;
         assert_eq!(
-            clip.finish_cut(op, &[A.to_string(), B.to_string()]),
+            finish_cut_with_failed_uris(&mut clip, op, &[A.to_string(), B.to_string()]),
             CutFinish::Partial
         );
         // Nothing moved: the next paste retries the full move, never a copy.
@@ -2809,7 +3563,7 @@ mod tests {
     fn rejected_destination_cancels_cut_without_consuming_clipboard() {
         let mut clip = ClipTracker::default();
         let published = clip.publish(entries(&[A, B], true));
-        let op = clip.begin_cut().expect("first move dispatches");
+        let op = clip.begin_cut().expect("first move dispatches").generation;
         assert_eq!(clip.begin_cut(), None);
 
         clip.cancel_cut(op);
@@ -2817,22 +3571,90 @@ mod tests {
         assert_eq!(clip.entries.as_ref().unwrap().uris, vec![A, B]);
         assert!(clip.entries.as_ref().unwrap().cut);
         assert_eq!(clip.published_text.as_deref(), Some(published.as_str()));
-        assert_eq!(clip.begin_cut(), Some(op));
+        assert_eq!(clip.begin_cut().map(|dispatch| dispatch.generation), Some(op));
     }
 
     #[test]
-    fn abandoned_cut_completion_releases_in_flight_state_for_retry() {
+    fn abandoned_cut_completion_marks_only_its_dispatch_unavailable() {
         let mut tracker = ClipTracker::default();
         tracker.publish(entries(&[A, B], true));
-        let operation = tracker.begin_cut().unwrap();
+        let operation = tracker.generation;
+        let identity_a = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "object-a".into(),
+        };
+        let identity_b = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "object-b".into(),
+        };
+        tracker
+            .cut_identity_guards
+            .insert(A.into(), MoveIdentityGuard::Stable(identity_a));
+        tracker
+            .cut_identity_guards
+            .insert(B.into(), MoveIdentityGuard::Stable(identity_b.clone()));
+        let dispatch = tracker.begin_cut_for(operation, &[A.to_string()]).unwrap();
         let tracker = Rc::new(RefCell::new(tracker));
+        let worker_started = Arc::new(AtomicBool::new(true));
 
-        drop(CutCompletionGuard::new(tracker.clone(), Some(operation)));
+        drop(CutCompletionGuard::new(
+            tracker.clone(),
+            Some(operation),
+            dispatch.uris,
+            worker_started,
+        ));
 
         let tracker = tracker.borrow();
         assert_eq!(tracker.cut_in_flight, None);
         assert_eq!(tracker.entries.as_ref().unwrap().uris, vec![A, B]);
         assert!(tracker.entries.as_ref().unwrap().cut);
+        assert_eq!(
+            tracker.cut_identity_guards.get(A),
+            Some(&MoveIdentityGuard::Unavailable)
+        );
+        assert_eq!(
+            tracker.cut_identity_guards.get(B),
+            Some(&MoveIdentityGuard::Stable(identity_b))
+        );
+    }
+
+    #[test]
+    fn cut_completion_guard_does_not_mutate_a_new_clipboard_generation() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let old_generation = clip.generation;
+        let dispatch = clip.begin_cut().unwrap();
+        let tracker = Rc::new(RefCell::new(clip));
+        let guard = CutCompletionGuard::new(
+            tracker.clone(),
+            Some(old_generation),
+            dispatch.uris,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let new_dispatch = {
+            let mut clip = tracker.borrow_mut();
+            clip.publish(entries(&[B], true));
+            clip.cut_identity_guards.insert(
+                B.into(),
+                MoveIdentityGuard::Stable(kito_core::FileIdentity {
+                    filesystem: "new-generation".into(),
+                    file: "object-b".into(),
+                }),
+            );
+            clip.begin_cut().unwrap()
+        };
+        drop(guard);
+
+        let clip = tracker.borrow();
+        assert_ne!(clip.generation, old_generation);
+        assert_eq!(clip.entries.as_ref().unwrap().uris, vec![B]);
+        assert!(matches!(
+            clip.cut_identity_guards.get(B),
+            Some(MoveIdentityGuard::Stable(identity))
+                if identity.filesystem == "new-generation"
+        ));
+        assert_eq!(clip.cut_in_flight, Some(new_dispatch));
     }
 
     #[test]
@@ -2840,10 +3662,10 @@ mod tests {
         let mut clip = ClipTracker::default();
         clip.publish(entries(&[A], true));
         let old_op = clip.generation;
-        assert_eq!(clip.begin_cut(), Some(old_op));
+        assert_eq!(clip.begin_cut().map(|dispatch| dispatch.generation), Some(old_op));
 
         clip.publish(entries(&[B], true));
-        let new_op = clip.begin_cut().expect("new cut can dispatch");
+        let new_op = clip.begin_cut().expect("new cut can dispatch").generation;
         clip.cancel_cut(old_op);
 
         assert_eq!(clip.entries.as_ref().unwrap().uris, vec![B]);
@@ -2856,8 +3678,11 @@ mod tests {
         let mut clip = ClipTracker::default();
         let published = clip.publish(entries(&[A, B], true));
         clip.on_own_changed();
-        let op = clip.begin_cut().expect("first move dispatches");
-        assert_eq!(clip.finish_cut(op, &[B.to_string()]), CutFinish::Partial);
+        let op = clip.begin_cut().expect("first move dispatches").generation;
+        assert_eq!(
+            finish_cut_with_failed_uris(&mut clip, op, &[B.to_string()]),
+            CutFinish::Partial
+        );
         assert_eq!(
             clip.resolve(Some(&published), clip.generation),
             PasteDecision::Internal {
@@ -2867,10 +3692,14 @@ mod tests {
         );
         // The explicit retry stays a move and is bound to the same clipboard
         // generation. A clipboard replacement retires it.
-        assert_eq!(clip.begin_cut_for(op), Some(op));
-        assert_eq!(clip.finish_cut(op, &[B.to_string()]), CutFinish::Partial);
+        let retry = clip.begin_cut_for(op, &[B.to_string()]).unwrap();
+        assert_eq!(retry.generation, op);
+        assert_eq!(
+            finish_cut_with_failed_uris(&mut clip, op, &[B.to_string()]),
+            CutFinish::Partial
+        );
         clip.on_external_changed();
-        assert_eq!(clip.begin_cut_for(op), None);
+        assert_eq!(clip.begin_cut_for(op, &[B.to_string()]), None);
     }
 
     #[test]
@@ -2907,6 +3736,450 @@ mod tests {
             .map(|item| item.source.as_str())
             .collect();
         assert_eq!(retry, vec![B]);
+    }
+
+    #[test]
+    fn retry_transfer_captures_identity_only_for_admitted_move_items() {
+        let identity = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "original-object".into(),
+        };
+        let items = vec![
+            OperationItemResult::from_move_result(
+                "operation-move",
+                A.to_string(),
+                "file:///tmp/dest".into(),
+                Some(identity.clone()),
+                Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "retry")),
+            ),
+            OperationItemResult::from_result(
+                "operation-move",
+                B.to_string(),
+                Some("file:///tmp/dest".into()),
+                Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "no identity")),
+            ),
+            OperationItemResult::from_result(
+                "operation-copy",
+                "file:///tmp/copy.txt".into(),
+                Some("file:///tmp/dest".into()),
+                Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "copy retry")),
+            ),
+            OperationItemResult::from_move_result(
+                "operation-move",
+                "file:///tmp/uncertain.txt".into(),
+                "file:///tmp/dest".into(),
+                Some(identity.clone()),
+                Err(glib::Error::new(
+                    gio::IOErrorEnum::Failed,
+                    MOVE_RETRY_IDENTITY_CHANGED_MARKER,
+                )),
+            ),
+        ];
+
+        let (uris, identities) = retry_transfer_capture(items);
+
+        assert_eq!(uris, vec![A, "file:///tmp/copy.txt"]);
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            identities.get(A),
+            Some(&MoveIdentityGuard::Stable(identity))
+        );
+    }
+
+    #[test]
+    fn cut_retry_subset_preserves_unresolved_item_and_identity_guards() {
+        let identity_a = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "object-a".into(),
+        };
+        let mut clip = ClipTracker::default();
+        let clipboard_text = clip.publish(entries(&[A, B], true));
+        assert_eq!(clipboard_text, format!("{A}\n{B}"));
+        let op = clip.begin_cut().unwrap().generation;
+        let first_results = vec![
+            OperationItemResult::from_move_result(
+                "operation-move",
+                A.to_string(),
+                "file:///tmp/destination".into(),
+                Some(identity_a.clone()),
+                Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "retryable")),
+            ),
+            OperationItemResult::from_move_result(
+                "operation-move",
+                B.to_string(),
+                "file:///tmp/destination".into(),
+                None,
+                Err(glib::Error::new(
+                    gio::IOErrorEnum::Cancelled,
+                    "cancelled; partial move output may remain at file:///tmp/destination/B",
+                )),
+            ),
+        ];
+        assert!(first_results[0].needs_retry());
+        assert!(!first_results[1].needs_retry());
+        assert_eq!(clip.finish_cut(op, &first_results), CutFinish::Partial);
+        assert_eq!(clip.entries.as_ref().unwrap().uris, vec![A, B]);
+        assert_eq!(clip.published_text.as_deref(), Some(clipboard_text.as_str()));
+
+        // A normal Ctrl+V after the first failure carries the stored guard
+        // for A and withholds the partial/uncertain B result.
+        let paste_dispatch = clip.begin_cut().unwrap();
+        assert_eq!(
+            paste_dispatch.identity_guards.get(A),
+            Some(&MoveIdentityGuard::Stable(identity_a.clone()))
+        );
+        assert!(matches!(
+            paste_dispatch.identity_guards.get(B),
+            Some(MoveIdentityGuard::Unavailable)
+        ));
+        assert!(matches!(
+            move_identity_attempt(A, &paste_dispatch.identity_guards, || panic!(
+                "Ctrl+V must not replace the stored identity with a fresh query"
+            )),
+            MoveIdentityAttempt::Authorized(Some(identity)) if identity == identity_a
+        ));
+        assert!(matches!(
+            move_identity_attempt(B, &paste_dispatch.identity_guards, || panic!(
+                "partial output must not trigger a manual Ctrl+V retry"
+            )),
+            MoveIdentityAttempt::Withheld(marker)
+                if marker == MOVE_RETRY_IDENTITY_UNAVAILABLE_MARKER
+        ));
+        clip.cancel_cut(op);
+
+        let (retry_uris, _retry_guards) = retry_transfer_capture(first_results.clone());
+        assert_eq!(retry_uris, vec![A]);
+        let retry_dispatch = clip.begin_cut_for(op, &retry_uris).unwrap();
+        assert_eq!(retry_dispatch.uris, vec![A]);
+        assert_eq!(
+            retry_dispatch.identity_guards.get(A),
+            Some(&MoveIdentityGuard::Stable(identity_a))
+        );
+
+        let retry_success = OperationItemResult::from_result(
+            "operation-move",
+            A.to_string(),
+            Some("file:///tmp/destination".into()),
+            Ok(()),
+        );
+        assert_eq!(clip.finish_cut(op, &[retry_success]), CutFinish::Partial);
+        assert_eq!(clip.entries.as_ref().unwrap().uris, vec![B]);
+        assert!(clip.entries.as_ref().unwrap().cut);
+        assert!(matches!(
+            clip.cut_identity_guards.get(B),
+            Some(MoveIdentityGuard::Unavailable)
+        ));
+        assert!(!clip.cut_identity_guards.contains_key(A));
+        assert!(clip.has_usable_entries(), "unretried cut item stays available");
+
+        let remaining_dispatch = clip.begin_cut().unwrap();
+        assert_eq!(remaining_dispatch.uris, vec![B]);
+        assert!(matches!(
+            move_identity_attempt(B, &remaining_dispatch.identity_guards, || panic!(
+                "Ctrl+V must not retry B with partial output"
+            )),
+            MoveIdentityAttempt::Withheld(marker)
+                if marker == MOVE_RETRY_IDENTITY_UNAVAILABLE_MARKER
+        ));
+        clip.cancel_cut(op);
+    }
+
+    #[test]
+    fn unknown_cut_worker_outcome_marks_only_dispatched_uris_unavailable() {
+        let identity_a = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "object-a".into(),
+        };
+        let identity_b = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "object-b".into(),
+        };
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A, B], true));
+        let op = clip.begin_cut().unwrap().generation;
+        let results = [
+            OperationItemResult::from_move_result(
+                "operation-move",
+                A.to_string(),
+                "file:///tmp/destination".into(),
+                Some(identity_a),
+                Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "retryable")),
+            ),
+            OperationItemResult::from_move_result(
+                "operation-move",
+                B.to_string(),
+                "file:///tmp/destination".into(),
+                Some(identity_b.clone()),
+                Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "retryable")),
+            ),
+        ];
+        assert_eq!(clip.finish_cut(op, &results), CutFinish::Partial);
+
+        let tracker = Rc::new(RefCell::new(clip));
+        for failure in [
+            crate::operation_queue::WorkerFailure::Panicked,
+            crate::operation_queue::WorkerFailure::ChannelClosed,
+        ] {
+            let dispatch = tracker
+                .borrow_mut()
+                .begin_cut_for(op, &[A.to_string()])
+                .unwrap();
+            let guard = CutCompletionGuard::new(
+                tracker.clone(),
+                Some(op),
+                dispatch.uris,
+                Arc::new(AtomicBool::new(false)),
+            );
+            guard.worker_failed(&failure);
+            drop(guard);
+        }
+
+        {
+            let clip = tracker.borrow();
+            assert_eq!(clip.entries.as_ref().unwrap().uris, vec![A, B]);
+            assert_eq!(
+                clip.cut_identity_guards.get(A),
+                Some(&MoveIdentityGuard::Unavailable)
+            );
+            assert_eq!(
+                clip.cut_identity_guards.get(B),
+                Some(&MoveIdentityGuard::Stable(identity_b))
+            );
+        }
+        let denied = tracker
+            .borrow_mut()
+            .begin_cut()
+            .expect("unavailable source stays unresolved");
+        assert!(matches!(
+            move_identity_attempt(A, &denied.identity_guards, || panic!(
+                "an unknown worker result must not capture a replacement identity"
+            )),
+            MoveIdentityAttempt::Withheld(marker)
+                if marker == MOVE_RETRY_IDENTITY_UNAVAILABLE_MARKER
+        ));
+        tracker.borrow_mut().cancel_cut(op);
+    }
+
+    #[test]
+    fn cut_worker_failure_before_start_preserves_prior_identity_guard() {
+        let identity = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "original-object".into(),
+        };
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let op = clip.begin_cut().unwrap().generation;
+        let failure = OperationItemResult::from_move_result(
+            "operation-move",
+            A.to_string(),
+            "file:///tmp/destination".into(),
+            Some(identity.clone()),
+            Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "retryable")),
+        );
+        assert_eq!(clip.finish_cut(op, &[failure]), CutFinish::Partial);
+
+        let tracker = Rc::new(RefCell::new(clip));
+        for failure in [
+            crate::operation_queue::WorkerFailure::SpawnFailed,
+            crate::operation_queue::WorkerFailure::QueueFull,
+            crate::operation_queue::WorkerFailure::CancelledBeforeStart,
+        ] {
+            let dispatch = tracker
+                .borrow_mut()
+                .begin_cut()
+                .expect("failed-before-start cut can be retried");
+            assert_eq!(
+                dispatch.identity_guards.get(A),
+                Some(&MoveIdentityGuard::Stable(identity.clone()))
+            );
+            let guard = CutCompletionGuard::new(
+                tracker.clone(),
+                Some(op),
+                dispatch.uris,
+                Arc::new(AtomicBool::new(false)),
+            );
+            guard.worker_failed(&failure);
+            drop(guard);
+            assert_eq!(
+                tracker.borrow().cut_identity_guards.get(A),
+                Some(&MoveIdentityGuard::Stable(identity.clone()))
+            );
+        }
+        assert!(!worker_failure_has_unknown_outcome(
+            &crate::operation_queue::WorkerFailure::SpawnFailed
+        ));
+    }
+
+    #[test]
+    fn partial_cut_ctrl_v_stays_withheld_and_does_not_capture_identity() {
+        let identity = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "original-object".into(),
+        };
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let op = clip.begin_cut().unwrap().generation;
+        let partial = OperationItemResult::from_move_result(
+            "operation-move",
+            A.to_string(),
+            "file:///tmp/destination".into(),
+            Some(identity),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::Cancelled,
+                "cancelled; partial move output may remain at file:///tmp/destination/A",
+            )),
+        );
+        assert!(!partial.needs_retry());
+        assert_eq!(clip.finish_cut(op, &[partial]), CutFinish::Partial);
+        assert!(matches!(
+            clip.cut_identity_guards.get(A),
+            Some(MoveIdentityGuard::Withheld(marker))
+                if marker.contains("partial move output may remain at")
+        ));
+
+        let dispatch = clip.begin_cut().expect("withheld cut remains on clipboard");
+        assert_eq!(dispatch.uris, vec![A]);
+        assert!(matches!(
+            dispatch.identity_guards.get(A),
+            Some(MoveIdentityGuard::Withheld(marker))
+                if marker.contains("partial move output may remain at")
+        ));
+        let blocked_marker = match move_identity_attempt(
+            A,
+            &dispatch.identity_guards,
+            || panic!("withheld Ctrl+V must not query or upgrade source identity"),
+        ) {
+            MoveIdentityAttempt::Withheld(marker) => marker,
+            MoveIdentityAttempt::Authorized(_) => panic!("partial move must stay withheld"),
+        };
+        assert!(blocked_marker.contains("partial move output may remain at"));
+        let blocked_result = OperationItemResult::from_move_result(
+            "operation-move",
+            A.to_string(),
+            "file:///tmp/destination".into(),
+            None,
+            Err(glib::Error::new(
+                gio::IOErrorEnum::Failed,
+                &blocked_marker,
+            )),
+        );
+        assert_eq!(clip.finish_cut(op, &[blocked_result]), CutFinish::Partial);
+        assert_eq!(clip.entries.as_ref().unwrap().uris, vec![A]);
+        assert!(matches!(
+            clip.cut_identity_guards.get(A),
+            Some(MoveIdentityGuard::Withheld(marker)) if marker == &blocked_marker
+        ));
+
+        let (retry_uris, _) = retry_transfer_capture(vec![OperationItemResult::from_move_result(
+            "operation-move",
+            A.to_string(),
+            "file:///tmp/destination".into(),
+            Some(kito_core::FileIdentity {
+                filesystem: "test-filesystem".into(),
+                file: "original-object".into(),
+            }),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::Cancelled,
+                "cancelled; partial move output may remain at file:///tmp/destination/A",
+            )),
+        )]);
+        assert!(retry_uris.is_empty(), "manual retry omits partial moves");
+    }
+
+    #[test]
+    fn identity_changed_cut_is_withheld_from_regular_paste() {
+        let identity = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "original-object".into(),
+        };
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let op = clip.begin_cut().unwrap().generation;
+        let changed = OperationItemResult::from_move_result(
+            "operation-move",
+            A.to_string(),
+            "file:///tmp/destination".into(),
+            Some(identity),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::Failed,
+                MOVE_RETRY_IDENTITY_CHANGED_MARKER,
+            )),
+        );
+
+        assert!(!changed.needs_retry());
+        assert_eq!(clip.finish_cut(op, &[changed]), CutFinish::Partial);
+        assert!(matches!(
+            clip.cut_identity_guards.get(A),
+            Some(MoveIdentityGuard::Withheld(marker))
+                if marker == MOVE_RETRY_IDENTITY_CHANGED_MARKER
+        ));
+        let dispatch = clip.begin_cut().expect("unresolved cut remains on clipboard");
+        assert!(matches!(
+            move_identity_attempt(A, &dispatch.identity_guards, || panic!(
+                "identity-changed source must not be recaptured for Ctrl+V"
+            )),
+            MoveIdentityAttempt::Withheld(marker)
+                if marker == MOVE_RETRY_IDENTITY_CHANGED_MARKER
+        ));
+        assert_eq!(clip.entries.as_ref().unwrap().uris, vec![A]);
+    }
+
+    #[test]
+    fn failed_cut_ctrl_v_refuses_a_replacement_at_the_same_uri() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        let old_source_path = temporary.path().join("old-source.txt");
+        let destination_path = temporary.path().join("destination");
+        std::fs::write(&source_path, b"original object").unwrap();
+        std::fs::create_dir(&destination_path).unwrap();
+        let source_uri = gio::File::for_path(&source_path).uri().to_string();
+        let destination_uri = gio::File::for_path(&destination_path).uri().to_string();
+        let original_identity = kito_core::file_identity(&source_uri).unwrap();
+
+        let mut clip = ClipTracker::default();
+        clip.publish(Clipboard {
+            uris: vec![source_uri.clone()],
+            cut: true,
+        });
+        let op = clip.begin_cut().unwrap().generation;
+        let first_failure = OperationItemResult::from_move_result(
+            "operation-move",
+            source_uri.clone(),
+            destination_uri.clone(),
+            Some(original_identity.clone()),
+            Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "initial failure")),
+        );
+        assert_eq!(clip.finish_cut(op, &[first_failure]), CutFinish::Partial);
+
+        // Keep the original inode alive elsewhere so the replacement cannot
+        // accidentally reuse its identity.
+        std::fs::rename(&source_path, &old_source_path).unwrap();
+        std::fs::write(&source_path, b"replacement object").unwrap();
+        let replacement_identity = kito_core::file_identity(&source_uri).unwrap();
+        assert_ne!(replacement_identity, original_identity);
+
+        let paste_dispatch = clip.begin_cut().unwrap();
+        let expected = match move_identity_attempt(
+            &source_uri,
+            &paste_dispatch.identity_guards,
+            || panic!("Ctrl+V must use the identity captured before the first failure"),
+        ) {
+            MoveIdentityAttempt::Authorized(Some(identity)) => identity,
+            _ => panic!("stable failed-cut identity should authorize a guarded retry"),
+        };
+        let error = kito_core::move_to_exact_result_cancellable_if_identity(
+            &source_uri,
+            &destination_uri,
+            &gio::Cancellable::new(),
+            Some(&expected),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(MOVE_RETRY_IDENTITY_CHANGED_MARKER));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"replacement object");
+        assert_eq!(std::fs::read_dir(&destination_path).unwrap().count(), 0);
+        clip.cancel_cut(op);
     }
 
     #[test]
@@ -2947,7 +4220,7 @@ mod tests {
     }
 
     #[test]
-    fn move_retry_policy_distinguishes_absent_and_partial_output() {
+    fn move_retry_policy_requires_stable_identity_and_excludes_partial_output() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("dest");
         std::fs::create_dir(&dest).unwrap();
@@ -2964,7 +4237,25 @@ mod tests {
             Some(gio::File::for_path(&dest).uri().to_string()),
             Err(missing_error),
         );
-        assert!(missing_result.needs_retry());
+        assert!(missing_result.retry_identity.is_none());
+        assert!(!missing_result.needs_retry());
+
+        let identity = kito_core::FileIdentity {
+            filesystem: "test-filesystem".into(),
+            file: "stable-source".into(),
+        };
+        let retryable = OperationItemResult::from_move_result(
+            "operation-move",
+            "file:///source/item.txt".into(),
+            "file:///tmp/dest".into(),
+            Some(identity.clone()),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "target unavailable before mutation",
+            )),
+        );
+        assert!(retryable.needs_retry());
+        assert_eq!(retryable.retry_identity, Some(identity.clone()));
 
         let partial = dest.join("partial.txt");
         std::fs::write(&partial, b"partial").unwrap();
@@ -2973,21 +4264,34 @@ mod tests {
             gio::IOErrorEnum::Cancelled,
             &format!("cancelled; partial move output may remain at {partial_uri}"),
         );
-        let partial_result = OperationItemResult::from_result(
+        let partial_result = OperationItemResult::from_move_result(
             "operation-move",
             "file:///source/partial.txt".into(),
-            Some(gio::File::for_path(&dest).uri().to_string()),
+            gio::File::for_path(&dest).uri().to_string(),
+            Some(identity.clone()),
             Err(partial_error),
         );
         assert!(!partial_result.needs_retry());
         assert!(partial.exists(), "partial output is reported, never deleted");
+
+        let changed = OperationItemResult::from_move_result(
+            "operation-move",
+            "file:///source/item.txt".into(),
+            "file:///tmp/dest".into(),
+            Some(identity),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::Failed,
+                MOVE_RETRY_IDENTITY_CHANGED_MARKER,
+            )),
+        );
+        assert!(!changed.needs_retry());
     }
 
     #[test]
     fn partial_move_keeps_cut_clipboard_without_becoming_retryable() {
         let mut clip = ClipTracker::default();
         clip.publish(entries(&[A], true));
-        let op = clip.begin_cut().unwrap();
+        let op = clip.begin_cut().unwrap().generation;
         let partial = OperationItemResult::from_result(
             "operation-move",
             A.to_string(),
@@ -2999,9 +4303,30 @@ mod tests {
         );
 
         assert!(!partial.needs_retry());
-        let failed_uris = failed_cut_uris(&[partial]);
-        assert_eq!(clip.finish_cut(op, &failed_uris), CutFinish::Partial);
+        assert_eq!(clip.finish_cut(op, &[partial]), CutFinish::Partial);
         assert!(clip.has_usable_entries());
+    }
+
+    #[test]
+    fn failed_cut_retains_move_without_identity_even_when_retry_is_withheld() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let op = clip.begin_cut().unwrap().generation;
+        let failed = OperationItemResult::from_result(
+            "operation-move",
+            A.to_string(),
+            Some("file:///tmp/dest".into()),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "stable identity unavailable",
+            )),
+        );
+
+        assert!(!failed.needs_retry());
+        assert_eq!(failed_cut_uris(&[failed.clone()]), vec![A]);
+        assert_eq!(clip.finish_cut(op, &[failed.clone()]), CutFinish::Partial);
+        assert!(clip.has_usable_entries());
+        assert_eq!(retry_transfer_capture(vec![failed]).0, Vec::<String>::new());
     }
 
     #[test]
@@ -3034,7 +4359,7 @@ mod tests {
     fn new_publish_during_move_stays_intact() {
         let mut clip = ClipTracker::default();
         let published_a = clip.publish(entries(&[A], true));
-        let op = clip.begin_cut().expect("first move dispatches");
+        let op = clip.begin_cut().expect("first move dispatches").generation;
         // New copy while the old move runs: independent state.
         let published_b = clip.publish(entries(&[B], false));
         clip.on_own_changed();
@@ -3054,7 +4379,7 @@ mod tests {
     fn external_replace_during_move_is_not_restored() {
         let mut clip = ClipTracker::default();
         clip.publish(entries(&[A], true));
-        let op = clip.begin_cut().expect("first move dispatches");
+        let op = clip.begin_cut().expect("first move dispatches").generation;
         clip.on_external_changed();
         assert_eq!(clip.finish_cut(op, &[]), CutFinish::Untouched);
         // Old cut is gone for good: foreign content pastes as copy.
@@ -3071,11 +4396,11 @@ mod tests {
         let mut clip = ClipTracker::default();
         clip.publish(entries(&[A], true));
         clip.on_own_changed();
-        let op = clip.begin_cut().expect("first move dispatches");
+        let op = clip.begin_cut().expect("first move dispatches").generation;
         // Second paste of the same cut: refused, no duplicate move.
         assert_eq!(clip.begin_cut(), None);
         // After completion the guard is released.
-        assert_eq!(clip.finish_cut(op, &[]), CutFinish::Consumed);
+        assert_eq!(finish_cut_with_failed_uris(&mut clip, op, &[]), CutFinish::Consumed);
         clip.publish(entries(&[A], true));
         assert!(clip.begin_cut().is_some());
     }

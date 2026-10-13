@@ -161,6 +161,7 @@ clip-empty = Clipboard is empty
 clip-changed = Clipboard changed, try again
 clip-moving = Move already in progress
 clip-nofiles = Clipboard has no files to paste
+clip-publish-failed = Could not publish to the clipboard
 pasted-items =
     { $count ->
         [one] Pasted { $count } item
@@ -233,6 +234,7 @@ operation-create-folder = Create folder
 operation-create-file = Create file
 operation-result-title = Operation result
 operation-worker-failed = The file operation could not be completed safely. Check the affected files.
+operation-queue-full = Operations queue is full; try again later.
 operation-result-success = { $operation }: { $count ->
     [one] completed one item.
    *[other] completed { $count } items.

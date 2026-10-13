@@ -781,6 +781,7 @@ fn show_about(window: &adw::ApplicationWindow) {
 fn main() -> glib::ExitCode {
     let preferences = PreferenceStore::load();
     let job_center = job_center::JobCenter::new();
+    let clipboard = Rc::new(RefCell::new(ops::ClipTracker::default()));
     l10n::init(kito_i18n::I18n::new(
         preferences.snapshot().language,
         kito_i18n::detect_system(),
@@ -802,6 +803,7 @@ fn main() -> glib::ExitCode {
         let preferences = preferences.clone();
         let operation_queue = operation_queue.clone();
         let job_center = job_center.clone();
+        let clipboard = clipboard.clone();
         move |app| {
             build_window(
                 app,
@@ -809,6 +811,7 @@ fn main() -> glib::ExitCode {
                 preferences.clone(),
                 operation_queue.clone(),
                 job_center.clone(),
+                clipboard.clone(),
             )
         }
     });
@@ -817,6 +820,7 @@ fn main() -> glib::ExitCode {
     app.connect_open({
         let preferences = preferences.clone();
         let operation_queue = operation_queue.clone();
+        let clipboard = clipboard.clone();
         move |app, files, _hint| {
             let mut uris = Vec::new();
             for file in files {
@@ -835,6 +839,7 @@ fn main() -> glib::ExitCode {
                 preferences.clone(),
                 operation_queue.clone(),
                 job_center.clone(),
+                clipboard.clone(),
             );
         }
     });
@@ -858,6 +863,7 @@ fn build_window(
     preferences: Rc<PreferenceStore>,
     operation_queue: Rc<operation_queue::OperationQueue>,
     job_center: Rc<job_center::JobCenter>,
+    clipboard: Rc<RefCell<ops::ClipTracker>>,
 ) {
     load_pathbar_css();
     let window = adw::ApplicationWindow::builder()
@@ -1461,6 +1467,7 @@ fn build_window(
         let preferences = preferences.clone();
         let operation_queue = operation_queue.clone();
         let job_center = job_center.clone();
+        let clipboard = clipboard.clone();
         move |uris| {
             build_window(
                 &app,
@@ -1468,6 +1475,7 @@ fn build_window(
                 preferences.clone(),
                 operation_queue.clone(),
                 job_center.clone(),
+                clipboard.clone(),
             )
         }
     });
@@ -1681,7 +1689,7 @@ fn build_window(
         window: window.clone(),
         manager: manager.clone(),
         toast: toast_overlay.clone(),
-        clipboard: Rc::new(RefCell::new(ops::ClipTracker::default())),
+        clipboard,
         operation_queue,
         job_center: job_center.clone(),
         preferences: preferences.clone(),
@@ -1748,13 +1756,22 @@ fn build_window(
     });
 
     // System clipboard decides what to paste: track ownership changes.
-    // Weak reference: the display outlives the window, no cycle.
+    // Weak Ctx avoids a cycle; explicitly disconnect because the display
+    // outlives this window and its clipboard signal.
     if let Some(display) = gdk::Display::default() {
+        let clipboard = display.clipboard();
         let weak = Rc::downgrade(&ctx);
-        display.clipboard().connect_changed(move |_| {
+        let handler = clipboard.connect_changed(move |_| {
             if let Some(ctx) = weak.upgrade() {
                 ctx.on_clipboard_changed();
             }
+        });
+        let handler = RefCell::new(Some(handler));
+        window.connect_close_request(move |_| {
+            if let Some(handler) = handler.borrow_mut().take() {
+                clipboard.disconnect(handler);
+            }
+            glib::Propagation::Proceed
         });
     }
 

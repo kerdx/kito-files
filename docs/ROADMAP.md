@@ -116,7 +116,7 @@ Kito sono proposte progettuali. Difficoltà indicative, senza stime temporali.
 | F05 | Ordinamento per nome, dimensione, tipo e data, inverso | Presente | 1 | Media |
 | F06 | Zoom delle icone e colonne selezionabili/ordinabili | Presente | 1 | Media |
 | F07 | Scorciatoie complete, focus e accessibilità | Parziale: scorciatoie configurabili | Trasversale | Media |
-| F08 | Centro operazioni, avanzamento e interruzione | Parziale: registro, progressi misurati e cancellazione cooperativa; UI non verificata graficamente, copie parziali segnalate senza cleanup automatico | 2 | Alta |
+| F08 | Centro operazioni, avanzamento e interruzione | Parziale: registro, progressi misurati, cancellazione cooperativa e coda limitata; UI non verificata graficamente | 2 | Alta |
 | F09 | Sostituisci, salta, conserva entrambi, unisci cartelle | Parziale: suffissi | 2 | Alta |
 | F10 | Spostamento affidabile tra filesystem | Parziale | 2 | Alta |
 | F11 | Annulla/ripeti per operazioni reversibili | Parziale: undo rinomina/spostamento/cestino, nessun redo | 2 | Alta |
@@ -363,23 +363,53 @@ di chiudere la fase.
   determinato/indeterminato, annullamento in coda e con worker reale su
   directory temporanee senza Cestino di sessione, successo completo,
   classifica onesta di annullamento e parzialità. La cronologia conserva al massimo
-   100 job terminali, oltre a tutti gli attivi. Una copia o uno spostamento
-   interrotti possono lasciare output parziale: se il target è verificato
-   presente senza seguire symlink, l'errore indica il suo URI e il retry cieco
-   è escluso per quel risultato; collisioni e target assenti conservano l'errore
-   originale e il retry normale. Non c'è cleanup automatico: non cancellare
-   output senza ownership/identità certa.
-  La coda FIFO non ha un limite: il backlog resta illimitato per non rifiutare
-  operazioni già inviate senza eseguirne i completamenti/cleanup.
+  100 job terminali, oltre a tutti gli attivi. Una copia o uno spostamento
+  interrotti possono lasciare output parziale: dopo un errore il worker verifica
+  il target senza seguire symlink. Se è presente, il messaggio ne indica l'URI e
+  il retry cieco è escluso. Per una copia, `NotFound` del target conserva
+  l'errore originale e il retry: la copia non muta la sorgente. GIO può
+  implementare MOVE cross-filesystem come copy+delete, perciò un errore può
+  avere side effect su sorgente e target. Per MOVE, `NotFound` del target
+  consente il retry solo se l'identità stabile catturata prima di `move_` e
+  quella riletta con `NOFOLLOW_SYMLINKS` dopo l'errore (senza cancellable) sono
+  entrambe disponibili ed esattamente uguali. La cattura iniziale usa il
+  cancellable del job; se il backend non fornisce un'identità, MOVE può comunque
+  essere tentato ma il successivo errore non autorizza retry. Identità cambiata,
+  assente o non interrogabile marca l'esito/sorgente come incerto, include URI e
+  codice GIO originale, dichiara che il target non è verificato presente e
+  blocca il retry. Ogni altro errore di lookup del target riporta l'URI candidato
+  e lo stato incerto senza affermare che esista, e impedisce il retry. `Exists`
+  non è un'eccezione: si ritenta solo se il target è provato assente e, per MOVE,
+  l'identità della sorgente è invariata. Un `NotFound` della sorgente verificato
+  prima della scelta del target resta un errore pre-mutazione, ma MOVE non è
+  automaticamente retryable senza identità stabile catturata prima della
+  prima mutazione. L'identità resta nei risultati interni (mai in UI/FTL) e,
+  al Retry, viene confrontata subito prima di `move_`: sorgente mancante,
+  identità indisponibile o cambiata produce `retry withheld: MOVE source identity
+  changed` e non invoca lo spostamento. COPY mantiene la policy di retry
+  esistente. Resta una piccola finestra TOCTOU path-based fra query d'identità e
+  chiamata GIO: non esiste un compare-and-move atomico portabile.
+  Non c'è cleanup automatico: l'ownership del parziale non è
+  dimostrabile uniformemente sui backend GIO, quindi cancellarlo rischierebbe di
+  rimuovere dati estranei.
+  La FIFO ammette al massimo 128 job pending, oltre al singolo worker in
+  esecuzione. Un submit eccedente è rifiutato senza avviare il worker o
+  invalidare undo, ma la completion viene comunque eseguita sul main thread:
+  il job registrato risulta `failed` senza esiti per elemento e l'utente vede
+  un avviso localizzato di coda piena. I flussi clipboard/drop completano il
+  cleanup anche in questo caso.
   Rinomina e creazione breve restano fuori dai job.
   - [x] Test su annullamento in coda, classificazione dei risultati e output
-    parziale di copia/spostamento; il target incompleto è indicato e il retry
-    cieco è escluso.
-  - [ ] Cleanup automatico sicuro dell'output parziale e limite al backlog FIFO.
+    parziale di copia/spostamento; per MOVE l'assenza del target consente retry
+    solo con identità stabile e invariata, ricontrollata prima del Retry; un
+    oggetto sostitutivo non viene spostato. Identità o target incerti bloccano
+    il retry. Resta la finestra TOCTOU fra query e `move_`.
+  - [x] Politica sicura per output parziale: segnalare il target e non ritentare
+    alla cieca; non cancellare output di ownership incerta.
+  - [x] Limite al backlog FIFO (128 pending, worker escluso), con rifiuto e completion visibile.
   - [ ] Verifica grafica Wayland/X11 del centro operazioni:
         stato in tempo reale, annullamento riprodotto a mano, temi e lingue.
-  - [ ] Concorrenza limitata oltre la serializzazione esistente (una mutazione
-        alla volta già implicata dalla coda FIFO; il numero_attivo resta 1).
+  - [x] Concorrenza limitata al worker singolo della FIFO; backlog massimo 128.
   - Stato al `f18b6b3`: esisteva una coda FIFO con worker e journal undo in
     `operation_queue.rs`, che serializza le mutazioni; i risultati strutturati per
     elemento erano gestiti in `ops.rs` (B03), non dal registro dei job. Non ci

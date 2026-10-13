@@ -124,6 +124,15 @@ the selected count.
 - Paste follows the current system clipboard rather than an outdated internal
   selection. Failed cut operations retain the failed items for another move attempt;
   repeated paste cannot dispatch the same cut concurrently
+- Kito windows share the internal clipboard state: cut in one window and paste
+  in another remains a move, including the original identity guard on a safe retry.
+  A foreign clipboard provider change invalidates that state; matching text alone
+  does not make an external clipboard a Kito cut
+- After a fully completed cut, Kito leaves the system clipboard alone instead of
+  emptying it: another app may have published content while the move was running,
+  and clearing could overwrite it. The previously published URI text can therefore
+  still be there; pasting it again reports an empty clipboard, because those items
+  were already moved
 - Name collisions get a safe suffix: `report.txt` → `report (copy).txt`, `report (copy 2).txt`
 - Copying a folder into itself or a subfolder is rejected before creating the
   destination; local destination checks also resolve symbolic links
@@ -141,9 +150,9 @@ the selected count.
   file menus; **New File** opens a separate submenu with icons for each file type
 - The empty-space menu uses the folder and tab where it was opened. Folder
   Properties there ignore any existing file selection without clearing it.
-- **Operations center** — the app menu has an **Operations** entry. Copy, move,
-  trash, restore, delete and empty-trash run as numbered operations that are
-  listed there with their status (queued, running, cancelling, completed,
+- **Operations center** — the app menu has an **Operations** entry shared across
+  all Kito windows. Copy, move, trash, restore, delete and empty-trash run as
+  numbered operations listed there with their status (queued, running, cancelling, completed,
   partial, failed or cancelled), the captured sources and destination, real
   progress when a measurable total exists (attempted items, refined by measured
   current-file bytes for copies), and per-item error details. Each active job
@@ -154,11 +163,42 @@ the selected count.
   or cancelled, never as a plain success. Closing a tab or window does not
   affect a running operation. Interrupted GIO copies or moves can leave partial
   output in the destination, but are reported as errors, never success; no
-  cleanup is attempted. The error details identify the intended target and
-  retry is withheld for that result. Collision and absent-source errors remain
-  retryable. Do not delete partial output unless you have identified it.
-  Automatic safe cleanup of partial output remains a limitation. Rename and
-  short creation actions are not listed as jobs.
+  cleanup is attempted. If a NOFOLLOW lookup verifies the target is present,
+  the error details include its URI and retry is withheld. For a copy, target
+  `NotFound` keeps the original error and allows retry. MOVE may use GIO's
+  cross-filesystem copy+delete fallback, so an error can affect both source and
+  target: retry after target `NotFound` is allowed only if the stable source
+  identity captured before MOVE and the post-error NOFOLLOW identity query (made
+  without a cancellable) are both available and exactly equal. Identity capture
+  uses the job cancellable; if the backend provides no stable identity, MOVE may
+  still be attempted, but a later lookup cannot authorize retry. A changed,
+  missing or unavailable identity marks the move outcome/source status
+  uncertain, notes that the target was not verified present, includes its URI
+  and withholds retry. Other target lookup failures also report an unknown
+  status without asserting the target exists and withhold retry. MOVE failures
+  without a pre-operation stable identity are not automatically retryable;
+  an initially missing source has no identity to authorize a retry. For a
+  retryable MOVE, Retry
+  carries the original identity and checks it again immediately before moving;
+  a missing, unavailable or changed identity withholds retry and does not call
+  the move operation. This identity check cannot eliminate the small path-based
+  race between the check and GIO's move call. `Exists` is retryable only when the
+  target is verified absent and, for MOVE, the source identity is unchanged. Do
+  not delete partial or uncertain output unless you have identified it.
+  Failed cuts remain in Kito's internal clipboard. A stable identity is reused
+  only for outcomes classified as safely retryable. Partial, uncertain or
+  identity-changed outcomes are withheld even on manual Ctrl+V, so they do not
+  start another MOVE; their URIs remain in the cut clipboard. A worker panic or
+  lost result makes the dispatched sources unavailable for further MOVE because
+  its filesystem outcome is unknown. Failures known to happen before a worker
+  starts preserve any existing guard. Retrying a safe subset does not discard
+  unresolved cut items that were not part of that retry.
+  At most 128 operations wait in the FIFO in addition to the one running.
+  Further submissions are rejected without filesystem changes and show a
+  localized “queue is full” notification; their job is listed as failed.
+  The app deliberately does not clean up uncertain partial output automatically;
+  inspect the reported target before removing anything. Rename and short creation
+  actions are not listed as jobs.
 
 **Integration**
 

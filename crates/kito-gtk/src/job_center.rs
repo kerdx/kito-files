@@ -405,7 +405,7 @@ impl JobCenter {
         let total = attempted(succeeded, failed, cancelled);
         job.progress
             .attempted
-            .store((succeeded + failed) as u64, Ordering::Release);
+            .fetch_max((succeeded + failed) as u64, Ordering::AcqRel);
         if !job.progress.has_total.load(Ordering::Acquire) && total > 0 {
             job.progress.files_total.store(total as u64, Ordering::Release);
             job.progress.has_total.store(true, Ordering::Release);
@@ -418,10 +418,26 @@ impl JobCenter {
 
     /// Marks a job failed as a whole (worker panic, spawn failure): the
     /// filesystem outcome is unknown, so no per-element success is implied.
-    pub(crate) fn finish_worker_failure(&self, job: &Arc<Job>) {
-        job.set_status(JobStatus::Failed);
+    /// Returns false when another completion already gave it a terminal state.
+    pub(crate) fn finish_worker_failure(&self, job: &Arc<Job>) -> bool {
+        let mut observed = job.status.load(Ordering::Acquire);
+        loop {
+            if !JobStatus::from_code(observed).is_active() {
+                return false;
+            }
+            match job.status.compare_exchange(
+                observed,
+                JobStatus::Failed.code(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed = actual,
+            }
+        }
         self.prune_history();
         self.notify_changed();
+        true
     }
 
     fn prune_history(&self) {
@@ -468,6 +484,33 @@ impl JobCenter {
         let dialog = build_operations_dialog(self);
         self.track_dialog(dialog.clone());
         dialog.present(Some(parent));
+    }
+}
+
+/// Fails a job if its completion callback exits while it is still active.
+/// The callback may panic before its operation-specific `finish_items`; a
+/// terminal status already recorded by that callback is left untouched.
+pub(crate) struct JobCompletionGuard {
+    center: Rc<JobCenter>,
+    job: Arc<Job>,
+}
+
+impl JobCompletionGuard {
+    pub(crate) fn new(center: Rc<JobCenter>, job: Arc<Job>) -> Self {
+        Self { center, job }
+    }
+}
+
+impl Drop for JobCompletionGuard {
+    fn drop(&mut self) {
+        // Drop can run during callback unwinding. Catch any panic from history
+        // bookkeeping or presenter notification to avoid a double panic; the
+        // status CAS happens first, so the job is still failed if that occurs.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.job.status().is_active() {
+                self.center.finish_worker_failure(&self.job);
+            }
+        }));
     }
 }
 
@@ -767,6 +810,67 @@ mod tests {
         assert_eq!(JobStatus::finish(1, 1, 1), JobStatus::Partial);
     }
 
+    #[test]
+    fn completion_panic_fails_active_job_and_guard_preserves_terminal_status() {
+        let center = JobCenter::new();
+        let (job, _) = center.begin_job("operation-copy", sources(1), None);
+        assert!(job.start(Some(1)));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let center = center.clone();
+            let job = job.clone();
+            move || {
+                let _guard = JobCompletionGuard::new(center, job);
+                panic!("simulated completion callback panic");
+            }
+        }));
+        assert!(panic.is_err());
+        assert_eq!(job.status(), JobStatus::Failed);
+
+        let (completed, _) = center.begin_job("operation-copy", sources(1), None);
+        let guard = JobCompletionGuard::new(center.clone(), completed.clone());
+        center.finish_items(
+            &completed,
+            vec![(completed.sources[0].clone(), JobItemState::Succeeded)],
+        );
+        drop(guard);
+        assert_eq!(completed.status(), JobStatus::Completed);
+
+        let (partial, _) = center.begin_job("operation-copy", sources(2), None);
+        let guard = JobCompletionGuard::new(center.clone(), partial.clone());
+        center.finish_items(
+            &partial,
+            vec![
+                (partial.sources[0].clone(), JobItemState::Succeeded),
+                (
+                    partial.sources[1].clone(),
+                    JobItemState::Failed("incomplete".into()),
+                ),
+            ],
+        );
+        drop(guard);
+        assert_eq!(partial.status(), JobStatus::Partial);
+
+        let (cancelled, _) = center.begin_job("operation-copy", sources(1), None);
+        let guard = JobCompletionGuard::new(center.clone(), cancelled.clone());
+        center.finish_items(
+            &cancelled,
+            vec![(
+                cancelled.sources[0].clone(),
+                JobItemState::Cancelled("stopped".into()),
+            )],
+        );
+        drop(guard);
+        assert_eq!(cancelled.status(), JobStatus::Cancelled);
+
+        let (worker_failed, _) = center.begin_job("operation-copy", sources(1), None);
+        assert!(center.finish_worker_failure(&worker_failed));
+        let guard = JobCompletionGuard::new(center.clone(), worker_failed.clone());
+        assert!(!center.finish_worker_failure(&worker_failed));
+        drop(guard);
+        assert_eq!(worker_failed.status(), JobStatus::Failed);
+    }
+
     /// Queue removal touches only queued jobs: a running job survives a
     /// stale cancel of its ID and is cancellable cooperatively through a
     /// real GIO cancellable.
@@ -894,6 +998,19 @@ mod tests {
         let (fraction, done, total) = job.load_fraction().unwrap();
         assert_eq!((done, total), (2, 4));
         assert_eq!(fraction, 0.5);
+    }
+
+    #[test]
+    fn external_move_already_completed_retains_worker_attempt_progress() {
+        let center = JobCenter::new();
+        let (job, _) = center.begin_job("operation-trash", sources(1), None);
+        job.start(Some(1));
+        job.record_attempt();
+
+        center.finish_items(&job, Vec::new());
+
+        assert_eq!(job.status(), JobStatus::Completed);
+        assert_eq!(job.load_fraction(), Some((1.0, 1, 1)));
     }
 
     #[test]

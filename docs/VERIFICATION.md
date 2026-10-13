@@ -259,18 +259,37 @@ misurata, né è possibile dedurla dai tempi del worker.
 ## F08 — Centro operazioni (2026-10-13, verifica correttiva)
 
 `cargo check --workspace --locked --all-targets` e `cargo test --workspace
---locked -- --skip restore_roundtrip_through_trash` passano: 83 test `kito-core`,
-205 `kito-gtk` e 11 `kito-i18n`; 13 test GTK sono ignorati perché richiedono un
+--locked -- --skip restore_roundtrip_through_trash` passano: 93 test `kito-core`,
+223 `kito-gtk` e 11 `kito-i18n`; 13 test GTK sono ignorati perché richiedono un
 display, e un test core del Cestino di sessione è filtrato. I test workspace
 descritti qui escludono il Cestino reale. Coprono ID e stati, annullamento in
 coda senza worker, completion chiamata, annullamento cooperativo GIO incluso
-restore e query del percorso, progresso per elementi e byte, retry, conservazione
-degli appunti per MOVE parziale e operazioni reali su fixture temporanee.
+restore e query del percorso, progresso per elementi e byte, retry, condivisione
+cross-window degli appunti e delle identity guard, finalizzazione fail-closed di
+una completion panica, e operazioni reali su fixture temporanee.
 `./scripts/check.sh` si
 ferma perché `cargo fmt` non è installato; `cargo clippy --workspace --all-targets`
 è bloccato perché `cargo clippy` non è installato. Stato live,
 annullamento manuale, temi e lingue non sono stati provati né su Wayland né su una
 sessione X11 separata.
+
+Regressioni aggiuntive: `cut_retry_subset_preserves_unresolved_item_and_identity_guards`
+e `failed_cut_ctrl_v_refuses_a_replacement_at_the_same_uri` verificano che i cut
+irrisolti conservino URI e guardie anche dopo un Retry parziale;
+`cut_clipboard_is_shared_between_windows_and_new_publish_stales_old_guard`
+verifica che una seconda finestra risolva un cut condiviso come MOVE con identity
+guard, mentre una nuova publication rende stale la vecchia generazione;
+`completion_panic_fails_active_job_and_guard_preserves_terminal_status` verifica
+che la completion panica lasci il job `Failed`, non sovrascriva stati terminali
+e non notifichi nuovamente un failure worker già registrato;
+`external_move_already_completed_retains_worker_attempt_progress`
+verifica che un MOVE esterno già completato non mostri progresso `0/N`.
+`completed_cut_tombstone_plans_empty_clipboard_instead_of_a_move`,
+`foreign_clipboard_provider_is_not_authorized_for_mutation` e
+`failed_clipboard_publish_never_reports_success` coprono tombstone e ownership
+del provider senza modificare la clipboard reale; `paste_resolution_requires_the_same_owned_provider_as_the_async_read`
+verifica che un provider esterno con testo identico non venga scambiato per il
+cut interno e che i risultati asincroni obsoleti non avviino operazioni.
 
 La cancellazione F08 è cooperativa ai confini delle operazioni GIO: dopo un MOVE
 o Trash riuscito, l'elemento completa il bookkeeping undo (query metadata non
@@ -282,21 +301,58 @@ una mutazione già riuscita.
 |---|---|---|---|---|---|
 | F08-1 | Registro job con ID, stati e contesto catturato immodificabile. | Automatica | Test headless Linux | SUPERATO | `job_ids_are_stable_and_ordered`, `captured_context_is_immutable_after_enqueue`. |
 | F08-2 | Annullamento di un lavoro in coda e di uno attivo in modo cooperativo. | Automatica | Test headless Linux, directory temporanee | SUPERATO | `cancelled_queued_task_skips_worker_and_runs_completion` verifica assenza di side-effect filesystem, callback e job finale `Cancelled`; `running_job_cancels_cooperatively_with_real_files` annulla una copia reale senza perdere la sorgente; il resolver restore controlla una cancellazione anticipata. |
-| F08-3 | Successo completo, parziale e fallito classificati onestamente. | Automatica | Test headless Linux, directory temporanee | SUPERATO | `job_finish_states_never_call_mixed_results_success`, `successful_worker_copy_classifies_completed`, `retry_candidates_exclude_recorded_successes`, `copy_retry_policy_distinguishes_missing_source_from_partial_output`, `move_retry_policy_distinguishes_absent_and_partial_output`, `partial_move_keeps_cut_clipboard_without_becoming_retryable`; nessun test richiede cross-filesystem reale. |
-| F08-4 | Progresso determinato/indeterminato, byte misurati, annullati non completati. | Automatica | Test headless Linux | SUPERATO (logica) | `progress_stays_indeterminate_without_a_reported_total`, `live_attempts_drive_the_progress_fraction`, `copy_byte_progress_refines_the_batch_and_cancelled_items_are_not_complete`; barra non osservata visivamente. |
+| F08-3 | Successo completo, parziale e fallito classificati onestamente. | Automatica | Test headless Linux, directory temporanee | SUPERATO | `job_finish_states_never_call_mixed_results_success`, `successful_worker_copy_classifies_completed`, `retry_candidates_exclude_recorded_successes`, `copy_retry_policy_distinguishes_missing_source_from_partial_output`, `move_retry_policy_requires_stable_identity_and_excludes_partial_output`, `retry_transfer_captures_identity_only_for_admitted_move_items`, `cut_retry_subset_preserves_unresolved_item_and_identity_guards`, `unknown_cut_worker_outcome_marks_only_dispatched_uris_unavailable`, `cut_worker_failure_before_start_preserves_prior_identity_guard`, `partial_cut_ctrl_v_stays_withheld_and_does_not_capture_identity`, `foreign_clipboard_provider_is_not_authorized_for_mutation`, `failed_cut_retains_move_without_identity_even_when_retry_is_withheld`, `partial_move_keeps_cut_clipboard_without_becoming_retryable`; i test core `move_target_not_found_preserves_retry_only_when_source_identity_is_unchanged`, `move_target_not_found_blocks_retry_after_source_identity_changes`, `move_target_not_found_blocks_retry_when_source_identity_is_unavailable`, `move_query_errors_suppress_retry_without_claiming_target_presence`, `retry_move_with_changed_source_identity_does_not_move_replacement`, `retry_move_with_unchanged_source_identity_moves_original_object` e `retry_move_with_missing_source_is_withheld_before_mutation` coprono policy, guard al Retry, lookup incerti e conservazione dati; nessun test richiede cross-filesystem reale. |
+| F08-4 | Progresso determinato/indeterminato, byte misurati, annullati non completati. | Automatica | Test headless Linux | SUPERATO (logica) | `progress_stays_indeterminate_without_a_reported_total`, `live_attempts_drive_the_progress_fraction`, `copy_byte_progress_refines_the_batch_and_cancelled_items_are_not_complete`, `external_move_already_completed_retains_worker_attempt_progress`; barra non osservata visivamente. |
 | F08-5 | Chiusura scheda/finestra durante un lavoro, aggiornamento di selezione/appunti al completamento. | Automatica, grafica | Test headless Linux; finestre reali non provate | PARZIALE | `application_stays_held_for_running_and_pending_tasks_until_completions` verifica hold bilanciati fino alle completion FIFO; `cancelled_queued_task_skips_worker_and_runs_completion` e `worker_and_completion_panics_release_the_queue_and_invalidate_history` verificano cleanup anche su cancellazione e panic. Il comportamento grafico di finestre reali non è stato provato. |
 | F08-6 | Centro operazioni: stato live, dettagli, annullamento dall'interfaccia. | Automatica strutturale, grafica | GTK test su display disponibile; interazione manuale non eseguita | PARZIALE | `operations_dialog_has_content_and_refresh_action` verifica child, refresh e voce menu; live, annullamento manuale, temi/lingue e Wayland/X11 restano da provare. |
 
-F08 non è completa: una copia o uno spostamento annullati/falliti possono lasciare
-output parziale. Solo quando il target è verificato presente senza seguire symlink
-l'errore riporta il suo URI e il retry cieco è disabilitato. Per uno spostamento
-GIO può aver copiato parte del target senza eliminare la sorgente: l'errore non è
-trasformato in successo e il target non viene cancellato senza ownership sicura.
-Target assenti e collisioni `Exists` conservano l'errore originale e il retry;
-rinomina e creazione breve sono fuori dal perimetro dei job F08.
-La coda FIFO in attesa non è limitata: non rifiuta job già inviati perché il
-rifiuto deve eseguire le completion specifiche (clipboard/drop) e rispettare
-gli effetti già promessi. La cronologia terminale invece è limitata a 100.
+F08 resta parziale in attesa della verifica grafica interattiva. Una copia o uno
+spostamento annullati/falliti possono lasciare output parziale. Dopo l'errore il
+worker interroga il target con `NOFOLLOW_SYMLINKS` e `Cancellable::NONE`: se la
+presenza è verificata, il messaggio include l'URI e il retry cieco è disabilitato.
+Per una copia, `NotFound` del target prova che la radice selezionata è assente:
+l'errore originale resta inalterato e il retry è disponibile. MOVE richiede una
+verifica aggiuntiva: GIO può implementarlo come copy+delete tra filesystem e un
+errore può avere side effect sia sulla sorgente sia sul target. Se la query del
+target dà `NotFound`, l'identità stabile è catturata prima di `move_` con
+`NOFOLLOW_SYMLINKS` e `Cancellable` e poi interrogata nuovamente con
+`NOFOLLOW_SYMLINKS` e `Cancellable::NONE`; solo se entrambe le identità sono
+disponibili ed esattamente uguali il retry conserva l'errore originale. Tale
+identità resta nel risultato interno, non nella UI o nei messaggi Fluent. Prima
+del successivo `move_`, il core ricontrolla l'identità attesa: oggetto sostituito,
+assente o non interrogabile produce `retry withheld: MOVE source identity changed`
+e non chiama `move_`. Il test con fixture rinominata mantiene l'oggetto originale
+per impedire riuso dell'identità e verifica che il sostituto resti intatto e la
+destinazione vuota; il test complementare verifica che l'identità invariata
+consenta lo spostamento. Se l'identità iniziale è cambiata, manca o una query
+fallisce, il messaggio include l'URI
+del target, indica l'esito MOVE e l'identità sorgente come incerti, conserva
+domain/code GIO e il marker di policy per disabilitare il retry; specifica che
+l'output può rimanere ma non afferma che il target sia presente (la verifica
+aveva dato `NotFound`). Se il backend non fornisce un'identità prima del MOVE,
+l'operazione può essere tentata ma un errore successivo non autorizza retry.
+Un `NotFound` sorgente prima della selezione del target è pre-mutazione ma non
+autorizza un retry MOVE automatico senza identità stabile pre-operazione.
+Resta una finestra TOCTOU path-based tra query d'identità e chiamata GIO, non
+eliminabile con un compare-and-move atomico portabile. Ogni altro errore di
+lookup del target produce URI candidato e stato esplicitamente incerto (“may
+remain”), preserva il domain/code GIO e disabilita il retry senza affermare che
+il target esista. `Exists` non è escluso a priori: per COPY si ritenta solo se
+il target è provato assente; per MOVE serve anche identità sorgente invariata.
+Gli errori non sono trasformati in successo e il target non viene cancellato
+senza ownership sicura.
+Rinomina e creazione breve sono fuori dal perimetro dei job F08.
+La pulizia automatica non è implementata intenzionalmente: GIO non offre una
+garanzia portabile di ownership del path che renda sicura la cancellazione di un
+output incerto. La policy è preservare l'output, descrivere con precisione
+presenza o incertezza e impedire un retry cieco quando lo stato non è sicuro.
+La FIFO ammette al massimo 128 job pending, oltre al worker singolo. Il test
+`pending_fifo_is_bounded_and_rejected_completion_runs_on_main_thread` satura il
+backlog con un worker gate, verifica rifiuto senza worker/marker né hold extra,
+completion singola sul main thread e drenaggio FIFO. Il rifiuto è un fallimento
+typed: job registrato `failed` senza outcome per elemento, notifica localizzata,
+nessuna mutazione o invalidazione undo; clipboard/drop eseguono comunque il
+proprio cleanup. La cronologia terminale resta limitata a 100.
 
 ## Automated checks
 

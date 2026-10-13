@@ -520,6 +520,11 @@ pub struct FileIdentity {
     pub file: String,
 }
 
+/// Technical policy marker used to suppress another MOVE retry after the
+/// original source identity no longer matches.
+pub const MOVE_RETRY_IDENTITY_CHANGED_MARKER: &str =
+    "retry withheld: MOVE source identity changed";
+
 pub fn file_identity(uri: &str) -> Result<FileIdentity, glib::Error> {
     file_identity_with_cancellable(uri, gio::Cancellable::NONE)
 }
@@ -563,8 +568,40 @@ pub fn move_to_exact_result_cancellable(
     dest_dir_uri: &str,
     cancellable: &gio::Cancellable,
 ) -> Result<String, glib::Error> {
+    move_to_exact_result_cancellable_if_identity(src_uri, dest_dir_uri, cancellable, None)
+}
+
+/// Cancellable MOVE with an optional stable source identity requirement.
+/// When `expected_identity` is present, the identity check is performed after
+/// destination selection and immediately before `move_`; a mismatch or an
+/// unavailable source identity fails closed without invoking the mutation.
+/// The path-based query and GIO mutation are still separate operations, so a
+/// backend may race a replacement in the narrow interval between them.
+pub fn move_to_exact_result_cancellable_if_identity(
+    src_uri: &str,
+    dest_dir_uri: &str,
+    cancellable: &gio::Cancellable,
+    expected_identity: Option<&FileIdentity>,
+) -> Result<String, glib::Error> {
     let src = gio::File::for_uri(src_uri);
     let dest_dir = gio::File::for_uri(dest_dir_uri);
+    if let Err(error) = src.query_info(
+        "standard::type",
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        Some(cancellable),
+    ) {
+        // Preserve a provably missing source as a pre-mutation failure. A
+        // retried MOVE must instead fail closed because its captured object is
+        // no longer available at this URI.
+        if error.matches(gio::IOErrorEnum::NotFound) && expected_identity.is_some() {
+            return Err(retry_identity_changed_error(Some(error)));
+        }
+        if error.matches(gio::IOErrorEnum::NotFound)
+            || error.matches(gio::IOErrorEnum::Cancelled)
+        {
+            return Err(error);
+        }
+    }
     if src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
         == gio::FileType::Directory
         && dest_inside_src(&src, &dest_dir)
@@ -582,42 +619,131 @@ pub fn move_to_exact_result_cancellable(
         .filter(|n| !n.is_empty())
         .ok_or_else(|| io_error("Invalid file name"))?;
     let dest = unique_child_cancellable(&dest_dir, OsStr::new(&name), cancellable)?;
+    if cancellable.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    // Capture as close as possible to the mutation so the same identity is
+    // used both to authorize a retry and to classify a failed MOVE. Retried
+    // operations additionally require the identity captured by the original
+    // attempt, preventing a replacement at the same URI from being moved.
+    let source_identity = match file_identity_with_cancellable(src_uri, Some(cancellable)) {
+        Ok(identity) => {
+            if expected_identity.is_some_and(|expected| expected != &identity) {
+                return Err(retry_identity_changed_error(None));
+            }
+            Some(identity)
+        }
+        Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => return Err(error),
+        Err(error) if expected_identity.is_some() => {
+            return Err(retry_identity_changed_error(Some(error)));
+        }
+        // For an initial MOVE, a stable identity is not required to attempt
+        // the operation. Its absence does, however, prevent a later retry.
+        Err(error) if error.matches(gio::IOErrorEnum::NotFound) => return Err(error),
+        Err(_) => None,
+    };
+    if cancellable.is_cancelled() {
+        return Err(cancelled_error());
+    }
     src.move_(
         &dest,
         gio::FileCopyFlags::NONE,
         Some(cancellable),
         Some(&mut |_, _| {}),
     )
-    .map_err(|error| move_error_with_partial_target(error, &dest))?;
+    .map_err(|error| move_error_with_partial_target(error, &src, &dest, source_identity.as_ref()))?;
     Ok(dest.uri().to_string())
 }
 
-fn move_error_with_partial_target(error: glib::Error, dest: &gio::File) -> glib::Error {
-    // GIO may implement a cross-filesystem move as copy+delete. A target
-    // already present due to a collision is not attributable to this move.
-    if error.matches(gio::IOErrorEnum::Exists) {
-        return error;
+fn retry_identity_changed_error(cause: Option<glib::Error>) -> glib::Error {
+    match cause {
+        Some(error) => glib::Error::with_domain(
+            error.domain(),
+            error.code(),
+            &format!("{error}; {MOVE_RETRY_IDENTITY_CHANGED_MARKER}"),
+        ),
+        None => glib::Error::new(
+            gio::IOErrorEnum::Failed,
+            MOVE_RETRY_IDENTITY_CHANGED_MARKER,
+        ),
     }
-    let target_exists = dest
+}
+
+fn move_error_with_partial_target(
+    error: glib::Error,
+    src: &gio::File,
+    dest: &gio::File,
+    source_identity_before: Option<&FileIdentity>,
+) -> glib::Error {
+    // GIO may implement a cross-filesystem move as copy+delete. Check the
+    // selected target without following symlinks. Even NotFound is not enough
+    // to permit a retry: fallback copy+delete may also have removed the source.
+    let target_status = dest
         .query_info(
             "standard::type",
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         )
-        .is_ok();
-    if !target_exists {
-        return error;
-    }
+        .map(|_| ());
+    move_error_with_target_status(
+        error,
+        src,
+        source_identity_before,
+        &dest.uri().to_string(),
+        target_status,
+    )
+}
 
-    let message = format!(
-        "{error}; partial move output may remain at {}",
-        dest.uri()
-    );
-    if error.matches(gio::IOErrorEnum::Cancelled) {
-        glib::Error::new(gio::IOErrorEnum::Cancelled, &message)
-    } else {
-        glib::Error::new(gio::IOErrorEnum::Failed, &message)
+fn move_error_with_target_status(
+    error: glib::Error,
+    src: &gio::File,
+    source_identity_before: Option<&FileIdentity>,
+    target_uri: &str,
+    target_status: Result<(), glib::Error>,
+) -> glib::Error {
+    match target_status {
+        Ok(()) => error_with_target_status(error, "move", target_uri, Ok(())),
+        Err(target_error) if !target_error.matches(gio::IOErrorEnum::NotFound) => {
+            error_with_target_status(error, "move", target_uri, Err(target_error))
+        }
+        Err(_) => {
+            // The F08 caller runs this synchronous verification in its worker.
+            // Ignore the cancelled operation token so we still establish whether
+            // retrying could repeat a move after GIO's copy+delete fallback.
+            let source_identity_now =
+                file_identity_with_cancellable(&src.uri().to_string(), gio::Cancellable::NONE);
+            move_error_after_target_not_found(
+                error,
+                target_uri,
+                source_identity_before,
+                source_identity_now,
+            )
+        }
     }
+}
+
+fn move_error_after_target_not_found(
+    error: glib::Error,
+    target_uri: &str,
+    source_identity_before: Option<&FileIdentity>,
+    source_identity_now: Result<FileIdentity, glib::Error>,
+) -> glib::Error {
+    let source_detail = match (source_identity_before, source_identity_now) {
+        (Some(before), Ok(current)) if before == &current => return error,
+        (Some(_), Ok(_)) => "source identity changed since MOVE began".to_string(),
+        (None, Ok(_)) => "source identity unknown (not captured before MOVE)".to_string(),
+        (_, Err(source_error)) if source_error.matches(gio::IOErrorEnum::NotFound) => {
+            "source identity unknown (source lookup returned NotFound)".to_string()
+        }
+        (_, Err(source_error)) => {
+            format!("source identity unknown (identity lookup failed: {source_error})")
+        }
+    };
+    let marker = format!(
+        "partial move output may remain at {target_uri} (target not verified present); move outcome uncertain: {source_detail}; target lookup returned NotFound (target URI {target_uri})"
+    );
+    let message = format!("{error}; {marker}");
+    glib::Error::with_domain(error.domain(), error.code(), &message)
 }
 
 /// Moves to a directory and returns the exact effective URI (including any
@@ -1257,6 +1383,17 @@ pub fn copy_to_cancellable(
 ) -> Result<(), glib::Error> {
     let src = gio::File::for_uri(src_uri);
     let dest_dir = gio::File::for_uri(dest_dir_uri);
+    if let Err(error) = src.query_info(
+        "standard::type",
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        Some(cancellable),
+    ) {
+        // Keep a provably absent source retryable without depending on a
+        // destination check after no copy could have started.
+        if error.matches(gio::IOErrorEnum::NotFound) {
+            return Err(error);
+        }
+    }
     if src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
         == gio::FileType::Directory
         && dest_inside_src(&src, &dest_dir)
@@ -1281,30 +1418,40 @@ pub fn copy_to_cancellable(
 }
 
 fn copy_error_with_partial_target(error: glib::Error, dest: &gio::File) -> glib::Error {
-    // A target already present on entry (or appearing due to a collision) is
-    // not evidence that this job created it. For all other failures, query
-    // without following symlinks so a broken link also counts as an output.
-    let partial_exists = !error.matches(gio::IOErrorEnum::Exists)
-        && dest
-            .query_info(
-                "standard::type",
-                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                gio::Cancellable::NONE,
-            )
-            .is_ok();
-    if !partial_exists {
-        return error;
-    }
+    // A broken symlink also counts as a present target. Do not special-case
+    // Exists: after unique-name selection it can be a concurrent collision or
+    // an Exists from a child of a partially copied directory.
+    let target_status = dest
+        .query_info(
+            "standard::type",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .map(|_| ());
+    error_with_target_status(error, "copy", &dest.uri(), target_status)
+}
 
-    let message = format!(
-        "{error}; partial copy output may remain at {}",
-        dest.uri()
-    );
-    if error.matches(gio::IOErrorEnum::Cancelled) {
-        glib::Error::new(gio::IOErrorEnum::Cancelled, &message)
-    } else {
-        glib::Error::new(gio::IOErrorEnum::Failed, &message)
-    }
+/// Adds the retry-suppressing marker when the destination is present or its
+/// status cannot be verified. A NotFound lookup proves the selected root absent
+/// and preserves the original retryable operation error. This classifier is
+/// separate from GIO so uncertain lookup outcomes can be tested deterministically.
+fn error_with_target_status(
+    error: glib::Error,
+    operation: &str,
+    target_uri: &str,
+    target_status: Result<(), glib::Error>,
+) -> glib::Error {
+    let marker = match target_status {
+        Ok(()) => format!("partial {operation} output may remain at {target_uri}"),
+        Err(verification_error) if verification_error.matches(gio::IOErrorEnum::NotFound) => {
+            return error;
+        }
+        Err(verification_error) => format!(
+            "partial {operation} output may remain at {target_uri} (status unknown; destination verification failed: {verification_error})"
+        ),
+    };
+    let message = format!("{error}; {marker}");
+    glib::Error::with_domain(error.domain(), error.code(), &message)
 }
 
 fn copy_recursive_cancellable(
@@ -2172,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_copy_marker_requires_a_present_non_collision_target() {
+    fn partial_copy_marker_suppresses_retry_when_target_is_present_including_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("partial.txt");
         std::fs::write(&target, b"partial").unwrap();
@@ -2189,42 +2336,380 @@ mod tests {
             &dest,
         );
         assert!(collision.matches(gio::IOErrorEnum::Exists));
-        assert!(!collision.message().contains("partial copy output may remain at"));
+        assert!(collision.message().contains("partial copy output may remain at"));
+        assert!(target.exists(), "the helper must not clean up the target");
     }
 
     #[test]
-    fn partial_move_marker_requires_a_present_non_collision_target() {
+    fn target_not_found_preserves_original_error_and_retryability() {
+        let original = glib::Error::new(gio::IOErrorEnum::Exists, "destination collision");
+        let absent = error_with_target_status(
+            original,
+            "copy",
+            "file:///tmp/absent",
+            Err(glib::Error::new(gio::IOErrorEnum::NotFound, "target absent")),
+        );
+
+        assert!(absent.matches(gio::IOErrorEnum::Exists));
+        assert_eq!(absent.message(), "destination collision");
+        assert!(!absent.message().contains("partial copy output may remain at"));
+    }
+
+    #[test]
+    fn uncertain_target_lookup_suppresses_retry_and_preserves_original_error_code() {
+        for verification_error in [
+            glib::Error::new(gio::IOErrorEnum::PermissionDenied, "lookup denied"),
+            glib::Error::new(gio::IOErrorEnum::NotSupported, "lookup unsupported"),
+        ] {
+            let uncertain = error_with_target_status(
+                glib::Error::new(gio::IOErrorEnum::Failed, "copy failed"),
+                "copy",
+                "file:///tmp/unknown",
+                Err(verification_error),
+            );
+
+            assert!(uncertain.matches(gio::IOErrorEnum::Failed));
+            assert!(uncertain
+                .message()
+                .contains("partial copy output may remain at file:///tmp/unknown"));
+            assert!(uncertain.message().contains("status unknown"));
+        }
+
+        let cancelled = error_with_target_status(
+            glib::Error::new(gio::IOErrorEnum::Cancelled, "copy cancelled"),
+            "move",
+            "file:///tmp/unknown",
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "lookup denied",
+            )),
+        );
+        assert!(cancelled.matches(gio::IOErrorEnum::Cancelled));
+        assert!(cancelled.message().contains("status unknown"));
+    }
+
+    #[test]
+    fn move_target_not_found_preserves_retry_only_when_source_identity_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.txt");
+        std::fs::write(&source_path, b"source").unwrap();
+        let target_path = tmp.path().join("target.txt");
+        let missing_target = gio::File::for_path(&target_path);
+        let source = gio::File::for_path(&source_path);
+        let source_identity = file_identity(&uri(&source_path)).unwrap();
+
+        let original = move_error_with_partial_target(
+            glib::Error::new(gio::IOErrorEnum::Failed, "move failed"),
+            &source,
+            &missing_target,
+            Some(&source_identity),
+        );
+        assert!(original.matches(gio::IOErrorEnum::Failed));
+        assert_eq!(original.message(), "move failed");
+        assert!(!original.message().contains("partial move output may remain at"));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source");
+        assert!(!target_path.exists());
+
+        let missing_source = gio::File::for_path(tmp.path().join("missing.txt"));
+        let uncertain = move_error_with_partial_target(
+            glib::Error::new(gio::IOErrorEnum::Failed, "move failed"),
+            &missing_source,
+            &missing_target,
+            None,
+        );
+        assert!(uncertain.matches(gio::IOErrorEnum::Failed));
+        assert!(uncertain.message().contains("move outcome uncertain"));
+        assert!(uncertain.message().contains("source identity unknown"));
+        assert!(uncertain.message().contains("source lookup returned NotFound"));
+        assert!(uncertain
+            .message()
+            .contains("target lookup returned NotFound"));
+        assert!(uncertain.message().contains("partial move output may remain at"));
+        assert!(uncertain.message().contains("target not verified present"));
+        assert!(uncertain.message().contains(missing_target.uri().as_str()));
+        assert!(!target_path.exists());
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source");
+    }
+
+    #[test]
+    fn move_target_not_found_blocks_retry_after_source_identity_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.txt");
+        let target_path = tmp.path().join("target.txt");
+        let sentinel_path = tmp.path().join("sentinel.txt");
+        std::fs::write(&source_path, b"replacement source sentinel").unwrap();
+        std::fs::write(&sentinel_path, b"unrelated sentinel").unwrap();
+        let old_identity = FileIdentity {
+            filesystem: "temp-filesystem".to_string(),
+            file: "old-inode".to_string(),
+        };
+        let replacement_identity = FileIdentity {
+            filesystem: "temp-filesystem".to_string(),
+            file: "replacement-inode".to_string(),
+        };
+        let original = glib::Error::new(gio::IOErrorEnum::PermissionDenied, "move failed");
+        let original_domain = original.domain();
+        let original_code = original.code();
+
+        let uncertain = move_error_after_target_not_found(
+            original,
+            &uri(&target_path),
+            Some(&old_identity),
+            Ok(replacement_identity),
+        );
+
+        assert!(uncertain.matches(gio::IOErrorEnum::PermissionDenied));
+        assert_eq!(uncertain.domain(), original_domain);
+        assert_eq!(uncertain.code(), original_code);
+        assert!(uncertain.message().contains("move outcome uncertain"));
+        assert!(uncertain.message().contains("source identity changed"));
+        assert!(uncertain.message().contains("target not verified present"));
+        assert!(uncertain.message().contains("target lookup returned NotFound"));
+        assert!(uncertain.message().contains(&uri(&target_path)));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"replacement source sentinel");
+        assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"unrelated sentinel");
+        assert!(!target_path.exists());
+    }
+
+    #[test]
+    fn move_target_not_found_blocks_retry_when_source_identity_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.txt");
+        let target_path = tmp.path().join("target.txt");
+        std::fs::write(&source_path, b"source sentinel").unwrap();
+        let current_identity = FileIdentity {
+            filesystem: "temp-filesystem".to_string(),
+            file: "current-inode".to_string(),
+        };
+        let old_identity = FileIdentity {
+            filesystem: "temp-filesystem".to_string(),
+            file: "old-inode".to_string(),
+        };
+        let unavailable = glib::Error::new(
+            gio::IOErrorEnum::NotSupported,
+            "stable identity unavailable",
+        );
+
+        let pre_identity_unavailable = move_error_after_target_not_found(
+            glib::Error::new(gio::IOErrorEnum::Failed, "move failed"),
+            &uri(&target_path),
+            None,
+            Ok(current_identity),
+        );
+        assert!(pre_identity_unavailable.matches(gio::IOErrorEnum::Failed));
+        assert!(pre_identity_unavailable.message().contains("source identity unknown"));
+        assert!(pre_identity_unavailable
+            .message()
+            .contains("not captured before MOVE"));
+        assert!(pre_identity_unavailable
+            .message()
+            .contains("target not verified present"));
+
+        let current_identity_unavailable = move_error_after_target_not_found(
+            glib::Error::new(gio::IOErrorEnum::Failed, "move failed"),
+            &uri(&target_path),
+            Some(&old_identity),
+            Err(unavailable),
+        );
+        assert!(current_identity_unavailable.matches(gio::IOErrorEnum::Failed));
+        assert!(current_identity_unavailable
+            .message()
+            .contains("source identity unknown"));
+        assert!(current_identity_unavailable
+            .message()
+            .contains("identity lookup failed"));
+        assert!(current_identity_unavailable
+            .message()
+            .contains("target not verified present"));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source sentinel");
+        assert!(!target_path.exists());
+    }
+
+    #[test]
+    fn partial_move_marker_suppresses_retry_when_target_is_present_and_preserves_data() {
         let tmp = tempfile::tempdir().unwrap();
         let target_path = tmp.path().join("partial.txt");
         let source_path = tmp.path().join("source.txt");
         std::fs::write(&source_path, b"source").unwrap();
+        std::fs::write(&target_path, b"partial target").unwrap();
+        let source = gio::File::for_path(&source_path);
         let dest = gio::File::for_path(&target_path);
+        let source_identity = file_identity(&uri(&source_path)).unwrap();
 
-        let absent = move_error_with_partial_target(
-            glib::Error::new(gio::IOErrorEnum::NotFound, "source missing"),
-            &dest,
-        );
-        assert!(absent.matches(gio::IOErrorEnum::NotFound));
-        assert!(!absent.message().contains("partial move output may remain at"));
-
-        std::fs::write(&target_path, b"partial").unwrap();
         let partial = move_error_with_partial_target(
             glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled"),
+            &source,
             &dest,
+            Some(&source_identity),
         );
         assert!(partial.matches(gio::IOErrorEnum::Cancelled));
         assert!(partial.message().contains("partial move output may remain at"));
         assert!(partial.message().contains(dest.uri().as_str()));
         assert_eq!(std::fs::read(&source_path).unwrap(), b"source");
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"partial target");
 
         let collision = move_error_with_partial_target(
             glib::Error::new(gio::IOErrorEnum::Exists, "already exists"),
+            &source,
             &dest,
+            Some(&source_identity),
         );
         assert!(collision.matches(gio::IOErrorEnum::Exists));
-        assert!(!collision.message().contains("partial move output may remain at"));
+        assert!(collision.message().contains("partial move output may remain at"));
         assert_eq!(std::fs::read(&source_path).unwrap(), b"source");
-        assert!(target_path.exists(), "the helper must not clean up the target");
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"partial target");
+    }
+
+    #[test]
+    fn move_query_errors_suppress_retry_without_claiming_target_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.txt");
+        std::fs::write(&source_path, b"source sentinel").unwrap();
+        let source = gio::File::for_path(&source_path);
+        let source_identity = file_identity(&uri(&source_path)).unwrap();
+        let target_uri = "file:///tmp/uncertain-target";
+
+        let target_unknown = move_error_with_target_status(
+            glib::Error::new(gio::IOErrorEnum::Cancelled, "move cancelled"),
+            &source,
+            Some(&source_identity),
+            target_uri,
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "target lookup denied",
+            )),
+        );
+        assert!(target_unknown.matches(gio::IOErrorEnum::Cancelled));
+        assert!(target_unknown
+            .message()
+            .contains("partial move output may remain at file:///tmp/uncertain-target"));
+        assert!(target_unknown.message().contains("status unknown"));
+        assert!(!target_unknown.message().contains("verified present"));
+
+        let source_unknown = move_error_after_target_not_found(
+            glib::Error::new(gio::IOErrorEnum::Cancelled, "move cancelled"),
+            target_uri,
+            Some(&source_identity),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::PermissionDenied,
+                "source lookup denied",
+            )),
+        );
+        assert!(source_unknown.matches(gio::IOErrorEnum::Cancelled));
+        assert!(source_unknown.message().contains("move outcome uncertain"));
+        assert!(source_unknown.message().contains("source identity unknown"));
+        assert!(source_unknown.message().contains("target lookup returned NotFound"));
+        assert!(source_unknown
+            .message()
+            .contains("partial move output may remain at file:///tmp/uncertain-target"));
+        assert!(!source_unknown
+            .message()
+            .contains("target verified present"));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source sentinel");
+    }
+
+    #[test]
+    fn cancellable_move_missing_source_keeps_original_pre_mutation_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.txt");
+        let error = move_to_exact_result_cancellable(
+            &uri(&missing),
+            &uri(tmp.path()),
+            &gio::Cancellable::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.matches(gio::IOErrorEnum::NotFound));
+        assert!(!error.message().contains("partial move output may remain at"));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retry_move_with_changed_source_identity_does_not_move_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        let destination_dir = tmp.path().join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&destination_dir).unwrap();
+        let source_path = source_dir.join("item.txt");
+        let captured_path = source_dir.join("captured-original.txt");
+        std::fs::write(&source_path, b"original object").unwrap();
+        let source_uri = uri(&source_path);
+        let expected = file_identity(&source_uri).unwrap();
+
+        // Model replacement between the first failed attempt and Retry while
+        // retaining the original object so its backend identity cannot be
+        // recycled for the replacement.
+        std::fs::rename(&source_path, &captured_path).unwrap();
+        std::fs::write(&source_path, b"replacement sentinel").unwrap();
+        assert_ne!(file_identity(&source_uri).unwrap(), expected);
+
+        let error = move_to_exact_result_cancellable_if_identity(
+            &source_uri,
+            &uri(&destination_dir),
+            &gio::Cancellable::new(),
+            Some(&expected),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .message()
+            .contains("retry withheld: MOVE source identity changed"));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"replacement sentinel");
+        assert_eq!(std::fs::read(&captured_path).unwrap(), b"original object");
+        assert_eq!(std::fs::read_dir(&destination_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retry_move_with_unchanged_source_identity_moves_original_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        let destination_dir = tmp.path().join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&destination_dir).unwrap();
+        let source_path = source_dir.join("item.txt");
+        std::fs::write(&source_path, b"original object").unwrap();
+        let source_uri = uri(&source_path);
+        let expected = file_identity(&source_uri).unwrap();
+
+        let target_uri = move_to_exact_result_cancellable_if_identity(
+            &source_uri,
+            &uri(&destination_dir),
+            &gio::Cancellable::new(),
+            Some(&expected),
+        )
+        .unwrap();
+
+        assert!(!source_path.exists());
+        let target_path = gio::File::for_uri(&target_uri).path().unwrap();
+        assert_eq!(std::fs::read(target_path).unwrap(), b"original object");
+        assert_eq!(std::fs::read_dir(&destination_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn retry_move_with_missing_source_is_withheld_before_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("missing.txt");
+        let destination_dir = tmp.path().join("destination");
+        std::fs::create_dir(&destination_dir).unwrap();
+        let expected = FileIdentity {
+            filesystem: "captured-filesystem".into(),
+            file: "captured-object".into(),
+        };
+
+        let error = move_to_exact_result_cancellable_if_identity(
+            &uri(&source_path),
+            &uri(&destination_dir),
+            &gio::Cancellable::new(),
+            Some(&expected),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .message()
+            .contains("retry withheld: MOVE source identity changed"));
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read_dir(&destination_dir).unwrap().count(), 0);
     }
 
     #[test]
@@ -2280,7 +2765,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_cancelled_move_with_existing_basename_is_not_partial_output() {
+    fn pre_cancelled_move_stops_before_mutation_during_source_preflight() {
         let tmp = tempfile::tempdir().unwrap();
         let source_dir = tmp.path().join("source");
         let dest_dir = tmp.path().join("dest");
