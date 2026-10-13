@@ -69,7 +69,7 @@ riuso di codice o asset richiede prima una verifica della compatibilità delle l
 | Operazioni su gruppi di file | Presente | Le viste usano `MultiSelection`; azioni di gruppo con URI e destinazione catturati (`ops.rs`, `tabs.rs`); verifica grafica residua (F01) |
 | Cestino, ripristino e cancellazione | Presente | Protezioni symlink e destinazioni di copia; verifiche locali/remote da estendere |
 | Conflitti e spostamenti tra filesystem | Parziale | Suffissi automatici; niente dialogo unisci/sostituisci; `move_to()` usa GIO senza fallback esplicito per cartelle |
-| Avanzamento, interruzione e undo delle operazioni | Parziale | `operation_queue.rs`: coda FIFO con worker, journal undo di 50 voci per rinomina/spostamento con identità invariata e cestino; risultati per elemento in `ops.rs`; nessuna UI di avanzamento, nessuna interruzione dei lavori, nessun redo |
+| Avanzamento, interruzione e undo delle operazioni | Parziale | `operation_queue.rs`: coda FIFO con worker, journal undo di 50 voci per rinomina/spostamento con identità invariata e cestino; risultati per elemento in `ops.rs`; F08: registro job in `job_center.rs` con ID, stati, avanzamento misurato e cancellazione cooperativa via `Cancellable` GIO; verifica grafica del centro operazioni non ancora eseguita; nessun redo |
 | Aggiornamento live della cartella aperta | Presente | `tabs.rs`: monitor GIO per scheda, batch coalesciati e riconciliazioni, con test automatici; verifica grafica residua (F04) |
 | Segnalibri e cartelle XDG | Presente | `kito-core/src/bookmarks.rs`: aggiunta, rinomina, riordino e rimozione con scrittura atomica e conservazione di permessi/etichette, monitor del file `bookmarks`; test automatici estesi, verifica grafica residua |
 | Dispositivi e rete | Parziale | Mount e voce network; la sidebar offre espulsione/smontaggio quando supportati da GIO; restano autenticazione e connessioni |
@@ -116,7 +116,7 @@ Kito sono proposte progettuali. Difficoltà indicative, senza stime temporali.
 | F05 | Ordinamento per nome, dimensione, tipo e data, inverso | Presente | 1 | Media |
 | F06 | Zoom delle icone e colonne selezionabili/ordinabili | Presente | 1 | Media |
 | F07 | Scorciatoie complete, focus e accessibilità | Parziale: scorciatoie configurabili | Trasversale | Media |
-| F08 | Centro operazioni, avanzamento e interruzione | Parziale: coda seriale, nessun avanzamento | 2 | Alta |
+| F08 | Centro operazioni, avanzamento e interruzione | Parziale: registro, progressi misurati e cancellazione cooperativa; UI non verificata graficamente, copie parziali segnalate senza cleanup automatico | 2 | Alta |
 | F09 | Sostituisci, salta, conserva entrambi, unisci cartelle | Parziale: suffissi | 2 | Alta |
 | F10 | Spostamento affidabile tra filesystem | Parziale | 2 | Alta |
 | F11 | Annulla/ripeti per operazioni reversibili | Parziale: undo rinomina/spostamento/cestino, nessun redo | 2 | Alta |
@@ -342,14 +342,49 @@ di chiudere la fase.
 
 ## Fase 2 — motore delle operazioni
 
-- [ ] **F08:** introdurre job con ID, sorgenti/destinazione catturate, stato, avanzamento,
-  cancellazione cooperativa e risultato per elemento; concorrenza limitata.
-  UI centrale con dettagli; non inventare percentuali quando il totale è sconosciuto.
-  Stato al `f18b6b3`: esiste una coda FIFO con worker e journal undo in
-  `operation_queue.rs`, che serializza le mutazioni; i risultati strutturati per
-  elemento sono gestiti in `ops.rs` (B03), non dal registro dei job. Non ci sono
-  ID job mostrati, avanzamento, pannello delle operazioni né cancellazione
-  cooperativa dall'interfaccia.
+- [ ] **F08 — parziale.** Registro job in `job_center.rs` sopra la coda esistente
+  (nessun motore duplicato): ID stabili, sorgenti/destinazione catturate
+  all'avvio, stati `queued/running/cancelling/completed/partial/failed/cancelled`;
+  un lavoro con elementi falliti o annullati non è mai riportato come successo
+  pieno. Cancellazione cooperativa: un job in coda resta visibile e viene
+  finalizzato come annullato senza avviare il worker, inclusi i completamenti di
+  appunti/drop. `gio::Cancellable` è propagato alla copia, allo spostamento, al
+  cestino, alla cancellazione definitiva, al ripristino e allo svuotamento del
+  cestino (`kito-core`, varianti `_*_cancellable`); gli elementi già completati
+  restano registrati e la classificazione distingue `partial`, `failed` e
+  `cancelled`. Avanzamento: elementi davvero tentati su totale noto (il numero
+  di sorgenti catturate) e frazione dei byte misurati del file corrente;
+  totale sconosciuto = barra indeterminata, nessuna scansione preliminare
+  ricorsiva. Centro operazioni per finestra, registro condiviso tra finestre
+  con azione `win.operations` e voce nel menu dell'app; chiusura scheda/finestra
+  non invalida un lavoro avviato. Retry dei soli fallimenti invariato (B03),
+   journal undo invariato in `operation_queue.rs`, vista e appunti
+  aggiornati come prima. Test automatici: ID, stati, progresso
+  determinato/indeterminato, annullamento in coda e con worker reale su
+  directory temporanee senza Cestino di sessione, successo completo,
+  classifica onesta di annullamento e parzialità. La cronologia conserva al massimo
+   100 job terminali, oltre a tutti gli attivi. Una copia o uno spostamento
+   interrotti possono lasciare output parziale: se il target è verificato
+   presente senza seguire symlink, l'errore indica il suo URI e il retry cieco
+   è escluso per quel risultato; collisioni e target assenti conservano l'errore
+   originale e il retry normale. Non c'è cleanup automatico: non cancellare
+   output senza ownership/identità certa.
+  La coda FIFO non ha un limite: il backlog resta illimitato per non rifiutare
+  operazioni già inviate senza eseguirne i completamenti/cleanup.
+  Rinomina e creazione breve restano fuori dai job.
+  - [x] Test su annullamento in coda, classificazione dei risultati e output
+    parziale di copia/spostamento; il target incompleto è indicato e il retry
+    cieco è escluso.
+  - [ ] Cleanup automatico sicuro dell'output parziale e limite al backlog FIFO.
+  - [ ] Verifica grafica Wayland/X11 del centro operazioni:
+        stato in tempo reale, annullamento riprodotto a mano, temi e lingue.
+  - [ ] Concorrenza limitata oltre la serializzazione esistente (una mutazione
+        alla volta già implicata dalla coda FIFO; il numero_attivo resta 1).
+  - Stato al `f18b6b3`: esisteva una coda FIFO con worker e journal undo in
+    `operation_queue.rs`, che serializza le mutazioni; i risultati strutturati per
+    elemento erano gestiti in `ops.rs` (B03), non dal registro dei job. Non ci
+    sono ID job mostrati, avanzamento, pannello delle operazioni né cancellazione
+    cooperativa dall'interfaccia.
 - [ ] **F09:** dialoghi conflitto e scelta applicabile ai successivi; nomi originali
   preservati; unione distinta dalla sostituzione; verifica scrivibilità solo indicativa.
 - [ ] **F10:** copia seguita da cancellazione per gli spostamenti che la richiedono;

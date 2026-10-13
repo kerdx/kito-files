@@ -1,5 +1,6 @@
 //! Process-wide FIFO for filesystem mutations and their UI completions.
 
+use gio::prelude::ApplicationExtManual;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -78,20 +79,75 @@ pub(crate) enum WorkerFailure {
     Panicked,
     ChannelClosed,
     SpawnFailed,
+    CancelledBeforeStart,
 }
 
 type Task = Box<dyn FnOnce(Rc<OperationQueue>)>;
 
 /// One application-wide serializer. Jobs run on worker threads, but each
 /// completion runs on the GTK thread before the next worker is started.
+/// The pending FIFO is intentionally uncapped: rejecting an already-submitted
+/// mutation would need to run its domain-specific completion/cleanup callback.
+/// Sustained submission faster than completion can therefore grow this queue.
 #[derive(Default)]
 pub(crate) struct OperationQueue {
     pending: RefCell<VecDeque<Task>>,
     running: Cell<bool>,
     undo: RefCell<UndoJournal>,
+    application: RefCell<Option<QueueApplication>>,
+}
+
+struct QueueApplication {
+    application: gio::Application,
+    active_holds: Rc<Cell<usize>>,
+}
+
+struct ApplicationHold {
+    _gio_hold: gio::ApplicationHoldGuard,
+    active_holds: Rc<Cell<usize>>,
+}
+
+impl Drop for ApplicationHold {
+    fn drop(&mut self) {
+        self.active_holds.set(self.active_holds.get() - 1);
+    }
 }
 
 impl OperationQueue {
+    /// Configures the application once, before windows can submit work.
+    pub(crate) fn set_application(&self, application: gio::Application) {
+        let mut configured_application = self.application.borrow_mut();
+        assert!(
+            configured_application.is_none(),
+            "operation queue application set more than once"
+        );
+        *configured_application = Some(QueueApplication {
+            application,
+            active_holds: Rc::new(Cell::new(0)),
+        });
+    }
+
+    fn acquire_application_hold(&self) -> Option<ApplicationHold> {
+        self.application
+            .borrow()
+            .as_ref()
+            .map(|application| {
+                application.active_holds.set(application.active_holds.get() + 1);
+                ApplicationHold {
+                    _gio_hold: application.application.hold(),
+                    active_holds: application.active_holds.clone(),
+                }
+            })
+    }
+
+    #[cfg(test)]
+    fn active_application_holds(&self) -> usize {
+        self.application
+            .borrow()
+            .as_ref()
+            .map_or(0, |application| application.active_holds.get())
+    }
+
     pub(crate) fn is_busy(&self) -> bool {
         self.running.get() || !self.pending.borrow().is_empty()
     }
@@ -129,10 +185,50 @@ impl OperationQueue {
     ) where
         R: Send + 'static,
     {
+        self.submit_cancellable(job, || false, done);
+    }
+
+    pub(crate) fn submit_cancellable<R>(
+        self: &Rc<Self>,
+        job: impl FnOnce() -> R + Send + 'static,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        done: impl FnOnce(Result<R, WorkerFailure>) + 'static,
+    ) where
+        R: Send + 'static,
+    {
+        self.submit_cancellable_with_start(job, cancelled, || true, done);
+    }
+
+    pub(crate) fn submit_cancellable_with_start<R>(
+        self: &Rc<Self>,
+        job: impl FnOnce() -> R + Send + 'static,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        start: impl Fn() -> bool + 'static,
+        done: impl FnOnce(Result<R, WorkerFailure>) + 'static,
+    ) where
+        R: Send + 'static,
+    {
+        // Pending work must also prevent application shutdown, not only the
+        // worker currently at the head of the FIFO.
+        let application_hold = self.acquire_application_hold();
         self.pending.borrow_mut().push_back(Box::new(move |queue| {
+            if cancelled() || !start() {
+                if catch_unwind(AssertUnwindSafe(|| {
+                    done(Err(WorkerFailure::CancelledBeforeStart))
+                }))
+                .is_err()
+                {
+                    eprintln!("Kito cancelled operation completion callback panicked");
+                }
+                queue.finish_current();
+                return;
+            }
             let (tx, rx) = async_channel::bounded::<Result<R, WorkerFailure>>(1);
             let completion_queue = queue.clone();
             glib::spawn_future_local(async move {
+                // Keep the hold through callback, finish_current and the next
+                // pump, avoiding an unheld interval between FIFO tasks.
+                let _application_hold = application_hold;
                 let result = rx.recv().await.unwrap_or(Err(WorkerFailure::ChannelClosed));
                 if let Err(failure) = &result {
                     completion_queue.invalidate_for_worker_failure(failure);
@@ -146,14 +242,19 @@ impl OperationQueue {
 
             let spawn_failure_tx = tx.clone();
             let worker_tx = tx;
+            let worker_cancelled = cancelled;
             let spawned = std::thread::Builder::new()
                 .name("kito-files-operation".to_string())
                 .spawn(move || {
-                    let result = match catch_unwind(AssertUnwindSafe(job)) {
-                        Ok(value) => Ok(value),
-                        Err(_) => {
-                            eprintln!("Kito filesystem mutation worker panicked");
-                            Err(WorkerFailure::Panicked)
+                    let result = if worker_cancelled() {
+                        Err(WorkerFailure::CancelledBeforeStart)
+                    } else {
+                        match catch_unwind(AssertUnwindSafe(job)) {
+                            Ok(value) => Ok(value),
+                            Err(_) => {
+                                eprintln!("Kito filesystem mutation worker panicked");
+                                Err(WorkerFailure::Panicked)
+                            }
                         }
                     };
                     let _ = worker_tx.send_blocking(result);
@@ -170,7 +271,7 @@ impl OperationQueue {
     }
 
     fn invalidate_for_worker_failure(&self, failure: &WorkerFailure) {
-        if !matches!(failure, WorkerFailure::SpawnFailed) {
+        if !matches!(failure, WorkerFailure::SpawnFailed | WorkerFailure::CancelledBeforeStart) {
             self.invalidate_undo();
         }
     }
@@ -209,7 +310,7 @@ mod tests {
     use std::{
         fs,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::{Duration, Instant},
@@ -387,11 +488,133 @@ mod tests {
     }
 
     #[test]
+    fn application_stays_held_for_running_and_pending_tasks_until_completions() {
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                let application = gio::Application::new(
+                    Some("it.kito.KitoFiles.OperationQueueTest"),
+                    gio::ApplicationFlags::NON_UNIQUE,
+                );
+                let queue = Rc::new(OperationQueue::default());
+                queue.set_application(application.clone());
+
+                let gate = Arc::new(AtomicBool::new(false));
+                queue.submit(
+                    {
+                        let gate = gate.clone();
+                        move || {
+                            while !gate.load(Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                    },
+                    {
+                        let queue = queue.clone();
+                        move |result| {
+                            result.unwrap();
+                            assert_eq!(queue.active_application_holds(), 2);
+                        }
+                    },
+                );
+                queue.submit(
+                    || 2,
+                    {
+                        let queue = queue.clone();
+                        move |result| {
+                            assert_eq!(result.unwrap(), 2);
+                            assert_eq!(queue.active_application_holds(), 1);
+                        }
+                    },
+                );
+
+                assert_eq!(queue.active_application_holds(), 2);
+                gate.store(true, Ordering::Release);
+                drive_until_idle(&context, &queue);
+                assert_eq!(queue.active_application_holds(), 0);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn cancelled_queued_task_skips_worker_and_runs_completion() {
+        let context = MainContext::new();
+        context.with_thread_default(|| {
+            let queue = Rc::new(OperationQueue::default());
+            queue.set_application(gio::Application::new(
+                Some("it.kito.KitoFiles.CancelledQueueTest"),
+                gio::ApplicationFlags::NON_UNIQUE,
+            ));
+            let fixture = tempfile::tempdir().unwrap();
+            let marker = fixture.path().join("must-not-exist");
+            let center = crate::job_center::JobCenter::new();
+            let source = gio::File::for_path(&marker).uri().to_string();
+            let (job, token) = center.begin_job("operation-delete", vec![source], None);
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            queue.submit(
+                {
+                    let gate = gate.clone();
+                    move || {
+                        while !gate.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                },
+                |_| {},
+            );
+            let completed = Arc::new(AtomicBool::new(false));
+            let worker_job = job.clone();
+            let start_job = job.clone();
+            queue.submit_cancellable_with_start(
+                {
+                    let marker = marker.clone();
+                    move || std::fs::write(marker, b"unexpected operation")
+                },
+                {
+                    let token = token.clone();
+                    move || token.is_cancelled()
+                },
+                move || start_job.start(Some(1)),
+                {
+                    let completed = completed.clone();
+                    let center = center.clone();
+                    let job = job.clone();
+                    let queue = queue.clone();
+                    move |result| {
+                        assert!(matches!(result, Err(WorkerFailure::CancelledBeforeStart)));
+                        assert_eq!(queue.active_application_holds(), 2);
+                        center.finish_items(
+                            &job,
+                            job.sources.iter().map(|source| (
+                                source.clone(),
+                                crate::job_center::JobItemState::Cancelled("before start".into()),
+                            )).collect(),
+                        );
+                        completed.store(true, Ordering::Release);
+                    }
+                },
+            );
+            assert!(center.cancel_queued(job.id));
+            gate.store(true, Ordering::Release);
+            drive_until_idle(&context, &queue);
+            assert!(!marker.exists(), "cancelled queued operation touched disk");
+            assert!(completed.load(Ordering::Acquire));
+            assert_eq!(queue.active_application_holds(), 0);
+            assert_eq!(worker_job.status(), crate::job_center::JobStatus::Cancelled);
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn worker_and_completion_panics_release_the_queue_and_invalidate_history() {
         let context = MainContext::new();
         context
             .with_thread_default(|| {
                 let queue = Rc::new(OperationQueue::default());
+                queue.set_application(gio::Application::new(
+                    Some("it.kito.KitoFiles.PanicQueueTest"),
+                    gio::ApplicationFlags::NON_UNIQUE,
+                ));
                 let identity = kito_core::FileIdentity {
                     filesystem: "fs".into(),
                     file: "id".into(),
@@ -420,6 +643,7 @@ mod tests {
                 drive_until_idle(&context, &queue);
                 assert!(worker_failed.get());
                 assert!(next_done.get());
+                assert_eq!(queue.active_application_holds(), 0);
                 assert_eq!(queue.begin_undo(), Err(UndoStartError::Empty));
 
                 queue.push_undo(UndoRecord::Move {
@@ -442,6 +666,7 @@ mod tests {
                 );
                 drive_until_idle(&context, &queue);
                 assert!(after_panic_done.get());
+                assert_eq!(queue.active_application_holds(), 0);
                 assert_eq!(queue.begin_undo(), Err(UndoStartError::Empty));
             })
             .unwrap();

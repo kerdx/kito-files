@@ -248,6 +248,25 @@ operation-item-failed = Non riuscito: { $error }
 operation-item-cancelled = Annullato: { $error }
 operation-retry-failed = Riprova gli elementi non riusciti
 operation-close = Chiudi
+
+## F08 Centro operazioni
+jobs-title = Operazioni
+jobs-destination = Destinazione: { $destination }
+jobs-cancel = Annulla
+jobs-cancelling = Annullamento in corso…
+jobs-progress-files = { $done } di { $total }
+jobs-status-queued = In coda
+jobs-status-running = In corso
+jobs-status-cancelling = Annullamento
+jobs-status-completed = Completato
+jobs-status-partial = Parziale
+jobs-status-failed = Non riuscito
+jobs-status-cancelled = Annullato
+jobs-cancelled-before-start = Annullata prima dell'avvio dell'operazione
+jobs-item-succeeded = Completato: { $source }
+jobs-item-failed = Non riuscito: { $source } — { $error }
+jobs-item-cancelled = Annullato: { $source } — { $error }
+menu-operations = Operazioni
 trash-already-empty = Il cestino è già vuoto.
 
 ## Finestre di dialogo

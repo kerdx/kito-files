@@ -256,6 +256,48 @@ alla base e 1.690–1.738 s con la Fase 1; la variabilità impedisce di attribui
 con sicurezza la differenza complessiva. La reattività grafica non è stata
 misurata, né è possibile dedurla dai tempi del worker.
 
+## F08 — Centro operazioni (2026-10-13, verifica correttiva)
+
+`cargo check --workspace --locked --all-targets` e `cargo test --workspace
+--locked -- --skip restore_roundtrip_through_trash` passano: 83 test `kito-core`,
+205 `kito-gtk` e 11 `kito-i18n`; 13 test GTK sono ignorati perché richiedono un
+display, e un test core del Cestino di sessione è filtrato. I test workspace
+descritti qui escludono il Cestino reale. Coprono ID e stati, annullamento in
+coda senza worker, completion chiamata, annullamento cooperativo GIO incluso
+restore e query del percorso, progresso per elementi e byte, retry, conservazione
+degli appunti per MOVE parziale e operazioni reali su fixture temporanee.
+`./scripts/check.sh` si
+ferma perché `cargo fmt` non è installato; `cargo clippy --workspace --all-targets`
+è bloccato perché `cargo clippy` non è installato. Stato live,
+annullamento manuale, temi e lingue non sono stati provati né su Wayland né su una
+sessione X11 separata.
+
+La cancellazione F08 è cooperativa ai confini delle operazioni GIO: dopo un MOVE
+o Trash riuscito, l'elemento completa il bookkeeping undo (query metadata non
+cancellabili sul worker) prima che l'annullamento si applichi all'elemento
+successivo. Un errore del solo lookup metadata non annulla né trasforma in errore
+una mutazione già riuscita.
+
+| ID | Verifica richiesta | Tipo | Ambiente effettivo | Esito | Evidenza e limiti |
+|---|---|---|---|---|---|
+| F08-1 | Registro job con ID, stati e contesto catturato immodificabile. | Automatica | Test headless Linux | SUPERATO | `job_ids_are_stable_and_ordered`, `captured_context_is_immutable_after_enqueue`. |
+| F08-2 | Annullamento di un lavoro in coda e di uno attivo in modo cooperativo. | Automatica | Test headless Linux, directory temporanee | SUPERATO | `cancelled_queued_task_skips_worker_and_runs_completion` verifica assenza di side-effect filesystem, callback e job finale `Cancelled`; `running_job_cancels_cooperatively_with_real_files` annulla una copia reale senza perdere la sorgente; il resolver restore controlla una cancellazione anticipata. |
+| F08-3 | Successo completo, parziale e fallito classificati onestamente. | Automatica | Test headless Linux, directory temporanee | SUPERATO | `job_finish_states_never_call_mixed_results_success`, `successful_worker_copy_classifies_completed`, `retry_candidates_exclude_recorded_successes`, `copy_retry_policy_distinguishes_missing_source_from_partial_output`, `move_retry_policy_distinguishes_absent_and_partial_output`, `partial_move_keeps_cut_clipboard_without_becoming_retryable`; nessun test richiede cross-filesystem reale. |
+| F08-4 | Progresso determinato/indeterminato, byte misurati, annullati non completati. | Automatica | Test headless Linux | SUPERATO (logica) | `progress_stays_indeterminate_without_a_reported_total`, `live_attempts_drive_the_progress_fraction`, `copy_byte_progress_refines_the_batch_and_cancelled_items_are_not_complete`; barra non osservata visivamente. |
+| F08-5 | Chiusura scheda/finestra durante un lavoro, aggiornamento di selezione/appunti al completamento. | Automatica, grafica | Test headless Linux; finestre reali non provate | PARZIALE | `application_stays_held_for_running_and_pending_tasks_until_completions` verifica hold bilanciati fino alle completion FIFO; `cancelled_queued_task_skips_worker_and_runs_completion` e `worker_and_completion_panics_release_the_queue_and_invalidate_history` verificano cleanup anche su cancellazione e panic. Il comportamento grafico di finestre reali non è stato provato. |
+| F08-6 | Centro operazioni: stato live, dettagli, annullamento dall'interfaccia. | Automatica strutturale, grafica | GTK test su display disponibile; interazione manuale non eseguita | PARZIALE | `operations_dialog_has_content_and_refresh_action` verifica child, refresh e voce menu; live, annullamento manuale, temi/lingue e Wayland/X11 restano da provare. |
+
+F08 non è completa: una copia o uno spostamento annullati/falliti possono lasciare
+output parziale. Solo quando il target è verificato presente senza seguire symlink
+l'errore riporta il suo URI e il retry cieco è disabilitato. Per uno spostamento
+GIO può aver copiato parte del target senza eliminare la sorgente: l'errore non è
+trasformato in successo e il target non viene cancellato senza ownership sicura.
+Target assenti e collisioni `Exists` conservano l'errore originale e il retry;
+rinomina e creazione breve sono fuori dal perimetro dei job F08.
+La coda FIFO in attesa non è limitata: non rifiuta job già inviati perché il
+rifiuto deve eseguire le completion specifiche (clipboard/drop) e rispettare
+gli effetti già promessi. La cronologia terminale invece è limitata a 100.
+
 ## Automated checks
 
 From the repository, run:

@@ -19,6 +19,7 @@ Wayland or X11 backend automatically; development testing is done on Wayland.
 - Places, devices, network locations and shared freedesktop bookmarks.
 - Multi-selection; copy, cut, paste, rename, file/folder creation and properties.
 - Drag-and-drop to folders and tabs; external Moves are confirmed only after success.
+- Operations center with job status, progress, cancellation and per-item errors.
 - Trash, restore and confirmed permanent deletion, with collision handling.
 - Asynchronous folder loading and bulk view updates.
 - Terminal integration and preferences for view, click behavior and window controls.

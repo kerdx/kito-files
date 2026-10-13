@@ -2,6 +2,7 @@
 //! Mutations use the application-wide FIFO on a worker; read-only background
 //! work uses the regular helper. Results return to GTK for toast + reload.
 
+use crate::job_center::{JobCenter, JobItemState};
 use crate::operation_queue::{OperationQueue, UndoRecord, UndoStartError};
 use crate::preferences::PreferenceStore;
 use crate::tabs::TabManager;
@@ -10,6 +11,7 @@ use gtk::{gdk, gio, glib};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::Arc,
 };
 
 #[derive(Clone, Default)]
@@ -64,6 +66,81 @@ struct OperationItemResult {
 }
 
 type RetryHandler = Rc<dyn Fn(Vec<OperationItemResult>)>;
+
+/// Worker-side hook to the running F08 job. `submit_job` installs the
+/// job for the duration of its worker thread; the closure returns false
+/// when no job context is set (defensive: callers treat it as progress
+/// without a registry entry).
+static CURRENT_JOB: std::sync::Mutex<Option<Arc<crate::job_center::Job>>> =
+    std::sync::Mutex::new(None);
+
+struct CurrentJobGuard;
+
+impl CurrentJobGuard {
+    fn install(job: Arc<crate::job_center::Job>) -> Self {
+        *CURRENT_JOB.lock().unwrap() = Some(job);
+        Self
+    }
+}
+
+impl Drop for CurrentJobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut current) = CURRENT_JOB.lock() {
+            *current = None;
+        }
+    }
+}
+
+fn job_report(f: impl FnOnce(&crate::job_center::Job)) {
+    if let Ok(guard) = CURRENT_JOB.lock() {
+        if let Some(job) = guard.as_ref() {
+            f(job);
+        }
+    }
+}
+
+fn is_queued_cancellation(failure: &crate::operation_queue::WorkerFailure) -> bool {
+    matches!(failure, crate::operation_queue::WorkerFailure::CancelledBeforeStart)
+}
+
+impl OperationItemResult {
+    /// Registry view of one finished element: the job center keeps the
+    /// same classification (B03) without duplicating the semantics.
+    fn job_state(&self) -> JobItemState {
+        match &self.state {
+            ItemState::Succeeded => JobItemState::Succeeded,
+            ItemState::Failed(error) => JobItemState::Failed(error.clone()),
+            ItemState::Cancelled(error) => JobItemState::Cancelled(error.clone()),
+        }
+    }
+}
+
+/// Cut clipboard state must retain every unsuccessful source, independently
+/// of whether the Operations dialog offers a safe retry for that outcome.
+fn failed_cut_uris(results: &[OperationItemResult]) -> Vec<String> {
+    results
+        .iter()
+        .filter(|result| !matches!(result.state, ItemState::Succeeded))
+        .map(|result| result.source.clone())
+        .collect()
+}
+
+fn operation_summary_args(
+    operation: String,
+    succeeded: usize,
+    failed: usize,
+    cancelled: usize,
+    total: usize,
+) -> kito_i18n::FluentArgs<'static> {
+    let mut args = kito_i18n::FluentArgs::new();
+    args.set("operation", operation);
+    args.set("count", succeeded as u64);
+    args.set("succeeded", succeeded as u64);
+    args.set("failed", failed as u64);
+    args.set("cancelled", cancelled as u64);
+    args.set("total", total as u64);
+    args
+}
 
 /// An inverse may only target an object whose backend identity survived the
 /// operation. In particular, GIO may implement a cross-filesystem move as
@@ -175,8 +252,15 @@ impl OperationItemResult {
     }
 
     fn needs_retry(&self) -> bool {
-        matches!(self.state, ItemState::Failed(_) | ItemState::Cancelled(_))
+        match &self.state {
+            ItemState::Failed(error) | ItemState::Cancelled(error) => {
+                !error.contains("partial copy output may remain at")
+                    && !error.contains("partial move output may remain at")
+            }
+            ItemState::Succeeded => false,
+        }
     }
+
 }
 
 /// An external MOVE may already have removed its source at the destination.
@@ -189,27 +273,41 @@ fn external_move_trash_result(
     if result
         .as_ref()
         .is_err_and(|error| error.matches(gio::IOErrorEnum::NotFound))
-        && source_check().is_err_and(|error| error.matches(gio::IOErrorEnum::NotFound))
     {
-        None
-    } else {
-        Some(OperationItemResult::from_result(
-            "operation-trash",
-            uri,
-            Some(kito_core::TRASH_URI.to_string()),
-            result,
-        ))
+        match source_check() {
+            Err(error) if error.matches(gio::IOErrorEnum::NotFound) => return None,
+            // A cancelled check is the actionable outcome; uncertain checks
+            // must not be used to infer that the external source is gone.
+            Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => {
+                return Some(OperationItemResult::from_result(
+                    "operation-trash",
+                    uri,
+                    Some(kito_core::TRASH_URI.to_string()),
+                    Err(error),
+                ));
+            }
+            _ => {}
+        }
     }
+    Some(OperationItemResult::from_result(
+        "operation-trash",
+        uri,
+        Some(kito_core::TRASH_URI.to_string()),
+        result,
+    ))
 }
 
 /// Queries the source without following symlinks. Only an explicit GIO
 /// NotFound proves the entry itself is absent; all other errors are uncertain.
-fn external_move_source_check(uri: &str) -> Result<(), glib::Error> {
+fn external_move_source_check(
+    uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<(), glib::Error> {
     gio::File::for_uri(uri)
         .query_info(
             "standard::type",
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-            gio::Cancellable::NONE,
+            Some(cancellable),
         )
         .map(|_| ())
 }
@@ -400,6 +498,8 @@ pub struct Ctx {
     pub toast: adw::ToastOverlay,
     pub(crate) clipboard: Rc<RefCell<ClipTracker>>,
     pub(crate) operation_queue: Rc<OperationQueue>,
+    /// F08: operation center shared by every window of the process.
+    pub(crate) job_center: Rc<JobCenter>,
     pub preferences: Rc<PreferenceStore>,
     /// Shows the path entry (Ctrl+L). Set by main.
     pub focus_path: Rc<dyn Fn()>,
@@ -443,6 +543,79 @@ impl Ctx {
 
     pub fn toast(&self, msg: &str) {
         self.toast.add_toast(adw::Toast::new(msg));
+    }
+
+    /// F08: submits a mutation as a registered, cancellable job. The job
+    /// captures sources/destination at enqueue time; the worker propagates
+    /// the job's GIO `Cancellable` to every cancellable core call and the
+    /// completion records per-element outcomes. Sources/destination and
+    /// later tab or selection changes stay independent (captured here),
+    /// and closing a tab or window never invalidates the running worker.
+    /// `job_worker` receives the cancellable. `done` keeps the same
+    /// engine contract as `OperationQueue::submit`.
+    fn submit_job<F, R>(
+        self: &Rc<Self>,
+        operation: &'static str,
+        sources: Vec<String>,
+        destination: Option<String>,
+        total_known: Option<u64>,
+        job_worker: F,
+        done: impl FnOnce(
+            Rc<Self>,
+            Arc<crate::job_center::Job>,
+            Result<R, crate::operation_queue::WorkerFailure>,
+        ) + 'static,
+    ) where
+        F: FnOnce(&gio::Cancellable) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (job, cancellable) = self
+            .job_center
+            .begin_job(operation, sources.clone(), destination.clone());
+        let job_center = self.job_center.clone();
+        let this = self.clone();
+        let worker_job = job.clone();
+        let start_job = job.clone();
+        let queued_cancellable = cancellable.clone();
+        let cancelled_job = job.clone();
+        let cancelled_center = job_center.clone();
+        self.operation_queue.clone().submit_cancellable_with_start(
+            move || {
+                let _job_guard = CurrentJobGuard::install(worker_job.clone());
+                job_worker(&cancellable)
+            },
+            move || queued_cancellable.is_cancelled(),
+            move || start_job.start(total_known),
+            move |outcome| {
+                let cancelled_before_start = matches!(
+                    outcome.as_ref(),
+                    Err(crate::operation_queue::WorkerFailure::CancelledBeforeStart)
+                );
+                if cancelled_before_start {
+                    cancelled_center.finish_items(
+                        &cancelled_job,
+                        cancelled_job
+                            .sources
+                            .iter()
+                            .map(|source| {
+                                (
+                                    source.clone(),
+                                    JobItemState::Cancelled(crate::l10n::tr(
+                                        "jobs-cancelled-before-start",
+                                    )),
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+                if outcome.is_err() {
+                    if !cancelled_before_start {
+                        job_center.finish_worker_failure(&job);
+                    }
+                }
+                done(this, job, outcome);
+            },
+        );
     }
 
     /// Starts a drag-and-drop transfer using the action selected by GDK.
@@ -620,12 +793,13 @@ impl Ctx {
             .filter(|result| matches!(result.state, ItemState::Cancelled(_)))
             .count();
         let total = results.len();
-        let mut args = kito_i18n::FluentArgs::new();
-        args.set("operation", crate::l10n::tr(operation));
-        args.set("succeeded", succeeded as u64);
-        args.set("failed", failed as u64);
-        args.set("cancelled", cancelled as u64);
-        args.set("total", total as u64);
+        let args = operation_summary_args(
+            crate::l10n::tr(operation),
+            succeeded,
+            failed,
+            cancelled,
+            total,
+        );
         let summary_key = if failed == 0 && cancelled == 0 {
             "operation-result-success"
         } else if succeeded == 0 && cancelled == 0 {
@@ -980,7 +1154,6 @@ impl Ctx {
             cut,
             move_with_backend: cut && move_with_backend,
         };
-        let this = self.clone();
         let result_operation = if transfer.cut {
             "operation-move"
         } else {
@@ -988,17 +1161,30 @@ impl Ctx {
         };
         let is_cut = transfer.cut;
         let retry_dest = transfer.destination.clone();
-        this.operation_queue.clone().submit(
-            move || {
+        // F08: copy keeps the source by definition. A backend move can be a
+        // copy+delete across filesystems, so failure may leave both source
+        // and a partial destination; core reports that output and disables
+        // blind retry without attempting unsafe cleanup.
+        let this = Rc::new(self.clone());
+        let this_rc = this.clone();
+        Ctx::submit_job(
+            &this_rc,
+            result_operation,
+            transfer.uris.clone(),
+            Some(transfer.destination.clone()),
+            Some(transfer.uris.len() as u64),
+            move |cancellable| {
                 let mut results = Vec::with_capacity(transfer.uris.len());
                 let mut undo = Vec::new();
                 for uri in &transfer.uris {
-                    let identity_before = transfer
-                        .move_with_backend
-                        .then(|| kito_core::file_identity(uri).ok())
-                        .flatten();
-                    if transfer.move_with_backend {
-                        match kito_core::move_to_exact_result(uri, &transfer.destination) {
+                    let outcome: OperationItemResult = if transfer.move_with_backend {
+                        let identity_before =
+                            kito_core::file_identity_cancellable(uri, cancellable).ok();
+                        match kito_core::move_to_exact_result_cancellable(
+                            uri,
+                            &transfer.destination,
+                            cancellable,
+                        ) {
                             Ok(target) => {
                                 let identity = unchanged_undo_identity(
                                     identity_before,
@@ -1011,54 +1197,93 @@ impl Ctx {
                                         identity,
                                     });
                                 }
-                                results.push(OperationItemResult {
-                                    operation: result_operation,
-                                    source: uri.clone(),
-                                    destination: Some(target),
-                                    state: ItemState::Succeeded,
-                                });
+                                OperationItemResult::from_destination_result(
+                                    result_operation,
+                                    uri.clone(),
+                                    transfer.destination.clone(),
+                                    Ok(target),
+                                )
                             }
-                            Err(error) => results.push(OperationItemResult::from_result(
+                            Err(error) => OperationItemResult::from_result(
                                 result_operation,
                                 uri.clone(),
                                 Some(transfer.destination.clone()),
                                 Err(error),
-                            )),
+                            ),
                         }
                     } else {
-                        results.push(OperationItemResult::from_result(
-                            result_operation,
-                            uri.clone(),
-                            Some(transfer.destination.clone()),
-                            kito_core::copy_to(uri, &transfer.destination),
-                        ));
+                        let report_bytes = gio::File::for_uri(uri).query_file_type(
+                            gio::FileQueryInfoFlags::NONE,
+                            Some(cancellable),
+                        ) != gio::FileType::Directory;
+                        match kito_core::copy_to_cancellable(
+                            uri,
+                            &transfer.destination,
+                            cancellable,
+                            |bytes_current, bytes_current_total| {
+                                if report_bytes {
+                                    job_report(move |job| {
+                                        job.report_current_file(
+                                            bytes_current as u64,
+                                            bytes_current_total,
+                                        );
+                                    });
+                                }
+                            },
+                        ) {
+                            Ok(()) => OperationItemResult::from_destination_result(
+                                result_operation,
+                                uri.clone(),
+                                transfer.destination.clone(),
+                                Ok(transfer.destination.clone()),
+                            ),
+                            Err(error) => OperationItemResult::from_result(
+                                result_operation,
+                                uri.clone(),
+                                Some(transfer.destination.clone()),
+                                Err(error),
+                            ),
+                        }
+                    };
+                    // Every really attempted element (success or terminal
+                    // non-cancelled failure) advances the determinate bar.
+                    // A cancelled item keeps the batch at its last real value.
+                    if !matches!(outcome.state, ItemState::Cancelled(_)) {
+                        job_report(move |job| job.record_attempt());
                     }
+                    results.push(outcome);
                 }
                 (results, undo)
             },
-            move |outcome| {
+            move |this, finished_job, outcome| {
                 let mut cut_guard = CutCompletionGuard::new(this.clipboard.clone(), cut_op);
                 let (results, undo): (Vec<OperationItemResult>, Vec<UndoRecord>) = match outcome {
                     Ok(result) => result,
-                    Err(_) => {
+                    Err(failure) => {
                         drop(cut_guard);
                         this.manager.reload_if_current(&retry_dest);
                         if let Some(completion) = &drop_completion {
                             completion.finish(&[]);
                         }
-                        this.operation_worker_failed();
+                        if !is_queued_cancellation(&failure) {
+                            this.operation_worker_failed();
+                        }
                         return;
                     }
                 };
                 for record in undo {
                     this.operation_queue.push_undo(record);
                 }
-                let cut_finish = cut_op.map(|op_generation| {
-                    let failed_uris: Vec<String> = results
+                // F08: registry classification for the Operations view.
+                this.job_center.finish_items(
+                    &finished_job,
+                    results
                         .iter()
-                        .filter(|result| result.needs_retry())
-                        .map(|result| result.source.clone())
-                        .collect();
+                        .map(|result| (result.source.clone(), result.job_state()))
+                        .collect(),
+                );
+                let cut_finish = cut_op.map(|op_generation| {
+                    let failed_uris = failed_cut_uris(&results);
                     this.clipboard
                         .borrow_mut()
                         .finish_cut(op_generation, &failed_uris)
@@ -1140,14 +1365,20 @@ impl Ctx {
         drop_completion: Option<DropCompletion>,
         external_move: bool,
     ) {
-        let this = self.clone();
-        let retry_folder = folder.clone();
-        this.operation_queue.clone().submit(
-            move || {
+        let this = Rc::new(self.clone());
+        let retry_folder2 = folder.clone();
+        Ctx::submit_job(
+            &this,
+            "operation-trash",
+            uris.clone(),
+            Some(kito_core::TRASH_URI.to_string()),
+            Some(uris.len() as u64),
+            move |cancellable| {
                 let mut results = Vec::new();
                 let mut undo = Vec::new();
                 for uri in uris {
-                    match kito_core::trash_with_identity(&uri) {
+                    let result_count = results.len();
+                    match kito_core::trash_with_identity_cancellable(&uri, cancellable) {
                         Ok(target) => {
                             if let Some((target, identity)) = target {
                                 undo.push(UndoRecord::Trash {
@@ -1167,7 +1398,7 @@ impl Ctx {
                             let result = if external_move {
                                 let check_uri = uri.clone();
                                 external_move_trash_result(uri, Err(error), || {
-                                    external_move_source_check(&check_uri)
+                                    external_move_source_check(&check_uri, cancellable)
                                 })
                             } else {
                                 Some(OperationItemResult::from_result(
@@ -1182,24 +1413,41 @@ impl Ctx {
                             }
                         }
                     }
+                    if results.len() > result_count
+                        && results.last().is_some_and(|result| !matches!(result.state, ItemState::Cancelled(_)))
+                        || (results.len() == result_count
+                            && external_move
+                            && !cancellable.is_cancelled())
+                    {
+                        job_report(move |job| job.record_attempt());
+                    }
                 }
                 (results, undo)
             },
-            move |outcome| {
+            move |this, finished_job, outcome| {
                 let (results, undo) = match outcome {
                     Ok(result) => result,
-                    Err(_) => {
+                    Err(failure) => {
                         this.manager.reload_if_current(&folder);
                         if let Some(completion) = &drop_completion {
                             completion.finish(&[]);
                         }
-                        this.operation_worker_failed();
+                        if !is_queued_cancellation(&failure) {
+                            this.operation_worker_failed();
+                        }
                         return;
                     }
                 };
                 for record in undo {
                     this.operation_queue.push_undo(record);
                 }
+                this.job_center.finish_items(
+                    &finished_job,
+                    results
+                        .iter()
+                        .map(|result| (result.source.clone(), result.job_state()))
+                        .collect(),
+                );
                 this.manager.reload_if_current(&folder);
                 if let Some(completion) = &drop_completion {
                     completion.finish(&results);
@@ -1209,6 +1457,7 @@ impl Ctx {
                         .reload_if_current(kito_core::FAVORITES_URI);
                 }
                 let retry_this = this.clone();
+                let retry_folder = retry_folder2.clone();
                 let retry: RetryHandler = Rc::new(move |failed| {
                     let uris = failed.into_iter().map(|item| item.source).collect();
                     retry_this.trash_uris(uris, retry_folder.clone(), None, false);
@@ -1235,36 +1484,65 @@ impl Ctx {
     }
 
     fn restore_uris(&self, uris: Vec<String>, trash_uri: String) {
-        let this = self.clone();
+        let this = Rc::new(self.clone());
         let retry_trash_uri = trash_uri.clone();
-        this.operation_queue.clone().submit(
-            move || {
+        Ctx::submit_job(
+            &this,
+            "operation-restore",
+            uris.clone(),
+            None,
+            Some(uris.len() as u64),
+            move |cancellable| {
                 uris.into_iter()
-                    .map(|uri| match kito_core::restore(&uri) {
-                        Ok(destination) => OperationItemResult {
-                            operation: "operation-restore",
-                            source: uri,
-                            destination: Some(destination),
-                            state: ItemState::Succeeded,
-                        },
-                        Err(error) => OperationItemResult::from_result(
-                            "operation-restore",
-                            uri,
-                            None,
-                            Err(error),
-                        ),
+                    .map(|uri| match kito_core::restore_cancellable(&uri, cancellable) {
+                        Ok(destination) => {
+                            job_report(move |job| job.record_attempt());
+                            OperationItemResult {
+                                operation: "operation-restore",
+                                source: uri,
+                                destination: Some(destination),
+                                state: ItemState::Succeeded,
+                            }
+                        }
+                        Err(error) => {
+                            if error.matches(gio::IOErrorEnum::Cancelled) {
+                                OperationItemResult::from_result(
+                                    "operation-restore",
+                                    uri,
+                                    None,
+                                    Err(error),
+                                )
+                            } else {
+                                job_report(move |job| job.record_attempt());
+                                OperationItemResult::from_result(
+                                    "operation-restore",
+                                    uri,
+                                    None,
+                                    Err(error),
+                                )
+                            }
+                        }
                     })
                     .collect::<Vec<_>>()
             },
-            move |outcome| {
+            move |this, finished_job, outcome| {
                 let results = match outcome {
                     Ok(results) => results,
-                    Err(_) => {
+                    Err(failure) => {
                         this.manager.reload_if_current(&trash_uri);
-                        this.operation_worker_failed();
+                        if !is_queued_cancellation(&failure) {
+                            this.operation_worker_failed();
+                        }
                         return;
                     }
                 };
+                this.job_center.finish_items(
+                    &finished_job,
+                    results
+                        .iter()
+                        .map(|result| (result.source.clone(), result.job_state()))
+                        .collect(),
+                );
                 this.manager.reload_if_current(&trash_uri);
                 let retry_this = this.clone();
                 let retry: RetryHandler = Rc::new(move |failed| {
@@ -1292,36 +1570,61 @@ impl Ctx {
             if response != "empty" {
                 return;
             }
-            let this = this.clone();
-            this.operation_queue.clone().submit(
-                move || match kito_core::empty_trash_detailed() {
-                    Ok(items) => items
-                        .into_iter()
-                        .map(|item| {
-                            OperationItemResult::from_result(
-                                "operation-empty-trash",
-                                item.uri,
-                                None,
-                                item.error.map_or(Ok(()), Err),
-                            )
-                        })
-                        .collect(),
-                    Err(error) => vec![OperationItemResult::from_result(
-                        "operation-empty-trash",
-                        kito_core::TRASH_URI.to_string(),
-                        None,
-                        Err(error),
-                    )],
+            let this = Rc::new(this.clone());
+            Ctx::submit_job(
+                &this,
+                "operation-empty-trash",
+                vec![kito_core::TRASH_URI.to_string()],
+                None,
+                None,
+                move |cancellable| {
+                    let outcome: Vec<OperationItemResult> = match
+                        kito_core::empty_dir_detailed_cancellable(
+                            kito_core::TRASH_URI,
+                            cancellable,
+                        ) {
+                        Ok(items) => items
+                            .into_iter()
+                            .map(|item| {
+                                let result = OperationItemResult::from_result(
+                                    "operation-empty-trash",
+                                    item.uri.clone(),
+                                    None,
+                                    item.error.map_or(Ok(()), Err),
+                                );
+                                if !matches!(result.state, ItemState::Cancelled(_)) {
+                                    job_report(move |job| job.record_attempt());
+                                }
+                                result
+                            })
+                            .collect(),
+                        Err(error) => vec![OperationItemResult::from_result(
+                            "operation-empty-trash",
+                            kito_core::TRASH_URI.to_string(),
+                            None,
+                            Err(error),
+                        )],
+                    };
+                    outcome
                 },
-                move |outcome| {
+                move |this, finished_job, outcome| {
                     let results = match outcome {
                         Ok(results) => results,
-                        Err(_) => {
+                        Err(failure) => {
                             this.manager.reload_if_current(kito_core::TRASH_URI);
-                            this.operation_worker_failed();
+                            if !is_queued_cancellation(&failure) {
+                                this.operation_worker_failed();
+                            }
                             return;
                         }
                     };
+                    this.job_center.finish_items(
+                        &finished_job,
+                        results
+                            .iter()
+                            .map(|result| (result.source.clone(), result.job_state()))
+                            .collect(),
+                    );
                     this.manager.reload_if_current(kito_core::TRASH_URI);
                     if results.is_empty() {
                         this.toast(&crate::l10n::tr("trash-already-empty"));
@@ -1366,31 +1669,49 @@ impl Ctx {
                 return;
             }
             let uris = uris.clone();
-            let this = this.clone();
+            let this = Rc::new(this.clone());
             let retry_folder = folder.clone();
             let completion_folder = folder.clone();
-            this.operation_queue.clone().submit(
-                move || {
+            Ctx::submit_job(
+                &this,
+                "operation-delete",
+                uris.clone(),
+                None,
+                Some(uris.len() as u64),
+                move |cancellable| {
                     uris.into_iter()
                         .map(|uri| {
-                            OperationItemResult::from_result(
+                            let result = OperationItemResult::from_result(
                                 "operation-delete",
                                 uri.clone(),
                                 None,
-                                kito_core::delete_recursive(&uri),
-                            )
+                                kito_core::delete_recursive_cancellable(&uri, cancellable),
+                            );
+                            if !matches!(result.state, ItemState::Cancelled(_)) {
+                                job_report(move |job| job.record_attempt());
+                            }
+                            result
                         })
                         .collect::<Vec<_>>()
                 },
-                move |outcome| {
+                move |this, finished_job, outcome| {
                     let results = match outcome {
                         Ok(results) => results,
-                        Err(_) => {
+                        Err(failure) => {
                             this.manager.reload_if_current(&completion_folder);
-                            this.operation_worker_failed();
+                            if !is_queued_cancellation(&failure) {
+                                this.operation_worker_failed();
+                            }
                             return;
                         }
                     };
+                    this.job_center.finish_items(
+                        &finished_job,
+                        results
+                            .iter()
+                            .map(|result| (result.source.clone(), result.job_state()))
+                            .collect(),
+                    );
                     this.manager.reload_if_current(&completion_folder);
                     let retry_this = this.clone();
                     let retry: RetryHandler = Rc::new(move |failed| {
@@ -2035,6 +2356,23 @@ fn prop_row(label: &str, value: &str) -> gtk::Box {
 mod tests {
     use super::*;
 
+    #[test]
+    fn successful_operation_summary_supplies_fluent_plural_count() {
+        let args = operation_summary_args(
+            "Copy".to_string(),
+            1,
+            0,
+            0,
+            1,
+        );
+        let i18n = kito_i18n::I18n::new(kito_i18n::AppLang::English, None);
+
+        assert_eq!(
+            i18n.tr_with("operation-result-success", &args),
+            "Copy: completed one item."
+        );
+    }
+
     fn move_result(source: &str, result: Result<(), glib::Error>) -> OperationItemResult {
         OperationItemResult::from_result(
             "operation-move",
@@ -2056,6 +2394,41 @@ mod tests {
     }
 
     #[test]
+    fn successful_move_keeps_undo_identity_when_cancelled_afterward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        let destination_dir = tmp.path().join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&destination_dir).unwrap();
+        let source = source_dir.join("item.txt");
+        std::fs::write(&source, b"temporary fixture").unwrap();
+        let source_uri = gio::File::for_path(&source).uri().to_string();
+        let destination_uri = gio::File::for_path(&destination_dir).uri().to_string();
+        let before = kito_core::file_identity(&source_uri).unwrap();
+        let cancellable = gio::Cancellable::new();
+
+        let target = kito_core::move_to_exact_result_cancellable(
+            &source_uri,
+            &destination_uri,
+            &cancellable,
+        )
+        .unwrap();
+        cancellable.cancel();
+
+        let after = kito_core::file_identity(&target).unwrap();
+        let identity = unchanged_undo_identity(Some(before.clone()), Some(after))
+            .expect("completed move should retain its undo identity");
+        let undo = UndoRecord::Move {
+            source: source_uri.clone(),
+            target: target.clone(),
+            identity,
+        };
+        assert!(matches!(undo, UndoRecord::Move { identity, .. } if identity == before));
+        assert!(!source.exists());
+        assert!(gio::File::for_uri(&target).query_exists(gio::Cancellable::NONE));
+    }
+
+    #[test]
     fn external_move_ignores_only_missing_sources_without_fabricating_success() {
         let (_dir, path, uri) = isolated_fixture();
         std::fs::write(&path, "temporary fixture").unwrap();
@@ -2066,7 +2439,7 @@ mod tests {
         let result = external_move_trash_result(
             uri.clone(),
             Err(glib::Error::new(gio::IOErrorEnum::NotFound, "missing")),
-            || external_move_source_check(&uri),
+            || external_move_source_check(&uri, &gio::Cancellable::new()),
         );
         assert!(result.is_none());
         // Empty results are intentionally not reported (and hence produce no
@@ -2085,7 +2458,7 @@ mod tests {
                 gio::IOErrorEnum::PermissionDenied,
                 "permission denied",
             )),
-            || external_move_source_check(&uri),
+            || external_move_source_check(&uri, &gio::Cancellable::new()),
         )
         .expect("non-NotFound errors remain reportable");
         assert_eq!(result.source, uri);
@@ -2102,7 +2475,7 @@ mod tests {
         let result = external_move_trash_result(
             uri.clone(),
             Err(glib::Error::new(gio::IOErrorEnum::NotFound, "trash backend")),
-            || external_move_source_check(&uri),
+            || external_move_source_check(&uri, &gio::Cancellable::new()),
         )
         .expect("existing source means NotFound came from the trash backend");
         assert_eq!(result.source, uri);
@@ -2134,6 +2507,24 @@ mod tests {
     }
 
     #[test]
+    fn external_move_reports_cancelled_source_check_instead_of_inferring_absence() {
+        let (_dir, path, uri) = isolated_fixture();
+        std::fs::write(&path, "temporary fixture").unwrap();
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let result = external_move_trash_result(
+            uri.clone(),
+            Err(glib::Error::new(gio::IOErrorEnum::NotFound, "trash result")),
+            || external_move_source_check(&uri, &cancellable),
+        )
+        .expect("a cancelled check must remain visible, not infer source absence");
+        assert_eq!(result.source, uri);
+        assert!(matches!(result.state, ItemState::Cancelled(_)));
+        assert!(path.exists());
+    }
+
+    #[test]
     fn external_move_batch_does_not_lose_other_item_outcomes() {
         let (_removed_dir, removed_path, removed_uri) = isolated_fixture();
         std::fs::write(&removed_path, "temporary fixture").unwrap();
@@ -2141,7 +2532,7 @@ mod tests {
         let missing = external_move_trash_result(
             removed_uri.clone(),
             Err(glib::Error::new(gio::IOErrorEnum::NotFound, "missing")),
-            || external_move_source_check(&removed_uri),
+            || external_move_source_check(&removed_uri, &gio::Cancellable::new()),
         );
 
         let (_error_dir, error_path, error_uri) = isolated_fixture();
@@ -2149,13 +2540,13 @@ mod tests {
         let failed = external_move_trash_result(
             error_uri.clone(),
             Err(glib::Error::new(gio::IOErrorEnum::PermissionDenied, "denied")),
-            || external_move_source_check(&error_uri),
+            || external_move_source_check(&error_uri, &gio::Cancellable::new()),
         );
 
         let (_success_dir, success_path, success_uri) = isolated_fixture();
         std::fs::write(&success_path, "temporary fixture").unwrap();
         let succeeded = external_move_trash_result(success_uri.clone(), Ok(()), || {
-            external_move_source_check(&success_uri)
+            external_move_source_check(&success_uri, &gio::Cancellable::new())
         });
 
         let outcomes: Vec<_> = [missing, failed, succeeded].into_iter().flatten().collect();
@@ -2500,6 +2891,15 @@ mod tests {
                     "permission denied",
                 )),
             ),
+            OperationItemResult::from_result(
+                "operation-copy",
+                "file:///partial".into(),
+                Some("file:///tmp/dest".into()),
+                Err(glib::Error::new(
+                    gio::IOErrorEnum::Cancelled,
+                    "partial copy output may remain at file:///tmp/dest/partial",
+                )),
+            ),
         ];
         let retry: Vec<_> = items
             .iter()
@@ -2507,6 +2907,101 @@ mod tests {
             .map(|item| item.source.as_str())
             .collect();
         assert_eq!(retry, vec![B]);
+    }
+
+    #[test]
+    fn copy_retry_policy_distinguishes_missing_source_from_partial_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let missing = tmp.path().join("missing.txt");
+        let missing_error = kito_core::copy_to_cancellable(
+            gio::File::for_path(&missing).uri().as_str(),
+            gio::File::for_path(&dest).uri().as_str(),
+            &gio::Cancellable::new(),
+            |_, _| {},
+        )
+        .unwrap_err();
+        let missing_result = OperationItemResult::from_result(
+            "operation-copy",
+            gio::File::for_path(&missing).uri().to_string(),
+            Some(gio::File::for_path(&dest).uri().to_string()),
+            Err(missing_error),
+        );
+        assert!(missing_result.needs_retry());
+
+        let partial = dest.join("partial.txt");
+        std::fs::write(&partial, b"partial").unwrap();
+        let partial_uri = gio::File::for_path(&partial).uri();
+        let partial_error = glib::Error::new(
+            gio::IOErrorEnum::Cancelled,
+            &format!("cancelled; partial copy output may remain at {partial_uri}"),
+        );
+        let partial_result = OperationItemResult::from_result(
+            "operation-copy",
+            "file:///source/partial.txt".into(),
+            Some(gio::File::for_path(&dest).uri().to_string()),
+            Err(partial_error),
+        );
+        assert!(!partial_result.needs_retry());
+    }
+
+    #[test]
+    fn move_retry_policy_distinguishes_absent_and_partial_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let missing = tmp.path().join("missing.txt");
+        let missing_error = kito_core::move_to_exact_result_cancellable(
+            gio::File::for_path(&missing).uri().as_str(),
+            gio::File::for_path(&dest).uri().as_str(),
+            &gio::Cancellable::new(),
+        )
+        .unwrap_err();
+        let missing_result = OperationItemResult::from_result(
+            "operation-move",
+            gio::File::for_path(&missing).uri().to_string(),
+            Some(gio::File::for_path(&dest).uri().to_string()),
+            Err(missing_error),
+        );
+        assert!(missing_result.needs_retry());
+
+        let partial = dest.join("partial.txt");
+        std::fs::write(&partial, b"partial").unwrap();
+        let partial_uri = gio::File::for_path(&partial).uri();
+        let partial_error = glib::Error::new(
+            gio::IOErrorEnum::Cancelled,
+            &format!("cancelled; partial move output may remain at {partial_uri}"),
+        );
+        let partial_result = OperationItemResult::from_result(
+            "operation-move",
+            "file:///source/partial.txt".into(),
+            Some(gio::File::for_path(&dest).uri().to_string()),
+            Err(partial_error),
+        );
+        assert!(!partial_result.needs_retry());
+        assert!(partial.exists(), "partial output is reported, never deleted");
+    }
+
+    #[test]
+    fn partial_move_keeps_cut_clipboard_without_becoming_retryable() {
+        let mut clip = ClipTracker::default();
+        clip.publish(entries(&[A], true));
+        let op = clip.begin_cut().unwrap();
+        let partial = OperationItemResult::from_result(
+            "operation-move",
+            A.to_string(),
+            Some("file:///tmp/dest".into()),
+            Err(glib::Error::new(
+                gio::IOErrorEnum::Cancelled,
+                "partial move output may remain at file:///tmp/dest/a",
+            )),
+        );
+
+        assert!(!partial.needs_retry());
+        let failed_uris = failed_cut_uris(&[partial]);
+        assert_eq!(clip.finish_cut(op, &failed_uris), CutFinish::Partial);
+        assert!(clip.has_usable_entries());
     }
 
     #[test]

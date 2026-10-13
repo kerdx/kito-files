@@ -521,10 +521,25 @@ pub struct FileIdentity {
 }
 
 pub fn file_identity(uri: &str) -> Result<FileIdentity, glib::Error> {
+    file_identity_with_cancellable(uri, gio::Cancellable::NONE)
+}
+
+/// Backend identity query with caller-controlled cancellation.
+pub fn file_identity_cancellable(
+    uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<FileIdentity, glib::Error> {
+    file_identity_with_cancellable(uri, Some(cancellable))
+}
+
+fn file_identity_with_cancellable(
+    uri: &str,
+    cancellable: Option<&gio::Cancellable>,
+) -> Result<FileIdentity, glib::Error> {
     let info = gio::File::for_uri(uri).query_info(
         "id::filesystem,id::file",
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-        gio::Cancellable::NONE,
+        cancellable,
     )?;
     let filesystem = info.attribute_string("id::filesystem");
     let file = info.attribute_string("id::file");
@@ -538,6 +553,70 @@ pub fn file_identity(uri: &str) -> Result<FileIdentity, glib::Error> {
         _ => Err(io_error(
             "Filesystem does not provide a stable file identity",
         )),
+    }
+}
+
+/// Cancellable move into `dest_dir_uri` with the exact effective target
+/// (see [`move_to_exact_result`]). Used by the F08 job center only.
+pub fn move_to_exact_result_cancellable(
+    src_uri: &str,
+    dest_dir_uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<String, glib::Error> {
+    let src = gio::File::for_uri(src_uri);
+    let dest_dir = gio::File::for_uri(dest_dir_uri);
+    if src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
+        == gio::FileType::Directory
+        && dest_inside_src(&src, &dest_dir)
+    {
+        return Err(io_error(
+            "Cannot move a folder into itself or one of its subfolders",
+        ));
+    }
+    if src.parent().is_some_and(|parent| parent.equal(&dest_dir)) {
+        return Err(io_error("Source is already in the destination folder"));
+    }
+    let name = src
+        .basename()
+        .and_then(|n| n.into_string().ok())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| io_error("Invalid file name"))?;
+    let dest = unique_child_cancellable(&dest_dir, OsStr::new(&name), cancellable)?;
+    src.move_(
+        &dest,
+        gio::FileCopyFlags::NONE,
+        Some(cancellable),
+        Some(&mut |_, _| {}),
+    )
+    .map_err(|error| move_error_with_partial_target(error, &dest))?;
+    Ok(dest.uri().to_string())
+}
+
+fn move_error_with_partial_target(error: glib::Error, dest: &gio::File) -> glib::Error {
+    // GIO may implement a cross-filesystem move as copy+delete. A target
+    // already present due to a collision is not attributable to this move.
+    if error.matches(gio::IOErrorEnum::Exists) {
+        return error;
+    }
+    let target_exists = dest
+        .query_info(
+            "standard::type",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .is_ok();
+    if !target_exists {
+        return error;
+    }
+
+    let message = format!(
+        "{error}; partial move output may remain at {}",
+        dest.uri()
+    );
+    if error.matches(gio::IOErrorEnum::Cancelled) {
+        glib::Error::new(gio::IOErrorEnum::Cancelled, &message)
+    } else {
+        glib::Error::new(gio::IOErrorEnum::Failed, &message)
     }
 }
 
@@ -592,6 +671,56 @@ pub fn move_exact_checked(
         gio::Cancellable::NONE,
         Some(&mut |_, _| {}),
     )
+}
+
+/// Cancellable trash with matching identity capture (see
+/// [`trash_with_identity`]). Used by the F08 job center only.
+pub fn trash_with_identity_cancellable(
+    uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<Option<(String, FileIdentity)>, glib::Error> {
+    let identity = match file_identity_cancellable(uri, cancellable) {
+        Ok(identity) => Some(identity),
+        Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => return Err(error),
+        Err(_) => None,
+    };
+    let original = gio::File::for_uri(uri).path();
+    gio::File::for_uri(uri).trash(Some(cancellable))?;
+    let metadata = (|| {
+        let (Some(identity), Some(original)) = (identity, original) else {
+            return Ok(None);
+        };
+        let wanted = original.as_os_str().as_bytes();
+        let children = gio::File::for_uri(TRASH_URI).enumerate_children(
+            "standard::name,trash::orig-path,id::filesystem,id::file",
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )?;
+        let mut matches = Vec::new();
+        loop {
+            let info = match children.next_file(gio::Cancellable::NONE) {
+                Ok(Some(info)) => info,
+                Ok(None) => break,
+                Err(error) => return Err(error),
+            };
+            let candidate = children.child(&info);
+            if file_info_byte_string(&info, c"trash::orig-path").as_deref() == Some(wanted)
+                && file_identity(candidate.uri().as_ref()).as_ref() == Ok(&identity)
+            {
+                matches.push(candidate.uri().to_string());
+            }
+        }
+        Ok((matches.len() == 1).then(|| (matches.remove(0), identity)))
+    })();
+    // Trash already succeeded. Metadata is only needed for Undo and must
+    // never turn a completed side effect into a reported operation failure.
+    Ok(trash_metadata_after_success(metadata))
+}
+
+fn trash_metadata_after_success(
+    metadata: Result<Option<(String, FileIdentity)>, glib::Error>,
+) -> Option<(String, FileIdentity)> {
+    metadata.ok().flatten()
 }
 
 /// Trash an item only retaining an undo target when a unique Trash entry can
@@ -661,6 +790,28 @@ pub fn restore_exact_checked(
         gio::Cancellable::NONE,
         Some(&mut |_, _| {}),
     )
+}
+
+/// Cancellable permanent recursive deletion (F08). Same NOFOLLOW_SYMLINKS
+/// semantics as [`delete_recursive`].
+pub fn delete_recursive_cancellable(
+    uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<(), glib::Error> {
+    let file = gio::File::for_uri(uri);
+    if file.query_file_type(gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, Some(cancellable))
+        == gio::FileType::Directory
+    {
+        let children = file.enumerate_children(
+            "standard::name",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            Some(cancellable),
+        )?;
+        while let Some(info) = children.next_file(Some(cancellable))? {
+            delete_recursive_cancellable(&children.child(&info).uri(), cancellable)?;
+        }
+    }
+    file.delete(Some(cancellable))
 }
 
 /// Permanent recursive deletion. The UI asks for confirmation first.
@@ -759,6 +910,38 @@ pub fn empty_dir(dir_uri: &str) -> Result<(usize, usize), glib::Error> {
     Ok((results.len(), failed))
 }
 
+/// Detailed, cancellable trash emptying (F08). Each entry is attempted
+/// even when a previous one failed; a cancelled batch stops early.
+pub fn empty_dir_detailed_cancellable(
+    dir_uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<Vec<DeleteResult>, glib::Error> {
+    let dir = gio::File::for_uri(dir_uri);
+    let children = dir.enumerate_children(
+        "standard::name",
+        gio::FileQueryInfoFlags::NONE,
+        Some(cancellable),
+    )?;
+    let mut uris = Vec::new();
+    while let Some(info) = children.next_file(Some(cancellable))? {
+        uris.push(children.child(&info).uri().to_string());
+    }
+    drop(children);
+    let mut results = Vec::new();
+    for uri in uris {
+        if cancellable.is_cancelled() {
+            results.push(DeleteResult {
+                uri,
+                error: Some(cancelled_error()),
+            });
+            continue;
+        }
+        let error = delete_recursive_cancellable(&uri, cancellable).err();
+        results.push(DeleteResult { uri, error });
+    }
+    Ok(results)
+}
+
 /// Empties a directory and retains each attempted URI and its technical
 /// error for a caller that needs an operation report.
 pub fn empty_dir_detailed(dir_uri: &str) -> Result<Vec<DeleteResult>, glib::Error> {
@@ -792,6 +975,27 @@ pub fn empty_trash() -> Result<(usize, usize), glib::Error> {
 /// Detailed results for emptying Trash after the UI has confirmed it.
 pub fn empty_trash_detailed() -> Result<Vec<DeleteResult>, glib::Error> {
     empty_dir_detailed(TRASH_URI)
+}
+
+/// Cancellable trash restore (F08). Same semantics as [`restore`].
+pub fn restore_cancellable(
+    uri: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<String, glib::Error> {
+    let file = gio::File::for_uri(uri);
+    let info = file.query_info(
+        gio::FILE_ATTRIBUTE_TRASH_ORIG_PATH.as_str(),
+        gio::FileQueryInfoFlags::NONE,
+        Some(cancellable),
+    )?;
+    let dest = restore_destination_cancellable(&info, Some(cancellable))?;
+    file.move_(
+        &dest,
+        gio::FileCopyFlags::NONE,
+        Some(cancellable),
+        Some(&mut |_, _| {}),
+    )
+    .map(|_| dest.uri().into())
 }
 
 /// Restores a trash entry to its original location.
@@ -840,6 +1044,13 @@ fn file_info_byte_string(info: &gio::FileInfo, attr: &std::ffi::CStr) -> Option<
 ///   `standard::trash::orig-path`) and must be read as bytes to preserve
 ///   spaces, special chars and non-UTF-8 names. Testable without backend.
 fn restore_destination(info: &gio::FileInfo) -> Result<gio::File, glib::Error> {
+    restore_destination_cancellable(info, gio::Cancellable::NONE)
+}
+
+fn restore_destination_cancellable(
+    info: &gio::FileInfo,
+    cancellable: Option<&gio::Cancellable>,
+) -> Result<gio::File, glib::Error> {
     let bytes = file_info_byte_string(info, c"trash::orig-path")
         .filter(|b| !b.is_empty())
         .ok_or_else(|| io_error("Unknown original location"))?;
@@ -851,10 +1062,26 @@ fn restore_destination(info: &gio::FileInfo) -> Result<gio::File, glib::Error> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| io_error("Unknown original location"))?;
-    if !parent.is_dir() {
+    let parent_file = gio::File::for_path(parent);
+    let parent_info = parent_file.query_info(
+        "standard::type",
+        gio::FileQueryInfoFlags::NONE,
+        cancellable,
+    );
+    let parent_info = match parent_info {
+        Ok(info) => info,
+        Err(error) if error.matches(gio::IOErrorEnum::NotFound) => {
+            return Err(io_error("Original location is no longer available"));
+        }
+        Err(error) => return Err(error),
+    };
+    if parent_info.file_type() != gio::FileType::Directory {
         return Err(io_error("Original location is no longer available"));
     }
-    Ok(unique_child(&gio::File::for_path(parent), name))
+    match cancellable {
+        Some(cancellable) => unique_child_cancellable(&parent_file, name, cancellable),
+        None => Ok(unique_child(&parent_file, name)),
+    }
 }
 
 /// Creates an empty file inside `parent_dir_uri`. If the name is taken,
@@ -1016,6 +1243,175 @@ fn dest_inside_src(src: &gio::File, dest_dir: &gio::File) -> bool {
     let s = norm(src.uri());
     let d = norm(dest_dir.uri());
     d == s || d.starts_with(&format!("{s}/"))
+}
+
+/// Cancellable recursive copy used by the F08 job center: `cancellable` is
+/// propagated to every GIO call, including the file-copy progress callback
+/// (reported as measured bytes of the current file, never a fabricated
+/// total). Keep in sync with [`copy_to`]: same guards and naming.
+pub fn copy_to_cancellable(
+    src_uri: &str,
+    dest_dir_uri: &str,
+    cancellable: &gio::Cancellable,
+    mut progress: impl FnMut(i64, i64),
+) -> Result<(), glib::Error> {
+    let src = gio::File::for_uri(src_uri);
+    let dest_dir = gio::File::for_uri(dest_dir_uri);
+    if src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
+        == gio::FileType::Directory
+        && dest_inside_src(&src, &dest_dir)
+    {
+        return Err(io_error(
+            "Cannot copy a folder into itself or one of its subfolders",
+        ));
+    }
+    let name = src
+        .basename()
+        .and_then(|n| n.into_string().ok())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| io_error("Invalid file name"))?;
+    let dest = unique_child_cancellable(
+        &gio::File::for_uri(dest_dir_uri),
+        OsStr::new(&name),
+        cancellable,
+    )?;
+    copy_recursive_cancellable(&src, &dest, cancellable, &mut progress).map_err(|error| {
+        copy_error_with_partial_target(error, &dest)
+    })
+}
+
+fn copy_error_with_partial_target(error: glib::Error, dest: &gio::File) -> glib::Error {
+    // A target already present on entry (or appearing due to a collision) is
+    // not evidence that this job created it. For all other failures, query
+    // without following symlinks so a broken link also counts as an output.
+    let partial_exists = !error.matches(gio::IOErrorEnum::Exists)
+        && dest
+            .query_info(
+                "standard::type",
+                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                gio::Cancellable::NONE,
+            )
+            .is_ok();
+    if !partial_exists {
+        return error;
+    }
+
+    let message = format!(
+        "{error}; partial copy output may remain at {}",
+        dest.uri()
+    );
+    if error.matches(gio::IOErrorEnum::Cancelled) {
+        glib::Error::new(gio::IOErrorEnum::Cancelled, &message)
+    } else {
+        glib::Error::new(gio::IOErrorEnum::Failed, &message)
+    }
+}
+
+fn copy_recursive_cancellable(
+    src: &gio::File,
+    dest: &gio::File,
+    cancellable: &gio::Cancellable,
+    progress: &mut impl FnMut(i64, i64),
+) -> Result<(), glib::Error> {
+    if cancellable.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    if src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
+        == gio::FileType::Directory
+    {
+        dest.make_directory(Some(cancellable))?;
+        let children = src.enumerate_children(
+            "standard::name",
+            gio::FileQueryInfoFlags::NONE,
+            Some(cancellable),
+        )?;
+        while let Some(info) = children.next_file(Some(cancellable))? {
+            copy_recursive_cancellable(
+                &children.child(&info),
+                &dest.child(info.name()),
+                cancellable,
+                progress,
+            )?;
+        }
+        Ok(())
+    } else {
+        let total = src
+            .query_info("standard::size", gio::FileQueryInfoFlags::NONE, Some(cancellable))
+            .ok()
+            .map(|info| info.size())
+            .filter(|size| *size > 0)
+            .unwrap_or(-1);
+        let mut last = 0_i64;
+        src.copy(
+            dest,
+            gio::FileCopyFlags::NONE,
+            Some(cancellable),
+            Some(&mut |current, _total| {
+                // GIO reports measured bytes of the current file; throttle
+                // to whole-percent steps to keep the UI callback cheap.
+                let percent = if total > 0 { current * 100 / total } else { current };
+                if percent != last {
+                    last = percent;
+                    progress(current, total);
+                }
+            }),
+        )
+        .map(|_| ())
+    }
+}
+
+fn cancelled_error() -> glib::Error {
+    glib::Error::new(gio::IOErrorEnum::Cancelled, "Operation cancelled")
+}
+
+/// `unique_child` with a propagated cancellable for the existence probes.
+fn unique_child_cancellable(
+    dest_dir: &gio::File,
+    name: &OsStr,
+    cancellable: &gio::Cancellable,
+) -> Result<gio::File, glib::Error> {
+    let mut candidate = dest_dir.child(name);
+    if !child_exists_cancellable(&candidate, cancellable)? {
+        return Ok(candidate);
+    }
+    let (stem, ext) = stem_ext_os(name);
+    let mut i = 1;
+    loop {
+        let mut numbered = OsString::from(stem);
+        numbered.push(if i == 1 {
+            " (copy)".to_string()
+        } else {
+            format!(" (copy {i})")
+        });
+        numbered.push(ext);
+        candidate = dest_dir.child(&numbered);
+        if !child_exists_cancellable(&candidate, cancellable)? {
+            return Ok(candidate);
+        }
+        i += 1;
+    }
+}
+
+fn child_exists_cancellable(
+    file: &gio::File,
+    cancellable: &gio::Cancellable,
+) -> Result<bool, glib::Error> {
+    if cancellable.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    let result = file.query_info(
+        "standard::type",
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        Some(cancellable),
+    );
+    if cancellable.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    match result {
+        Ok(_) => Ok(true),
+        Err(error) if error.matches(gio::IOErrorEnum::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Copies a file or folder (recursively) into `dest_dir_uri`.
@@ -1262,6 +1658,41 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_identity_query_returns_cancelled_without_touching_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        std::fs::write(&source, b"untouched").unwrap();
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let error = file_identity_cancellable(&uri(&source), &cancellable).unwrap_err();
+        assert!(error.matches(gio::IOErrorEnum::Cancelled));
+        assert_eq!(std::fs::read(source).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn pre_cancelled_trash_does_not_touch_source_or_session_trash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        std::fs::write(&source, b"untouched").unwrap();
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let error = trash_with_identity_cancellable(&uri(&source), &cancellable).unwrap_err();
+        assert!(error.matches(gio::IOErrorEnum::Cancelled));
+        assert_eq!(std::fs::read(source).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn cancelled_followup_metadata_after_trash_remains_successful() {
+        let result = trash_metadata_after_success(Err(glib::Error::new(
+            gio::IOErrorEnum::Cancelled,
+            "metadata query cancelled after Trash succeeded",
+        )));
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn copy_dir_is_recursive() {
         let tmp = tree_fixture();
         let dest = tempfile::tempdir().unwrap();
@@ -1281,6 +1712,23 @@ mod tests {
         copy_to(&uri(&tmp.path().join("top.txt")), &dest_uri).unwrap();
         assert!(dest.path().join("top.txt").exists());
         assert!(dest.path().join("top (copy).txt").exists());
+    }
+
+    #[test]
+    fn cancellable_child_collision_gets_copy_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("item.txt");
+        std::fs::write(&existing, b"existing").unwrap();
+
+        let candidate = unique_child_cancellable(
+            &gio::File::for_path(tmp.path()),
+            OsStr::new("item.txt"),
+            &gio::Cancellable::new(),
+        )
+        .unwrap();
+
+        assert!(candidate.equal(&gio::File::for_path(tmp.path().join("item (copy).txt"))));
+        assert_eq!(std::fs::read(existing).unwrap(), b"existing");
     }
 
     #[test]
@@ -1376,6 +1824,20 @@ mod tests {
         let missing = trash_info("/tmp/kito-definitely-gone-xyz/f.txt");
         let err = restore_destination(&missing).unwrap_err();
         assert!(err.to_string().contains("no longer available"));
+    }
+
+    #[test]
+    fn restore_destination_resolution_honors_pre_cancelled_cancellable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = tmp.path().join("report.txt");
+        std::fs::write(&fixture, b"keep intact").unwrap();
+        let info = trash_info(fixture.to_str().unwrap());
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let error = restore_destination_cancellable(&info, Some(&cancellable)).unwrap_err();
+        assert!(error.matches(gio::IOErrorEnum::Cancelled));
+        assert_eq!(std::fs::read(&fixture).unwrap(), b"keep intact");
     }
 
     #[test]
@@ -1661,6 +2123,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancellable_delete_propagates_missing_directory_enumeration_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = delete_recursive_cancellable(
+            &uri(&tmp.path().join("missing-directory")),
+            &gio::Cancellable::new(),
+        )
+        .unwrap_err();
+        assert!(error.matches(gio::IOErrorEnum::NotFound));
+    }
+
     /// Sorted entry names of `dir`: snapshot to verify that a rejected
     /// operation creates nothing.
     fn names(dir: &std::path::Path) -> Vec<String> {
@@ -1679,6 +2152,159 @@ mod tests {
         std::fs::write(a.join("f.txt"), b"effe").unwrap();
         std::fs::write(a.join("sub").join("g.txt"), b"gi").unwrap();
         tmp
+    }
+
+    #[test]
+    fn cancellable_copy_missing_source_keeps_original_retryable_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.txt");
+        let error = copy_to_cancellable(
+            &uri(&missing),
+            &uri(tmp.path()),
+            &gio::Cancellable::new(),
+            |_, _| {},
+        )
+        .unwrap_err();
+
+        assert!(error.matches(gio::IOErrorEnum::NotFound));
+        assert!(!error.message().contains("partial copy output may remain at"));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn partial_copy_marker_requires_a_present_non_collision_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("partial.txt");
+        std::fs::write(&target, b"partial").unwrap();
+        let dest = gio::File::for_path(&target);
+        let error = glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled");
+
+        let marked = copy_error_with_partial_target(error, &dest);
+        assert!(marked.matches(gio::IOErrorEnum::Cancelled));
+        assert!(marked.message().contains("partial copy output may remain at"));
+        assert!(marked.message().contains(dest.uri().as_str()));
+
+        let collision = copy_error_with_partial_target(
+            glib::Error::new(gio::IOErrorEnum::Exists, "already exists"),
+            &dest,
+        );
+        assert!(collision.matches(gio::IOErrorEnum::Exists));
+        assert!(!collision.message().contains("partial copy output may remain at"));
+    }
+
+    #[test]
+    fn partial_move_marker_requires_a_present_non_collision_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_path = tmp.path().join("partial.txt");
+        let source_path = tmp.path().join("source.txt");
+        std::fs::write(&source_path, b"source").unwrap();
+        let dest = gio::File::for_path(&target_path);
+
+        let absent = move_error_with_partial_target(
+            glib::Error::new(gio::IOErrorEnum::NotFound, "source missing"),
+            &dest,
+        );
+        assert!(absent.matches(gio::IOErrorEnum::NotFound));
+        assert!(!absent.message().contains("partial move output may remain at"));
+
+        std::fs::write(&target_path, b"partial").unwrap();
+        let partial = move_error_with_partial_target(
+            glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled"),
+            &dest,
+        );
+        assert!(partial.matches(gio::IOErrorEnum::Cancelled));
+        assert!(partial.message().contains("partial move output may remain at"));
+        assert!(partial.message().contains(dest.uri().as_str()));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source");
+
+        let collision = move_error_with_partial_target(
+            glib::Error::new(gio::IOErrorEnum::Exists, "already exists"),
+            &dest,
+        );
+        assert!(collision.matches(gio::IOErrorEnum::Exists));
+        assert!(!collision.message().contains("partial move output may remain at"));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"source");
+        assert!(target_path.exists(), "the helper must not clean up the target");
+    }
+
+    #[test]
+    fn cancellable_copy_preserves_cancellation_without_partial_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        let dest = tmp.path().join("dest");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let error = copy_to_cancellable(
+            &uri(&source),
+            &uri(&dest),
+            &cancellable,
+            |_, _| {},
+        )
+        .unwrap_err();
+
+        assert!(error.matches(gio::IOErrorEnum::Cancelled));
+        assert!(!error.message().contains("partial copy output may remain at"));
+        assert_eq!(std::fs::read_dir(dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn pre_cancelled_copy_with_existing_basename_is_not_partial_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        let dest_dir = tmp.path().join("dest");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&dest_dir).unwrap();
+        let source = source_dir.join("item.txt");
+        let target = dest_dir.join("item.txt");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&target, b"existing target").unwrap();
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let error = copy_to_cancellable(
+            &uri(&source),
+            &uri(&dest_dir),
+            &cancellable,
+            |_, _| {},
+        )
+        .unwrap_err();
+
+        assert!(error.matches(gio::IOErrorEnum::Cancelled));
+        assert!(!error.message().contains("partial copy output may remain at"));
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert_eq!(std::fs::read(target).unwrap(), b"existing target");
+        assert_eq!(std::fs::read_dir(dest_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pre_cancelled_move_with_existing_basename_is_not_partial_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        let dest_dir = tmp.path().join("dest");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&dest_dir).unwrap();
+        let source = source_dir.join("item.txt");
+        let target = dest_dir.join("item.txt");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&target, b"existing target").unwrap();
+        let cancellable = gio::Cancellable::new();
+        cancellable.cancel();
+
+        let error = move_to_exact_result_cancellable(
+            &uri(&source),
+            &uri(&dest_dir),
+            &cancellable,
+        )
+        .unwrap_err();
+
+        assert!(error.matches(gio::IOErrorEnum::Cancelled));
+        assert!(!error.message().contains("partial move output may remain at"));
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert_eq!(std::fs::read(target).unwrap(), b"existing target");
+        assert_eq!(std::fs::read_dir(dest_dir).unwrap().count(), 1);
     }
 
     #[test]

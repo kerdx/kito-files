@@ -2809,6 +2809,7 @@ mod background_drop_tests {
                 toast: toast.clone(),
                 clipboard: Rc::new(RefCell::new(crate::ops::ClipTracker::default())),
                 operation_queue: Rc::new(crate::operation_queue::OperationQueue::default()),
+                job_center: crate::job_center::JobCenter::new(),
                 preferences,
                 focus_path: Rc::new(|| {}),
             });

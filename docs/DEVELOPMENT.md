@@ -117,6 +117,7 @@ kito-files/
 │           ├── tabs.rs         # AdwTabView, per-tab state and history
 │           ├── sidebar.rs      # Places, Devices, Network, Trash
 │           ├── ops.rs          # clipboard, file operations, properties, dialogs
+│           ├── job_center.rs   # F08 operation registry: job ids, states, progress, cancel
 │           ├── dnd.rs          # GDK file-list drag sources, targets and action negotiation
 │           ├── context_menu.rs # file / background / trash popovers
 │           ├── path_completion.rs # asynchronous local path suggestions
@@ -231,3 +232,52 @@ retries remain moves and are guarded by the original clipboard generation, so
 a newer clipboard is not overwritten. Completion refreshes tabs showing the
 captured destination rather than acting on whichever tab happens to be active.
 Details and reproduction commands: [performance report](perf-report.md).
+
+### Operation jobs (F08)
+
+`operation_queue.rs` stays the single mutation serializer; `job_center.rs` adds
+a registry wrapped around it. `Ctx::submit_job` (in `ops.rs`) registers a job
+with a stable id, captured sources/destination, then runs the mutation worker
+with the job's GIO `Cancellable` propagated to the cancellable variants of
+`kito-core` (copy, move, trash, delete, restore, empty). The worker reports
+progress via atomics only: really attempted items against a known batch total,
+plus measured current-file bytes from the GIO copy callback. Unknown totals
+stay indeterminate; no recursive pre-scan invents percentages.
+
+Every submitted FIFO task holds the shared `GApplication` from enqueue through
+its main-context completion and cleanup. Closing the last window therefore
+does not terminate already-submitted jobs; the application remains alive until
+their completions have run. A closed tab or window is not updated by a later UI
+completion, and this is not a persistence guarantee: quitting or crashing the
+process can still interrupt work.
+
+Job states are `queued`, `running`, `cancelling`, `completed`, `partial`,
+`failed`, `cancelled`. Queued cancellation stays visible and must bypass the
+worker when the FIFO reaches it; its completion still runs to release clipboard
+and drag/drop state. Running
+jobs observe the cancellation at the next cancellable GIO call. Completed
+elements complete non-cancellable undo bookkeeping after a successful MOVE or
+Trash, then cancellation applies at the next operation boundary. Cancellation
+is cooperative at GIO operation boundaries, not a rollback of an item already
+mutated. Completed elements remain registered; a job with failed or cancelled elements is never
+presented as plain success (`partial`, `failed` or `cancelled`). Retrying
+failed items starts a new job with the same captured destination; the old job
+keeps its records. The Operations dialog (per window, shared registry) lists
+every job with status, sources/destination, progress, a cancel command and
+per-item details. At most 100 terminal jobs are retained; active jobs are never
+evicted. Interrupted GIO copies or moves may leave partial output, but remain
+errors rather than successes; no cleanup is attempted. The error detail
+identifies the target URI and disables blind retry; do not delete it without
+verified ownership. Collision and absent-source errors remain retryable.
+Terminal history is capped at 100, but the pending FIFO remains
+uncapped: submissions are not rejected because each already owns a completion
+and may own clipboard/drop state. Sustained submission faster than processing
+can grow pending memory. This remaining cleanup limitation keeps F08 incomplete. Rename and
+short creation actions are outside the F08 job center. Worker panics and spawn failures mark the job failed without
+implying per-element outcomes, and undo history invalidation rules stay
+exactly the ones in `operation_queue.rs`.
+
+`job_center.rs` regression tests run workers against temporary directories
+(cancel-in-flight, full success) and classified cancellations without touching
+the session Trash; the unit tests cover ids, states, progress determinacy and
+queued-vs-running cancellation.

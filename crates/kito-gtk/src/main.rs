@@ -6,6 +6,7 @@ mod context_menu;
 mod dnd;
 mod file_list;
 mod icons;
+mod job_center;
 mod l10n;
 mod operation_queue;
 mod ops;
@@ -157,7 +158,18 @@ fn apply_window_controls(
     end.set_decoration_layout(layout.as_deref());
 }
 
-const APP_MENU_ITEMS: [(&str, &str, &[&str]); 2] = [
+const APP_MENU_ITEMS: [(&str, &str, &[&str]); 3] = [
+    (
+        "menu-operations",
+        "win.operations",
+        &[
+            "system-run-symbolic",
+            "emblem-system-symbolic",
+            "software-store-symbolic",
+            "system-run",
+            "emblem-system",
+        ],
+    ),
     (
         "menu-preferences",
         "win.preferences",
@@ -338,9 +350,19 @@ fn register_actions(
         ("zoom-out", ops::Ctx::zoom_out),
         ("zoom-reset", ops::Ctx::zoom_reset),
     ];
+    // F08: the operation center is a UI entry point, not a file action: it
+    // reads the shared registry instead of acting on a selection context.
+    let actions_action = gio::SimpleAction::new("operations", None);
+    {
+        let ctx = ctx.clone();
+        actions_action.connect_activate(move |_, _| {
+            ctx.job_center.present_dialog(&ctx.window);
+        });
+    }
+    group.add_action(&actions_action);
     for (name, run) in defs {
         let action = gio::SimpleAction::new(name, None);
-        if matches!(name, "rename" | "properties") {
+        if is_single_item_action(name) {
             single_item_actions.borrow_mut().push(action.clone());
         }
         let ctx = ctx.clone();
@@ -361,6 +383,10 @@ fn register_actions(
     window.insert_action_group("win", Some(&group));
 
     shortcuts::register_application_accelerators(app, &preferences.snapshot());
+}
+
+fn is_single_item_action(name: &str) -> bool {
+    matches!(name, "rename" | "properties")
 }
 
 /// Button with ordered system-theme icon candidates. Callers put symbolic
@@ -754,6 +780,7 @@ fn show_about(window: &adw::ApplicationWindow) {
 
 fn main() -> glib::ExitCode {
     let preferences = PreferenceStore::load();
+    let job_center = job_center::JobCenter::new();
     l10n::init(kito_i18n::I18n::new(
         preferences.snapshot().language,
         kito_i18n::detect_system(),
@@ -769,16 +796,19 @@ fn main() -> glib::ExitCode {
     });
     file_list::subscribe_file_shortcuts(&preferences);
     let operation_queue = Rc::new(operation_queue::OperationQueue::default());
+    operation_queue.set_application(app.clone().upcast());
 
     app.connect_activate({
         let preferences = preferences.clone();
         let operation_queue = operation_queue.clone();
+        let job_center = job_center.clone();
         move |app| {
             build_window(
                 app,
                 Vec::new(),
                 preferences.clone(),
                 operation_queue.clone(),
+                job_center.clone(),
             )
         }
     });
@@ -799,7 +829,13 @@ fn main() -> glib::ExitCode {
                     uris.push(parent.uri().to_string());
                 }
             }
-            build_window(app, uris, preferences.clone(), operation_queue.clone());
+            build_window(
+                app,
+                uris,
+                preferences.clone(),
+                operation_queue.clone(),
+                job_center.clone(),
+            );
         }
     });
 
@@ -821,6 +857,7 @@ fn build_window(
     initial_uris: Vec<String>,
     preferences: Rc<PreferenceStore>,
     operation_queue: Rc<operation_queue::OperationQueue>,
+    job_center: Rc<job_center::JobCenter>,
 ) {
     load_pathbar_css();
     let window = adw::ApplicationWindow::builder()
@@ -1423,7 +1460,16 @@ fn build_window(
         let app = app.clone();
         let preferences = preferences.clone();
         let operation_queue = operation_queue.clone();
-        move |uris| build_window(&app, uris, preferences.clone(), operation_queue.clone())
+        let job_center = job_center.clone();
+        move |uris| {
+            build_window(
+                &app,
+                uris,
+                preferences.clone(),
+                operation_queue.clone(),
+                job_center.clone(),
+            )
+        }
     });
     let manager = tabs::TabManager::new(
         tab_view,
@@ -1637,6 +1683,7 @@ fn build_window(
         toast: toast_overlay.clone(),
         clipboard: Rc::new(RefCell::new(ops::ClipTracker::default())),
         operation_queue,
+        job_center: job_center.clone(),
         preferences: preferences.clone(),
         focus_path: select_path_entry,
     });
@@ -1928,6 +1975,13 @@ fn build_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_rename_and_properties_require_a_single_selection() {
+        assert!(is_single_item_action("rename"));
+        assert!(is_single_item_action("properties"));
+        assert!(!is_single_item_action("operations"));
+    }
 
     #[test]
     fn crumb_items_decode_labels_keep_uris() {

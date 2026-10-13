@@ -141,6 +141,24 @@ the selected count.
   file menus; **New File** opens a separate submenu with icons for each file type
 - The empty-space menu uses the folder and tab where it was opened. Folder
   Properties there ignore any existing file selection without clearing it.
+- **Operations center** — the app menu has an **Operations** entry. Copy, move,
+  trash, restore, delete and empty-trash run as numbered operations that are
+  listed there with their status (queued, running, cancelling, completed,
+  partial, failed or cancelled), the captured sources and destination, real
+  progress when a measurable total exists (attempted items, refined by measured
+  current-file bytes for copies), and per-item error details. Each active job
+  has a cancel command: queued jobs remain visible and are skipped before their
+  worker starts; running jobs stop cooperatively at the next GIO call and keep
+  the items that already
+  finished. A job with failed or cancelled items is reported as partial, failed
+  or cancelled, never as a plain success. Closing a tab or window does not
+  affect a running operation. Interrupted GIO copies or moves can leave partial
+  output in the destination, but are reported as errors, never success; no
+  cleanup is attempted. The error details identify the intended target and
+  retry is withheld for that result. Collision and absent-source errors remain
+  retryable. Do not delete partial output unless you have identified it.
+  Automatic safe cleanup of partial output remains a limitation. Rename and
+  short creation actions are not listed as jobs.
 
 **Integration**
 

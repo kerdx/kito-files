@@ -249,6 +249,25 @@ operation-item-failed = Failed: { $error }
 operation-item-cancelled = Cancelled: { $error }
 operation-retry-failed = Retry failed items
 operation-close = Close
+
+## F08 Operations center
+jobs-title = Operations
+jobs-destination = Destination: { $destination }
+jobs-cancel = Cancel
+jobs-cancelling = Cancelling…
+jobs-progress-files = { $done } of { $total }
+jobs-status-queued = Queued
+jobs-status-running = Running
+jobs-status-cancelling = Cancelling
+jobs-status-completed = Completed
+jobs-status-partial = Partial
+jobs-status-failed = Failed
+jobs-status-cancelled = Cancelled
+jobs-cancelled-before-start = Cancelled before the operation started
+jobs-item-succeeded = Completed: { $source }
+jobs-item-failed = Failed: { $source } — { $error }
+jobs-item-cancelled = Cancelled: { $source } — { $error }
+menu-operations = Operations
 trash-already-empty = The Trash is already empty.
 
 ## Dialogs
